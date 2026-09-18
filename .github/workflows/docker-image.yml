@@ -10,6 +10,15 @@ on:
         required: true
         type: boolean
         default: true
+      extra_sha_tag:
+        description: "Optional extra GHCR tag (short SHA) copied from the branch image tag"
+        required: false
+        type: string
+      retag_only:
+        description: "Skip binary and image build; only apply extra_sha_tag"
+        required: false
+        type: boolean
+        default: false
   schedule:
     # Run at 05:00 UTC daily
     - cron: "0 5 * * *"
@@ -53,7 +62,7 @@ jobs:
     name: "Build: Binaries"
     needs:
       - check-ci
-    if: needs.check-ci.outputs.enabled == 'true'
+    if: needs.check-ci.outputs.enabled == 'true' && inputs.retag_only != true
     runs-on: ${{ vars.BUILD_RUNNER_LABEL || 'ubuntu-latest' }}
     strategy:
       max-parallel: 2
@@ -141,7 +150,7 @@ jobs:
       - check-ci
       - build-binaries
     # Only run this for versioned builds (skip for blanked builds)
-    if: needs.check-ci.outputs.enabled == 'true' && !inputs.blank_version_build
+    if: needs.check-ci.outputs.enabled == 'true' && !inputs.blank_version_build && inputs.retag_only != true
     runs-on: ubuntu-latest
     permissions:
       contents: read       # required for checkout
@@ -266,3 +275,34 @@ jobs:
             -a "ref=${{ github.sha }}" \
             --yes \
           ${images}
+
+  # Copy an extra SHA tag onto an already-published branch image without rebuilding.
+  retag-sha:
+    name: "Retag: SHA"
+    needs:
+      - check-ci
+      - image
+    if: |
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.extra_sha_tag != '' &&
+      needs.check-ci.outputs.enabled == 'true' &&
+      (inputs.retag_only == true || needs.image.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Docker Login
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy SHA tag
+        run: |
+          source_tag="${GITHUB_REF_NAME//\//-}"
+          docker buildx imagetools create \
+            -t "ghcr.io/${{ github.repository }}:${{ inputs.extra_sha_tag }}" \
+            "ghcr.io/${{ github.repository }}:${source_tag}"
