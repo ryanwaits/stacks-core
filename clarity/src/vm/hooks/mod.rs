@@ -18,6 +18,7 @@
 //! Evaluation hooks and call-tracing support for observing Clarity VM execution.
 
 mod internals;
+pub mod storage;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod trace;

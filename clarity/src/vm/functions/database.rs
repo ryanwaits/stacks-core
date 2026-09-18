@@ -261,6 +261,16 @@ pub fn special_contract_call(
         }
     }
 
+    if exec_state.global_context.emit_vm_trace {
+        exec_state.global_context.storage_trace.record_nested_call(
+            invoke_ctx,
+            contract_identifier,
+            function_name.to_string(),
+            &rest_args,
+            &result,
+        );
+    }
+
     Ok(result)
 }
 

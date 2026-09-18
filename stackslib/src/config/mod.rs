@@ -4781,6 +4781,12 @@ pub struct EventObserverConfigFile {
     /// - `"block_proposal"`: Subscribes to block proposal response events (for Nakamoto consensus).
     ///   - Events delivered to: `/proposal_response`.
     ///
+    /// - `"storage"`: Opt-in Clarity `var-set` / map write traces. Not included in `"*"`.
+    ///   - Events delivered to: `/new_block` (`vm_events` array, not `events[]`).
+    ///
+    /// - `"contract_calls"`: Opt-in nested `contract-call?` traces. Not included in `"*"`.
+    ///   - Events delivered to: `/new_block` (`vm_events` array).
+    ///
     /// - Smart Contract Event: Subscribes to a specific smart contract event.
     ///   - Format: `"{deployer_address}.{contract_name}::{event_name}"`
     ///     (e.g., `ST0000000000000000000000000000000000000000.my-contract::my-custom-event`)
@@ -4873,6 +4879,8 @@ pub enum EventKeyType {
     MinedMicroblocks,
     StackerDBChunks,
     BlockProposal,
+    StorageEvent,
+    ContractCallEvent,
 }
 
 impl EventKeyType {
@@ -4903,6 +4911,14 @@ impl EventKeyType {
 
         if raw_key == "block_proposal" {
             return Some(EventKeyType::BlockProposal);
+        }
+
+        if raw_key == "storage" {
+            return Some(EventKeyType::StorageEvent);
+        }
+
+        if raw_key == "contract_calls" {
+            return Some(EventKeyType::ContractCallEvent);
         }
 
         let comps: Vec<_> = raw_key.split("::").collect();
@@ -4994,6 +5010,23 @@ mod tests {
             ConfigFile::from_str("//[node]").unwrap_err()
         );
         assert!(ConfigFile::from_str("").is_ok());
+    }
+
+    #[test]
+    fn event_key_storage_and_contract_calls_not_star() {
+        assert_eq!(
+            EventKeyType::from_string("storage"),
+            Some(EventKeyType::StorageEvent)
+        );
+        assert_eq!(
+            EventKeyType::from_string("contract_calls"),
+            Some(EventKeyType::ContractCallEvent)
+        );
+        assert_ne!(
+            EventKeyType::from_string("*"),
+            EventKeyType::from_string("storage")
+        );
+        assert!(EventKeyType::from_string("contract_call").is_none());
     }
 
     #[test]

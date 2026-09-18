@@ -23,6 +23,7 @@ use stacks_common::bounded_format;
 use stacks_common::types::StacksEpochId;
 use stacks_common::types::chainstate::StacksBlockId;
 
+use super::hooks::storage::StorageTraceCollector;
 use super::hooks::{
     CallArguments, CallHook, CallTraceFrame, EvalHook, EvalHookNotifier, ExecutionOutcome,
 };
@@ -218,6 +219,9 @@ pub struct GlobalContext<'a, 'hooks> {
     /// A resource limiter that will be polled on every `eval` to check that execution
     /// time and heap allocation don't exceed configured maximums
     pub execution_resource_limiter: ResourceLimiter,
+    /// Collect storage / nested-call traces via eval-hook notifications. Default off.
+    pub emit_vm_trace: bool,
+    pub(crate) storage_trace: StorageTraceCollector,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -372,6 +376,19 @@ impl<'a, 'hooks> OwnedEnvironment<'a, 'hooks> {
     pub fn set_execution_resource_limiter(&mut self, resource_limiter: ResourceLimiter) {
         self.context
             .set_execution_resource_limiter(resource_limiter);
+    }
+
+    pub fn set_emit_vm_trace(&mut self, on: bool) {
+        self.context.set_emit_vm_trace(on);
+    }
+
+    pub fn take_vm_trace_events(&mut self) -> Vec<crate::vm::events::VmTraceEvent> {
+        self.context.storage_trace.take_committed()
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn vm_trace_events(&self) -> &[crate::vm::events::VmTraceEvent] {
+        self.context.storage_trace.committed()
     }
 
     pub fn get_exec_environment<'b>(
@@ -1320,10 +1337,12 @@ impl ExecutionState<'_, '_, '_> {
 
 impl EvalHookNotifier for ExecutionState<'_, '_, '_> {
     fn has_eval_hooks(&self) -> bool {
-        self.global_context
-            .eval_hooks
-            .as_ref()
-            .is_some_and(|hooks| !hooks.is_empty())
+        self.global_context.emit_vm_trace
+            || self
+                .global_context
+                .eval_hooks
+                .as_ref()
+                .is_some_and(|hooks| !hooks.is_empty())
     }
 
     fn notify_will_begin_eval(
@@ -1342,6 +1361,13 @@ impl EvalHookNotifier for ExecutionState<'_, '_, '_> {
         expr: &SymbolicExpression,
         res: &core::result::Result<ValueRef<'a>, VmExecutionError>,
     ) {
+        if self.global_context.emit_vm_trace
+            && let Ok(value_ref) = res
+        {
+            self.global_context
+                .storage_trace
+                .did_finish_eval(expr, value_ref.as_ref());
+        }
         self.for_each_eval_hook(|hook, env| {
             hook.did_finish_eval(env, invoke_ctx, context, expr, res)
         });
@@ -1353,6 +1379,11 @@ impl EvalHookNotifier for ExecutionState<'_, '_, '_> {
         call: &CallHook,
         args: CallArguments,
     ) {
+        if self.global_context.emit_vm_trace {
+            self.global_context
+                .storage_trace
+                .will_begin_call(call, args);
+        }
         self.for_each_eval_hook(|hook, env| hook.will_begin_call(env, invoke_ctx, call, args));
     }
 
@@ -1363,6 +1394,11 @@ impl EvalHookNotifier for ExecutionState<'_, '_, '_> {
         arg_index: usize,
         value: &Value,
     ) {
+        if self.global_context.emit_vm_trace {
+            self.global_context
+                .storage_trace
+                .did_evaluate_call_argument(arg_index, value);
+        }
         self.for_each_eval_hook(|hook, env| {
             hook.did_evaluate_call_argument(env, invoke_ctx, call, arg_index, value)
         });
@@ -1374,6 +1410,11 @@ impl EvalHookNotifier for ExecutionState<'_, '_, '_> {
         call: &CallHook,
         res: &core::result::Result<Value, VmExecutionError>,
     ) {
+        if self.global_context.emit_vm_trace {
+            self.global_context
+                .storage_trace
+                .did_finish_call(invoke_ctx, call, res);
+        }
         self.for_each_eval_hook(|hook, env| hook.did_finish_call(env, invoke_ctx, call, res));
     }
 }
@@ -1398,6 +1439,8 @@ impl<'a, 'hooks> GlobalContext<'a, 'hooks> {
             chain_id,
             eval_hooks: None,
             execution_resource_limiter: ResourceLimiter::unlimited(),
+            emit_vm_trace: false,
+            storage_trace: StorageTraceCollector::default(),
         }
     }
 
@@ -1407,6 +1450,11 @@ impl<'a, 'hooks> GlobalContext<'a, 'hooks> {
 
     pub fn set_execution_resource_limiter(&mut self, resource_limiter: ResourceLimiter) {
         self.execution_resource_limiter = resource_limiter;
+    }
+
+    pub fn set_emit_vm_trace(&mut self, on: bool) {
+        self.emit_vm_trace = on;
+        self.storage_trace.set_enabled(on);
     }
 
     fn get_asset_map(&mut self) -> Result<&mut AssetMap, VmExecutionError> {
@@ -1578,6 +1626,9 @@ impl<'a, 'hooks> GlobalContext<'a, 'hooks> {
         self.database.begin();
         let read_only = self.is_read_only();
         self.read_only.push(read_only);
+        if self.emit_vm_trace {
+            self.storage_trace.begin_batch();
+        }
     }
 
     pub fn begin_read_only(&mut self) {
@@ -1590,6 +1641,9 @@ impl<'a, 'hooks> GlobalContext<'a, 'hooks> {
         self.event_batches.push((EventBatch::new(), total_size));
         self.database.begin();
         self.read_only.push(true);
+        if self.emit_vm_trace {
+            self.storage_trace.begin_batch();
+        }
     }
 
     pub fn commit(&mut self) -> Result<(Option<AssetMap>, Option<EventBatch>), VmExecutionError> {
@@ -1623,6 +1677,9 @@ impl<'a, 'hooks> GlobalContext<'a, 'hooks> {
         };
 
         self.database.commit()?;
+        if self.emit_vm_trace {
+            self.storage_trace.commit_batch();
+        }
         Ok((out_map, out_batch))
     }
 
@@ -1631,13 +1688,16 @@ impl<'a, 'hooks> GlobalContext<'a, 'hooks> {
         if popped.is_none() {
             return Err(VmInternalError::Expect("Expected entry to rollback".into()).into());
         }
-        let popped = self.read_only.pop();
-        if popped.is_none() {
-            return Err(VmInternalError::Expect("Expected entry to rollback".into()).into());
-        }
+        let was_read_only = self
+            .read_only
+            .pop()
+            .ok_or_else(|| VmInternalError::Expect("Expected entry to rollback".into()))?;
         let popped = self.event_batches.pop();
         if popped.is_none() {
             return Err(VmInternalError::Expect("Expected entry to rollback".into()).into());
+        }
+        if self.emit_vm_trace {
+            self.storage_trace.rollback_batch(was_read_only);
         }
 
         self.database.roll_back()

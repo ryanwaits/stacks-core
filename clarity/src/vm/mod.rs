@@ -73,7 +73,7 @@ pub use crate::vm::database::clarity_db::StacksEpoch;
 #[cfg(any(test, feature = "testing"))]
 use crate::vm::errors::ClarityEvalError;
 use crate::vm::errors::{RuntimeCheckErrorKind, RuntimeError, VmExecutionError, VmInternalError};
-use crate::vm::events::StacksTransactionEvent;
+use crate::vm::events::{StacksTransactionEvent, StorageEvent, VarSetEventData, VmTraceEvent};
 use crate::vm::functions::define::DefineResult;
 pub use crate::vm::functions::stx_transfer_consolidated;
 use crate::vm::hooks::{CallArguments, CallTraceFrame, EvalHookNotifier as _};
@@ -692,7 +692,19 @@ pub fn eval_all(
                     global_context.add_memory(value.size()?.into())?;
 
                     let data_type = global_context.database.create_variable(&contract_context.contract_identifier, &name, value_type)?;
+                    let init_trace = global_context.emit_vm_trace.then(|| value.clone());
                     global_context.database.set_variable(&contract_context.contract_identifier, &name, value, &data_type, &global_context.epoch_id)?;
+                    if let Some(init_value) = init_trace
+                        && let Ok(data) = VarSetEventData::try_from_value(
+                            contract_context.contract_identifier.clone(),
+                            name.to_string(),
+                            &init_value,
+                        )
+                    {
+                        global_context
+                            .storage_trace
+                            .push_event(VmTraceEvent::Storage(StorageEvent::VarSet(data)));
+                    }
 
                     contract_context.meta_data_var.insert(name, data_type);
                 },

@@ -57,6 +57,8 @@ mod sequences;
 #[cfg(test)]
 mod simple_apply_eval;
 #[cfg(test)]
+mod storage_trace;
+#[cfg(test)]
 mod traits;
 #[cfg(test)]
 mod variables;

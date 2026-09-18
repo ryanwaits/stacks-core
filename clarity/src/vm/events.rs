@@ -333,14 +333,205 @@ pub struct SmartContractEventData {
 
 impl SmartContractEventData {
     pub fn json_serialize(&self) -> Result<serde_json::Value, SerializationError> {
-        let mut byte_serialization = Vec::new();
-        self.value.serialize_write(&mut byte_serialization)?;
-        let raw_value = to_hex_prefixed(byte_serialization.as_slice(), true);
         Ok(json!({
             "contract_identifier": self.key.0.to_string(),
             "topic": self.key.1,
-            "raw_value": raw_value,
+            "raw_value": hex_value(&self.value)?,
         }))
+    }
+}
+
+/// Opt-in write / nested-call trace. Not a [`StacksTransactionEvent`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum VmTraceEvent {
+    Storage(StorageEvent),
+    ContractCall(ContractCallEventData),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StorageEvent {
+    VarSet(VarSetEventData),
+    MapSet(MapWriteEventData),
+    MapInsert(MapWriteEventData),
+    MapDelete(MapDeleteEventData),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VarSetEventData {
+    pub contract_identifier: QualifiedContractIdentifier,
+    pub var_name: String,
+    pub raw_value: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapWriteEventData {
+    pub contract_identifier: QualifiedContractIdentifier,
+    pub map_name: String,
+    pub raw_key: String,
+    pub raw_value: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapDeleteEventData {
+    pub contract_identifier: QualifiedContractIdentifier,
+    pub map_name: String,
+    pub raw_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContractCallEventData {
+    pub contract_identifier: QualifiedContractIdentifier,
+    pub sender: Option<PrincipalData>,
+    pub caller: PrincipalData,
+    pub function_name: String,
+    pub function_args: Vec<String>,
+    pub raw_result: String,
+}
+
+pub(crate) fn hex_value(value: &Value) -> Result<String, SerializationError> {
+    let mut byte_serialization = Vec::new();
+    value.serialize_write(&mut byte_serialization)?;
+    Ok(to_hex_prefixed(byte_serialization.as_slice(), true))
+}
+
+impl VarSetEventData {
+    pub fn try_from_value(
+        contract_identifier: QualifiedContractIdentifier,
+        var_name: String,
+        value: &Value,
+    ) -> Result<Self, SerializationError> {
+        Ok(Self {
+            contract_identifier,
+            var_name,
+            raw_value: hex_value(value)?,
+        })
+    }
+
+    pub fn json_serialize(&self) -> serde_json::Value {
+        json!({
+            "contract_identifier": self.contract_identifier.to_string(),
+            "var_name": self.var_name,
+            "raw_value": self.raw_value,
+        })
+    }
+}
+
+impl MapWriteEventData {
+    pub fn try_from_values(
+        contract_identifier: QualifiedContractIdentifier,
+        map_name: String,
+        key: &Value,
+        value: &Value,
+    ) -> Result<Self, SerializationError> {
+        Ok(Self {
+            contract_identifier,
+            map_name,
+            raw_key: hex_value(key)?,
+            raw_value: hex_value(value)?,
+        })
+    }
+
+    pub fn json_serialize(&self) -> serde_json::Value {
+        json!({
+            "contract_identifier": self.contract_identifier.to_string(),
+            "map_name": self.map_name,
+            "raw_key": self.raw_key,
+            "raw_value": self.raw_value,
+        })
+    }
+}
+
+impl MapDeleteEventData {
+    pub fn try_from_value(
+        contract_identifier: QualifiedContractIdentifier,
+        map_name: String,
+        key: &Value,
+    ) -> Result<Self, SerializationError> {
+        Ok(Self {
+            contract_identifier,
+            map_name,
+            raw_key: hex_value(key)?,
+        })
+    }
+
+    pub fn json_serialize(&self) -> serde_json::Value {
+        json!({
+            "contract_identifier": self.contract_identifier.to_string(),
+            "map_name": self.map_name,
+            "raw_key": self.raw_key,
+        })
+    }
+}
+
+impl ContractCallEventData {
+    pub fn try_from_values<'a>(
+        contract_identifier: QualifiedContractIdentifier,
+        sender: Option<PrincipalData>,
+        caller: PrincipalData,
+        function_name: String,
+        function_args: impl IntoIterator<Item = &'a Value>,
+        result: &Value,
+    ) -> Result<Self, SerializationError> {
+        let function_args = function_args
+            .into_iter()
+            .map(hex_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            contract_identifier,
+            sender,
+            caller,
+            function_name,
+            function_args,
+            raw_result: hex_value(result)?,
+        })
+    }
+
+    pub fn json_serialize(&self) -> serde_json::Value {
+        json!({
+            "contract_identifier": self.contract_identifier.to_string(),
+            "sender": self.sender.as_ref().map(|s| s.to_string()),
+            "caller": self.caller.to_string(),
+            "function_name": self.function_name,
+            "function_args": self.function_args,
+            "raw_result": self.raw_result,
+        })
+    }
+}
+
+impl VmTraceEvent {
+    pub fn json_serialize(&self, txid: &dyn std::fmt::Debug, committed: bool) -> serde_json::Value {
+        match self {
+            VmTraceEvent::Storage(StorageEvent::VarSet(event_data)) => json!({
+                "txid": format!("0x{txid:?}"),
+                "committed": committed,
+                "type": "var_set_event",
+                "var_set_event": event_data.json_serialize()
+            }),
+            VmTraceEvent::Storage(StorageEvent::MapSet(event_data)) => json!({
+                "txid": format!("0x{txid:?}"),
+                "committed": committed,
+                "type": "map_set_event",
+                "map_set_event": event_data.json_serialize()
+            }),
+            VmTraceEvent::Storage(StorageEvent::MapInsert(event_data)) => json!({
+                "txid": format!("0x{txid:?}"),
+                "committed": committed,
+                "type": "map_insert_event",
+                "map_insert_event": event_data.json_serialize()
+            }),
+            VmTraceEvent::Storage(StorageEvent::MapDelete(event_data)) => json!({
+                "txid": format!("0x{txid:?}"),
+                "committed": committed,
+                "type": "map_delete_event",
+                "map_delete_event": event_data.json_serialize()
+            }),
+            VmTraceEvent::ContractCall(event_data) => json!({
+                "txid": format!("0x{txid:?}"),
+                "committed": committed,
+                "type": "contract_call_event",
+                "contract_call_event": event_data.json_serialize()
+            }),
+        }
     }
 }
 
@@ -435,5 +626,20 @@ mod tests {
                 "raw_value": "0x0100000000000000000000000000000063",
             })
         );
+    }
+
+    #[test]
+    fn vm_trace_json_uses_array_order_not_event_index() {
+        let contract_id = QualifiedContractIdentifier::new(
+            StandardPrincipalData::null_principal(),
+            ContractName::try_from("test-contract".to_string()).unwrap(),
+        );
+        let event = VmTraceEvent::Storage(StorageEvent::VarSet(
+            VarSetEventData::try_from_value(contract_id, "n".into(), &Value::UInt(1)).unwrap(),
+        ));
+        let json = event.json_serialize(&"deadbeef", true);
+        assert!(json.get("event_index").is_none());
+        assert!(json.get("vm_event_index").is_none());
+        assert_eq!(json.get("type").unwrap(), "var_set_event");
     }
 }
