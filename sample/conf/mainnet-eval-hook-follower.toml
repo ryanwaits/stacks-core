@@ -1,0 +1,65 @@
+# ============================================================
+# STACKS FOLLOWER — MAINNET EVAL-HOOK FEEDER (FROM GENESIS)
+# ============================================================
+#
+# Empty-disk IBD follower that executes every Clarity tx so the
+# eval-hook write log is complete. This is how you get full
+# historical var/map + nested contract-call? traces.
+#
+# DO NOT restore a Hiro / archive chainstate snapshot into
+# working_dir. Snapshots skip Clarity execution; the hook never
+# sees that history.
+#
+# DO NOT set vm_trace_max_bytes > 0. A truncated marker means
+# dropped writes; you cannot reconstruct Clarity state from an
+# incomplete log.
+#
+# Dedicated feeder. Do not combine with a snapshot RPC node.
+# Bitcoin must also have every block (bitcoind from genesis, or
+# a full-history source). Catch-up is days–weeks.
+#
+# After catch-up, snapshot THIS node's chainstate plus the
+# indexer DB. Disaster recovery replays the trace log, not
+# Clarity.
+#
+# Requires this fork's stacks-node (stock binaries panic on
+# events_keys "storage" / "contract_calls").
+#
+#   stacks-node start --config sample/conf/mainnet-eval-hook-follower.toml
+
+[node]
+# Persistent empty directory. Wipe it if you previously restored
+# a snapshot here.
+working_dir = "/stacks-data/mainnet-eval-hook-feeder"
+
+rpc_bind = "0.0.0.0:20443"
+p2p_bind = "0.0.0.0:20444"
+prometheus_bind = "0.0.0.0:9153"
+
+miner = false
+stacker = false
+
+# Unlimited traces. Required for full-state reconstruction.
+vm_trace_max_bytes = 0
+
+# Block until the indexer ACKs. Do not drop /new_block.
+event_dispatcher_blocking = true
+
+# Mainnet bootstrap nodes are auto-populated when mode = "mainnet".
+
+[burnchain]
+mode = "mainnet"
+peer_host = "127.0.0.1"
+# rpc_port = 8332
+# peer_port = 8333
+# username = "your-bitcoin-rpc-user"
+# password = "your-bitcoin-rpc-password"
+
+# Genesis /new_block bodies are large (~80MB at height 0; later
+# blocks grow with vm_events). Timeout must cover that. Retries
+# on: a missed block is a hole in the write log.
+[[events_observer]]
+endpoint = "127.0.0.1:3700"
+events_keys = ["*", "storage", "contract_calls"]
+timeout_ms = 120000
+disable_retries = false
