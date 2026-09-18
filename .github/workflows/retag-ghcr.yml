@@ -1,0 +1,38 @@
+# Retag an existing GHCR image without rebuilding.
+# Used to pin a SHA tag (e.g. 441e595) onto a branch-tagged image.
+
+name: Retag GHCR Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "Existing image tag to copy"
+        required: true
+        type: string
+      dest_tag:
+        description: "New tag (usually short SHA)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  retag:
+    name: "Retag Image"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docker Login
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy tag
+        run: |
+          docker buildx imagetools create \
+            -t "ghcr.io/${{ github.repository }}:${{ inputs.dest_tag }}" \
+            "ghcr.io/${{ github.repository }}:${{ inputs.source_tag }}"
