@@ -363,6 +363,9 @@ impl Node {
         chain_state
             .clarity_state
             .set_emit_vm_trace(event_dispatcher.emit_vm_trace());
+        chain_state
+            .clarity_state
+            .set_vm_trace_max_bytes(config.node.vm_trace_max_bytes);
 
         let burnchain_config = config.get_burnchain();
 

@@ -346,6 +346,14 @@ impl SmartContractEventData {
 pub enum VmTraceEvent {
     Storage(StorageEvent),
     ContractCall(ContractCallEventData),
+    /// Emergency only: a positive `vm_trace_max_bytes` was set and this tx
+    /// exceeded it. `dropped` counts traces not recorded after the cap,
+    /// including the overflowing event. Those writes are gone — a genesis
+    /// feeder that reconstructs Clarity state must leave the cap at `0`
+    /// so this variant is never emitted.
+    Truncated {
+        dropped: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -499,6 +507,36 @@ impl ContractCallEventData {
 }
 
 impl VmTraceEvent {
+    /// Approximate in-memory size for the per-tx collector cap. Dominated by
+    /// hex strings; not JSON size.
+    pub(crate) fn approx_size(&self) -> usize {
+        const BASE: usize = 96;
+        match self {
+            VmTraceEvent::Storage(StorageEvent::VarSet(data)) => BASE
+                .saturating_add(data.var_name.len())
+                .saturating_add(data.raw_value.len()),
+            VmTraceEvent::Storage(StorageEvent::MapSet(data))
+            | VmTraceEvent::Storage(StorageEvent::MapInsert(data)) => BASE
+                .saturating_add(data.map_name.len())
+                .saturating_add(data.raw_key.len())
+                .saturating_add(data.raw_value.len()),
+            VmTraceEvent::Storage(StorageEvent::MapDelete(data)) => BASE
+                .saturating_add(data.map_name.len())
+                .saturating_add(data.raw_key.len()),
+            VmTraceEvent::ContractCall(data) => {
+                let args = data
+                    .function_args
+                    .iter()
+                    .map(|a| a.len())
+                    .fold(0usize, usize::saturating_add);
+                BASE.saturating_add(data.function_name.len())
+                    .saturating_add(data.raw_result.len())
+                    .saturating_add(args)
+            }
+            VmTraceEvent::Truncated { .. } => 24,
+        }
+    }
+
     pub fn json_serialize(&self, txid: &dyn std::fmt::Debug, committed: bool) -> serde_json::Value {
         match self {
             VmTraceEvent::Storage(StorageEvent::VarSet(event_data)) => json!({
@@ -530,6 +568,12 @@ impl VmTraceEvent {
                 "committed": committed,
                 "type": "contract_call_event",
                 "contract_call_event": event_data.json_serialize()
+            }),
+            VmTraceEvent::Truncated { dropped } => json!({
+                "txid": format!("0x{txid:?}"),
+                "committed": committed,
+                "type": "truncated",
+                "truncated": { "dropped": dropped }
             }),
         }
     }
@@ -641,5 +685,14 @@ mod tests {
         assert!(json.get("event_index").is_none());
         assert!(json.get("vm_event_index").is_none());
         assert_eq!(json.get("type").unwrap(), "var_set_event");
+    }
+
+    #[test]
+    fn truncated_json_has_dropped_and_no_event_index() {
+        let json = VmTraceEvent::Truncated { dropped: 7 }.json_serialize(&"deadbeef", true);
+        assert!(json.get("event_index").is_none());
+        assert!(json.get("vm_event_index").is_none());
+        assert_eq!(json.get("type").unwrap(), "truncated");
+        assert_eq!(json["truncated"]["dropped"], 7);
     }
 }

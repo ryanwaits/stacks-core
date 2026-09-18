@@ -34,12 +34,21 @@ struct PendingStorageCall {
     values: Vec<Option<Value>>,
 }
 
+/// One rollback frame of traces, with a running size used by the per-tx cap.
+#[derive(Default)]
+struct TraceBatch {
+    events: Vec<VmTraceEvent>,
+    approx_bytes: usize,
+}
+
 /// Batch-stacked write / nested-call collector.
 #[derive(Default)]
 pub struct StorageTraceCollector {
     enabled: bool,
-    batches: Vec<Vec<VmTraceEvent>>,
-    committed: Vec<VmTraceEvent>,
+    /// Per-tx cap on live traces. `0` means unlimited.
+    max_bytes: usize,
+    batches: Vec<TraceBatch>,
+    committed: TraceBatch,
     pending: Vec<PendingStorageCall>,
 }
 
@@ -47,6 +56,13 @@ impl StorageTraceCollector {
     /// Enable or disable collection. Disabled is a no-op on every method.
     pub fn set_enabled(&mut self, on: bool) {
         self.enabled = on;
+    }
+
+    /// Per-tx size cap in bytes. `0` (default) is unlimited and is required
+    /// for a write log that can reconstruct full Clarity state. A positive
+    /// value drops traces past the cap.
+    pub fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
     }
 
     /// Whether collection is on.
@@ -57,7 +73,7 @@ impl StorageTraceCollector {
     /// Push a new batch (mirrors `GlobalContext::begin` / `begin_read_only`).
     pub fn begin_batch(&mut self) {
         if self.enabled {
-            self.batches.push(Vec::new());
+            self.batches.push(TraceBatch::default());
         }
     }
 
@@ -70,7 +86,8 @@ impl StorageTraceCollector {
             return;
         };
         if let Some(parent) = self.batches.last_mut() {
-            parent.append(&mut batch);
+            parent.approx_bytes = parent.approx_bytes.saturating_add(batch.approx_bytes);
+            parent.events.append(&mut batch.events);
         } else {
             self.committed = batch;
         }
@@ -87,9 +104,14 @@ impl StorageTraceCollector {
         };
         if was_read_only {
             if let Some(parent) = self.batches.last_mut() {
-                parent.append(&mut batch);
+                parent.approx_bytes = parent.approx_bytes.saturating_add(batch.approx_bytes);
+                parent.events.append(&mut batch.events);
             } else {
-                self.committed.append(&mut batch);
+                self.committed.approx_bytes = self
+                    .committed
+                    .approx_bytes
+                    .saturating_add(batch.approx_bytes);
+                self.committed.events.append(&mut batch.events);
             }
         }
     }
@@ -98,24 +120,66 @@ impl StorageTraceCollector {
     pub fn take_committed(&mut self) -> Vec<VmTraceEvent> {
         self.pending.clear();
         self.batches.clear();
-        std::mem::take(&mut self.committed)
+        std::mem::take(&mut self.committed).events
     }
 
     /// Borrow committed traces without draining.
     pub fn committed(&self) -> &[VmTraceEvent] {
-        &self.committed
+        &self.committed.events
+    }
+
+    fn live_bytes(&self) -> usize {
+        self.committed.approx_bytes.saturating_add(
+            self.batches
+                .iter()
+                .map(|b| b.approx_bytes)
+                .fold(0usize, usize::saturating_add),
+        )
+    }
+
+    fn current_mut(&mut self) -> &mut TraceBatch {
+        self.batches.last_mut().unwrap_or(&mut self.committed)
+    }
+
+    fn current_is_truncated(&self) -> bool {
+        let events = self
+            .batches
+            .last()
+            .map(|b| b.events.as_slice())
+            .unwrap_or(self.committed.events.as_slice());
+        matches!(events.last(), Some(VmTraceEvent::Truncated { .. }))
     }
 
     /// Record an already-built event onto the current batch.
+    ///
+    /// If a per-tx byte cap is set and this event would exceed it, a single
+    /// [`VmTraceEvent::Truncated`] marker is appended instead and further
+    /// events increment `dropped`. A truncated nested batch that rolls back
+    /// drops the marker with the batch.
     pub fn push_event(&mut self, event: VmTraceEvent) {
         if !self.enabled {
             return;
         }
-        if let Some(batch) = self.batches.last_mut() {
-            batch.push(event);
-        } else {
-            self.committed.push(event);
+        if self.current_is_truncated() {
+            if let Some(VmTraceEvent::Truncated { dropped }) = self.current_mut().events.last_mut()
+            {
+                *dropped = dropped.saturating_add(1);
+            }
+            return;
         }
+        let size = event.approx_size();
+        let live = self.live_bytes();
+        if self.max_bytes > 0 && live.saturating_add(size) > self.max_bytes {
+            let truncated = VmTraceEvent::Truncated { dropped: 1 };
+            let tsize = truncated.approx_size();
+            let target = self.current_mut();
+            target.approx_bytes = target.approx_bytes.saturating_add(tsize);
+            target.events.push(truncated);
+            return;
+        }
+        let target = self.current_mut();
+        target.approx_bytes = target.approx_bytes.saturating_add(size);
+        target.events.push(event);
     }
 
     /// Open a storage builtin call we might emit.

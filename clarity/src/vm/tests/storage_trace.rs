@@ -5,7 +5,8 @@ use stacks_common::types::StacksEpochId;
 use crate::vm::ClarityVersion;
 use crate::vm::contexts::OwnedEnvironment;
 use crate::vm::database::MemoryBackingStore;
-use crate::vm::events::{StorageEvent, VmTraceEvent};
+use crate::vm::events::{StorageEvent, VarSetEventData, VmTraceEvent};
+use crate::vm::hooks::storage::StorageTraceCollector;
 use crate::vm::types::{PrincipalData, QualifiedContractIdentifier, Value};
 
 const STORE: &str = r#"
@@ -283,4 +284,97 @@ fn failed_public_drops_own_writes() {
         "aborted public fn drops traces: {:?}",
         env.vm_trace_events()
     );
+}
+
+fn var_set_trace(n: u128) -> VmTraceEvent {
+    VmTraceEvent::Storage(StorageEvent::VarSet(
+        VarSetEventData::try_from_value(store_id(), "n".into(), &Value::UInt(n)).unwrap(),
+    ))
+}
+
+#[test]
+fn unlimited_cap_keeps_every_event() {
+    let mut c = StorageTraceCollector::default();
+    c.set_enabled(true);
+    c.set_max_bytes(0);
+    for i in 0..50 {
+        c.push_event(var_set_trace(i));
+    }
+    assert_eq!(c.committed().len(), 50);
+    assert!(
+        c.committed()
+            .iter()
+            .all(|e| !matches!(e, VmTraceEvent::Truncated { .. }))
+    );
+}
+
+#[test]
+fn positive_cap_emits_truncated_and_drops_rest() {
+    let mut c = StorageTraceCollector::default();
+    c.set_enabled(true);
+    let first = var_set_trace(1);
+    c.set_max_bytes(first.approx_size().saturating_add(8));
+    c.push_event(first);
+    c.push_event(var_set_trace(2));
+    c.push_event(var_set_trace(3));
+    assert_eq!(c.committed().len(), 2, "{:?}", c.committed());
+    assert!(matches!(
+        c.committed()[0],
+        VmTraceEvent::Storage(StorageEvent::VarSet(_))
+    ));
+    assert!(matches!(
+        c.committed()[1],
+        VmTraceEvent::Truncated { dropped: 2 }
+    ));
+}
+
+#[test]
+fn rolled_back_truncated_batch_does_not_poison_parent() {
+    let mut c = StorageTraceCollector::default();
+    c.set_enabled(true);
+    c.set_max_bytes(1);
+    c.begin_batch();
+    c.begin_batch();
+    c.push_event(var_set_trace(1));
+    assert!(c.committed().last().is_none());
+    c.rollback_batch(false);
+    c.set_max_bytes(0);
+    c.push_event(var_set_trace(9));
+    c.commit_batch();
+    assert_eq!(c.committed().len(), 1);
+    assert!(matches!(
+        c.committed()[0],
+        VmTraceEvent::Storage(StorageEvent::VarSet(_))
+    ));
+}
+
+#[test]
+fn env_unlimited_by_default_records_writes() {
+    let mut marf = MemoryBackingStore::new();
+    let mut env = OwnedEnvironment::new(marf.as_clarity_db(), StacksEpochId::latest());
+    init_store(&mut env);
+    env.set_emit_vm_trace(true);
+    env.set_vm_trace_max_bytes(0);
+    let (value, _) = exec(&mut env, &store_id(), "set-n", vec![Value::UInt(3)]);
+    assert!(is_ok_true(&value));
+    assert!(matches!(
+        env.vm_trace_events()[0],
+        VmTraceEvent::Storage(StorageEvent::VarSet(_))
+    ));
+}
+
+#[test]
+fn env_tiny_cap_emits_truncated() {
+    let mut marf = MemoryBackingStore::new();
+    let mut env = OwnedEnvironment::new(marf.as_clarity_db(), StacksEpochId::latest());
+    init_store(&mut env);
+    env.set_emit_vm_trace(true);
+    env.set_vm_trace_max_bytes(1);
+    let (value, _) = exec(&mut env, &store_id(), "set-n", vec![Value::UInt(3)]);
+    assert!(is_ok_true(&value));
+    assert_eq!(env.vm_trace_events().len(), 1);
+    assert!(matches!(
+        env.vm_trace_events()[0],
+        VmTraceEvent::Truncated { dropped: 1 }
+    ));
 }

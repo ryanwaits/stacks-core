@@ -12,6 +12,8 @@ miner = true
 mock_mining = true
 mine_microblocks = false
 seed = "b8d99fd45da58038d630d9855d3ca2466e8e0f89d3894c4724f0efc9ff4b51f0"
+# Unlimited. A positive cap emits type=truncated and drops writes.
+vm_trace_max_bytes = 0
 
 [burnchain]
 mode = "mocknet"

@@ -92,6 +92,8 @@ pub struct ClarityInstance {
     mainnet: bool,
     chain_id: u32,
     emit_vm_trace: bool,
+    /// Per-tx eval-hook trace cap in bytes. `0` = unlimited.
+    vm_trace_max_bytes: u64,
 }
 
 ///
@@ -122,6 +124,7 @@ pub struct ClarityBlockConnection<'a, 'b> {
     chain_id: u32,
     epoch: StacksEpochId,
     emit_vm_trace: bool,
+    vm_trace_max_bytes: u64,
 }
 
 ///
@@ -142,6 +145,7 @@ pub struct ClarityTransactionConnection<'a, 'b> {
     /// connection.
     cache: ClarityExecutionCache,
     emit_vm_trace: bool,
+    vm_trace_max_bytes: u64,
     last_vm_events: Vec<clarity::vm::events::VmTraceEvent>,
 }
 
@@ -282,6 +286,7 @@ impl<'a, 'b> ClarityTransactionConnection<'a, 'b> {
             epoch,
             cache: ClarityExecutionCache::default(),
             emit_vm_trace: false,
+            vm_trace_max_bytes: 0,
             last_vm_events: Vec::new(),
         }
     }
@@ -344,6 +349,7 @@ impl ClarityBlockConnection<'_, '_> {
             chain_id: CHAIN_ID_TESTNET,
             epoch,
             emit_vm_trace: false,
+            vm_trace_max_bytes: 0,
         }
     }
 
@@ -400,6 +406,7 @@ impl ClarityBlockConnection<'_, '_> {
             chain_id,
             epoch: epoch.epoch_id,
             emit_vm_trace: false,
+            vm_trace_max_bytes: 0,
         }
     }
 
@@ -424,6 +431,7 @@ impl ClarityBlockConnection<'_, '_> {
             chain_id,
             epoch: GENESIS_EPOCH,
             emit_vm_trace: false,
+            vm_trace_max_bytes: 0,
         }
     }
 
@@ -491,6 +499,7 @@ impl ClarityInstance {
         ClarityInstance {
             datastore,
             emit_vm_trace: false,
+            vm_trace_max_bytes: 0,
             mainnet,
             chain_id,
         }
@@ -498,6 +507,10 @@ impl ClarityInstance {
 
     pub fn set_emit_vm_trace(&mut self, on: bool) {
         self.emit_vm_trace = on;
+    }
+
+    pub fn set_vm_trace_max_bytes(&mut self, max_bytes: u64) {
+        self.vm_trace_max_bytes = max_bytes;
     }
 
     pub fn with_marf<F, R>(&mut self, f: F) -> R
@@ -553,6 +566,7 @@ impl ClarityInstance {
             epoch,
         );
         conn.emit_vm_trace = self.emit_vm_trace;
+        conn.vm_trace_max_bytes = self.vm_trace_max_bytes;
         conn
     }
 
@@ -572,6 +586,7 @@ impl ClarityInstance {
             self.chain_id,
         );
         conn.emit_vm_trace = self.emit_vm_trace;
+        conn.vm_trace_max_bytes = self.vm_trace_max_bytes;
         conn
     }
 
@@ -599,6 +614,7 @@ impl ClarityInstance {
             chain_id: self.chain_id,
             epoch,
             emit_vm_trace: self.emit_vm_trace,
+            vm_trace_max_bytes: self.vm_trace_max_bytes,
         };
 
         let use_mainnet = self.mainnet;
@@ -699,6 +715,7 @@ impl ClarityInstance {
             chain_id: self.chain_id,
             epoch,
             emit_vm_trace: self.emit_vm_trace,
+            vm_trace_max_bytes: self.vm_trace_max_bytes,
         };
 
         let use_mainnet = self.mainnet;
@@ -811,6 +828,7 @@ impl ClarityInstance {
             chain_id: self.chain_id,
             epoch: epoch.epoch_id,
             emit_vm_trace: self.emit_vm_trace,
+            vm_trace_max_bytes: self.vm_trace_max_bytes,
         }
     }
 
@@ -852,6 +870,7 @@ impl ClarityInstance {
             chain_id: self.chain_id,
             epoch: epoch.epoch_id,
             emit_vm_trace: self.emit_vm_trace,
+            vm_trace_max_bytes: self.vm_trace_max_bytes,
         }
     }
 
@@ -2263,6 +2282,7 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
             self.epoch,
         );
         tx.emit_vm_trace = self.emit_vm_trace;
+        tx.vm_trace_max_bytes = self.vm_trace_max_bytes;
         tx
     }
 
@@ -2420,6 +2440,9 @@ impl TransactionConnection for ClarityTransactionConnection<'_, '_> {
                     self.epoch,
                 );
                 vm_env.set_emit_vm_trace(self.emit_vm_trace);
+                vm_env.set_vm_trace_max_bytes(
+                    usize::try_from(self.vm_trace_max_bytes).unwrap_or(usize::MAX),
+                );
 
                 let result = to_do(&mut vm_env);
                 let vm_events = vm_env.take_vm_trace_events();

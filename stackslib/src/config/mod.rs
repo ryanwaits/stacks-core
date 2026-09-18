@@ -2386,6 +2386,21 @@ pub struct NodeConfig {
     pub pox_5_bond_admin: Option<PrincipalData>,
     /// Principal that can permanently pause PoX-5 signer reward claims.
     pub pox_5_pause_admin: Option<PrincipalData>,
+    /// Per-transaction cap on in-memory eval-hook VM traces, in bytes.
+    /// `0` (default) is unlimited: every committed write and nested
+    /// `contract-call?` is emitted. A genesis feeder that reconstructs
+    /// Clarity state from the write log **must** leave this at `0`.
+    ///
+    /// A positive value is an emergency brake only: the collector stops
+    /// recording that tx, appends a `type: "truncated"` marker with a
+    /// `dropped` count, and those writes are gone. Do not use this on
+    /// a historical feeder.
+    /// ---
+    /// @default: `0` (unlimited)
+    /// @units: bytes
+    /// @toml_example: |
+    ///   vm_trace_max_bytes = 0
+    pub vm_trace_max_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2657,6 +2672,7 @@ impl Default for NodeConfig {
             pox_5_sbtc_registry_contract: None,
             pox_5_bond_admin: None,
             pox_5_pause_admin: None,
+            vm_trace_max_bytes: 0,
         }
     }
 }
@@ -4196,6 +4212,8 @@ pub struct NodeConfigFile {
     pub pox_5_bond_admin: Option<String>,
     /// Principal that can permanently pause PoX-5 signer reward claims.
     pub pox_5_pause_admin: Option<String>,
+    /// Per-tx eval-hook trace cap in bytes. `0` / omitted = unlimited.
+    pub vm_trace_max_bytes: Option<u64>,
 }
 
 impl NodeConfigFile {
@@ -4327,6 +4345,9 @@ impl NodeConfigFile {
                 .map(PrincipalData::parse)
                 .transpose()
                 .map_err(|e| format!("Invalid pox_5_pause_admin: {e}"))?,
+            vm_trace_max_bytes: self
+                .vm_trace_max_bytes
+                .unwrap_or(default_node_config.vm_trace_max_bytes),
         };
         Ok(node_config)
     }

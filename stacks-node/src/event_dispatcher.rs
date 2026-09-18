@@ -150,6 +150,18 @@ fn serialize_block_vm_events(
             let include = match event {
                 VmTraceEvent::Storage(_) => include_storage,
                 VmTraceEvent::ContractCall(_) => include_contract_calls,
+                VmTraceEvent::Truncated { dropped } => {
+                    if include_storage || include_contract_calls {
+                        warn!(
+                            "vm trace truncated for tx";
+                            "txid" => %txid,
+                            "dropped" => dropped,
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                }
             };
             if include {
                 out.push(event.json_serialize(&txid, true));

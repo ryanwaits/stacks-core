@@ -382,6 +382,10 @@ impl<'a, 'hooks> OwnedEnvironment<'a, 'hooks> {
         self.context.set_emit_vm_trace(on);
     }
 
+    pub fn set_vm_trace_max_bytes(&mut self, max_bytes: usize) {
+        self.context.set_vm_trace_max_bytes(max_bytes);
+    }
+
     pub fn take_vm_trace_events(&mut self) -> Vec<crate::vm::events::VmTraceEvent> {
         self.context.storage_trace.take_committed()
     }
@@ -1455,6 +1459,10 @@ impl<'a, 'hooks> GlobalContext<'a, 'hooks> {
     pub fn set_emit_vm_trace(&mut self, on: bool) {
         self.emit_vm_trace = on;
         self.storage_trace.set_enabled(on);
+    }
+
+    pub fn set_vm_trace_max_bytes(&mut self, max_bytes: usize) {
+        self.storage_trace.set_max_bytes(max_bytes);
     }
 
     fn get_asset_map(&mut self) -> Result<&mut AssetMap, VmExecutionError> {

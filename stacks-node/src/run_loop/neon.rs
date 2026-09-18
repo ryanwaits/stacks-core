@@ -651,6 +651,9 @@ impl RunLoop {
         chain_state_db
             .clarity_state
             .set_emit_vm_trace(self.event_dispatcher.emit_vm_trace());
+        chain_state_db
+            .clarity_state
+            .set_vm_trace_max_bytes(self.config.node.vm_trace_max_bytes);
         run_loop::announce_boot_receipts(
             &mut self.event_dispatcher,
             &chain_state_db,
