@@ -76,6 +76,7 @@ use crate::clarity_vm::clarity::{
 };
 use crate::clarity_vm::database::marf::MarfedKV;
 use crate::clarity_vm::database::HeadersDBConn;
+use crate::clarity_vm::state_writes::StateWrite;
 use crate::core::*;
 use crate::monitoring;
 use crate::net::atlas::BNS_CHARS_REGEX;
@@ -226,6 +227,9 @@ pub struct StacksEpochReceipt {
     /// Was .signers updated during this block?
     pub signers_updated: bool,
     pub coinbase_height: u64,
+    /// Every Clarity MARF write the block made, in write order, when the
+    /// `ClarityInstance` was collecting them; `None` otherwise.
+    pub state_writes: Option<Vec<StateWrite>>,
 }
 
 /// Headers we serve over the network

@@ -40,6 +40,7 @@ use crate::clarity_vm::clarity::{
 };
 use crate::clarity_vm::database::ephemeral::EphemeralMarfStore;
 use crate::clarity_vm::special::handle_contract_call_special_cases;
+use crate::clarity_vm::state_writes::StateWriteLog;
 use crate::core::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
 use crate::util_lib::db::{Error as DatabaseError, IndexDBConn};
 
@@ -253,6 +254,7 @@ impl MarfedKV {
         PersistentWritableMarfStore {
             chain_tip,
             marf: tx,
+            state_writes: None,
         }
     }
 
@@ -281,6 +283,7 @@ impl MarfedKV {
         PersistentWritableMarfStore {
             chain_tip,
             marf: tx,
+            state_writes: None,
         }
     }
 
@@ -387,6 +390,8 @@ pub struct PersistentWritableMarfStore<'a> {
     chain_tip: StacksBlockId,
     /// The transaction to the MARF instance
     marf: MarfTransaction<'a, StacksBlockId>,
+    /// Record of `put_all_data` writes; `None` unless collection was enabled
+    state_writes: Option<StateWriteLog>,
 }
 
 /// A wrapper around a MARF handle which allows only read access to the MARF's keys off of a given
@@ -1008,6 +1013,9 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
         for (key, value) in items.into_iter() {
             let marf_value = MARFValue::from_value(&value);
             SqliteConnection::put(self.marf.sqlite_tx(), &marf_value.to_hex(), &value)?;
+            if let Some(log) = self.state_writes.as_mut() {
+                log.record(&key, &value);
+            }
             keys.push(key);
             values.push(marf_value);
         }
@@ -1050,7 +1058,15 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
     }
 }
 
-impl WritableMarfStore for PersistentWritableMarfStore<'_> {}
+impl WritableMarfStore for PersistentWritableMarfStore<'_> {
+    fn enable_state_write_log(&mut self) {
+        self.state_writes.get_or_insert_with(StateWriteLog::default);
+    }
+
+    fn state_write_log(&mut self) -> Option<&mut StateWriteLog> {
+        self.state_writes.as_mut()
+    }
+}
 
 /// This trait exists so we can implement `ClarityMarfStore`, `ClarityMarfStoreTransaction`, and
 /// `WritableMarfStore` for `Box<dyn WritableMarfStore + '_>`.  We need
@@ -1247,4 +1263,12 @@ impl<'a> ClarityBackingStore for Box<dyn WritableMarfStore + 'a> {
 }
 
 impl<'a> ClarityMarfStore for Box<dyn WritableMarfStore + 'a> {}
-impl<'a> WritableMarfStore for Box<dyn WritableMarfStore + 'a> {}
+impl<'a> WritableMarfStore for Box<dyn WritableMarfStore + 'a> {
+    fn enable_state_write_log(&mut self) {
+        WritableMarfStore::enable_state_write_log(self.deref_mut())
+    }
+
+    fn state_write_log(&mut self) -> Option<&mut StateWriteLog> {
+        WritableMarfStore::state_write_log(self.deref_mut())
+    }
+}

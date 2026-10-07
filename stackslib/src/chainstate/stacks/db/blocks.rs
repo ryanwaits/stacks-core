@@ -60,6 +60,7 @@ use crate::chainstate::stacks::{
 };
 use crate::clarity_vm::clarity::{ClarityConnection, ClarityInstance};
 use crate::clarity_vm::database::SortitionDBRef;
+use crate::clarity_vm::state_writes::StateWrite;
 use crate::core::mempool::MAXIMUM_MEMPOOL_TX_CHAINING;
 use crate::cost_estimates::EstimatorError;
 use crate::monitoring::{set_last_block_transaction_count, set_last_execution_cost_observed};
@@ -189,6 +190,7 @@ impl BlockEventDispatcher for DummyEventDispatcher {
         _signer_bitvec: &Option<BitVec<4000>>,
         _block_timestamp: Option<u64>,
         _coinbase_height: u64,
+        _state_writes: Option<&[StateWrite]>,
     ) {
         error!("We should never try to announce to the dummy dispatcher");
         panic!();
@@ -3912,10 +3914,10 @@ impl StacksChainState {
         for microblock in microblocks.iter() {
             debug!("Process microblock {}", &microblock.block_hash());
             for (tx_index, tx) in microblock.txs.iter().enumerate() {
-                let (tx_fee, mut tx_receipt) = StacksChainState::process_transaction(
-                    clarity_tx, tx, false, None,
-                )
-                .map_err(|source| {
+                clarity_tx.connection().set_state_write_owner(|| tx.txid());
+                let result = StacksChainState::process_transaction(clarity_tx, tx, false, None);
+                clarity_tx.connection().clear_state_write_owner();
+                let (tx_fee, mut tx_receipt) = result.map_err(|source| {
                     Box::new(MicroblockProcessingFailure {
                         source,
                         microblock_hash: microblock.block_hash(),
@@ -4097,6 +4099,9 @@ impl StacksChainState {
                     }
                 }
             }
+            clarity_tx
+                .connection()
+                .set_state_write_owner(|| txid.clone());
             let (result, vm_events) = clarity_tx.connection().as_transaction(|tx| {
                 let result = tx.run_contract_call(
                     &sender.clone().into(),
@@ -4110,6 +4115,7 @@ impl StacksChainState {
                 let vm_events = tx.take_vm_trace_events();
                 (result, vm_events)
             });
+            clarity_tx.connection().clear_state_write_owner();
             match result {
                 Ok((value, _, events)) => {
                     if let Value::Response(ref resp) = value {
@@ -4222,6 +4228,7 @@ impl StacksChainState {
                             memo,
                             ..
                         } = transfer_stx_op.clone();
+                        clarity_tx.connection().set_state_write_owner(|| txid.clone());
                         let result = clarity_tx.connection().as_transaction(|tx| {
                             tx.run_stx_transfer(
                                 &sender.clone().into(),
@@ -4230,6 +4237,7 @@ impl StacksChainState {
                                 &BuffData { data: memo },
                             )
                         });
+                        clarity_tx.connection().clear_state_write_owner();
                         match result {
                             Ok((value, _, events)) => {
                                 debug!("Processed TransferStx burnchain op"; "transfered_ustx" => transfered_ustx, "sender" => %sender, "recipient" => %recipient, "txid" => %txid);
@@ -4307,6 +4315,9 @@ impl StacksChainState {
             } else {
                 Value::none()
             };
+            clarity_tx
+                .connection()
+                .set_state_write_owner(|| txid.clone());
             let (result, vm_events) = clarity_tx.connection().as_transaction(|tx| {
                 let result = tx.run_contract_call(
                     &sender.clone().into(),
@@ -4325,6 +4336,7 @@ impl StacksChainState {
                 let vm_events = tx.take_vm_trace_events();
                 (result, vm_events)
             });
+            clarity_tx.connection().clear_state_write_owner();
             match result {
                 Ok((value, _, events)) => {
                     if let Value::Response(ref resp) = value {
@@ -4418,6 +4430,9 @@ impl StacksChainState {
                 "aggregate_key" => aggregate_key.to_hex(),
                 "txid" => %txid
             );
+            clarity_tx
+                .connection()
+                .set_state_write_owner(|| txid.clone());
             let (result, vm_events) = clarity_tx.connection().as_transaction(|tx| {
                 let result = tx.run_contract_call(
                     &sender.clone().into(),
@@ -4436,6 +4451,7 @@ impl StacksChainState {
                 let vm_events = tx.take_vm_trace_events();
                 (result, vm_events)
             });
+            clarity_tx.connection().clear_state_write_owner();
             match result {
                 Ok((value, _, events)) => {
                     if let Value::Response(ref resp) = value {
@@ -4520,14 +4536,20 @@ impl StacksChainState {
         let mut receipts = vec![];
         let mut total_size = 0u64;
         for tx_to_process in block_txs {
-            let (tx_fee, mut tx_receipt) = match tx_to_process {
+            let tx = match &tx_to_process {
+                TxToProcess::Skip { tx, .. } | TxToProcess::Execute(tx) => *tx,
+            };
+            clarity_tx.connection().set_state_write_owner(|| tx.txid());
+            let result = match tx_to_process {
                 TxToProcess::Skip { tx, category } => {
-                    StacksChainState::process_skipped_transaction(clarity_tx, tx, category, false)?
+                    StacksChainState::process_skipped_transaction(clarity_tx, tx, category, false)
                 }
                 TxToProcess::Execute(tx) => {
-                    StacksChainState::process_transaction(clarity_tx, tx, false, None)?
+                    StacksChainState::process_transaction(clarity_tx, tx, false, None)
                 }
             };
+            clarity_tx.connection().clear_state_write_owner();
+            let (tx_fee, mut tx_receipt) = result?;
             fees = fees.checked_add(u128::from(tx_fee)).expect("Fee overflow");
             tx_receipt.tx_index = tx_index;
             total_size = total_size.saturating_add(tx_receipt.size().ok_or_else(|| {
@@ -5515,6 +5537,7 @@ impl StacksChainState {
             parent_burn_block_height,
             parent_burn_block_timestamp,
             clarity_commit,
+            state_writes,
         ) = {
             // get previous burn block stats
             let (parent_burn_block_hash, parent_burn_block_height, parent_burn_block_timestamp) =
@@ -5689,6 +5712,7 @@ impl StacksChainState {
                    "block cost" => %block_cost);
 
             // good to go!
+            let state_writes = clarity_tx.connection().take_state_writes();
             let clarity_commit =
                 clarity_tx.precommit_to_block(chain_tip_consensus_hash, &block.block_hash());
 
@@ -5743,6 +5767,7 @@ impl StacksChainState {
                 parent_burn_block_height,
                 parent_burn_block_timestamp,
                 clarity_commit,
+                state_writes,
             )
         };
 
@@ -5769,6 +5794,7 @@ impl StacksChainState {
                 epoch_transition: applied_epoch_transition,
                 signers_updated: false,
                 coinbase_height,
+                state_writes,
             };
 
             return Ok((epoch_receipt, clarity_commit, None));
@@ -5861,6 +5887,7 @@ impl StacksChainState {
             epoch_transition: applied_epoch_transition,
             signers_updated,
             coinbase_height,
+            state_writes,
         };
 
         Ok((epoch_receipt, clarity_commit, reward_set_data))
@@ -6336,6 +6363,7 @@ impl StacksChainState {
                 &None,
                 None,
                 next_staging_block.height,
+                epoch_receipt.state_writes.as_deref(),
             );
         }
 

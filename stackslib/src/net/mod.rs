@@ -2353,6 +2353,7 @@ pub mod test {
     use crate::chainstate::stacks::tests::*;
     use crate::chainstate::stacks::{StacksMicroblockHeader, *};
     use crate::chainstate::tests::{TestChainstate, TestChainstateConfig};
+    use crate::clarity_vm::state_writes::StateWrite;
     use crate::core::{StacksEpoch, StacksEpochExtension};
     use crate::cost_estimates::metrics::UnitMetric;
     use crate::cost_estimates::tests::fee_rate_fuzzer::ConstantFeeEstimator;
@@ -2561,6 +2562,7 @@ pub mod test {
         pub matured_rewards: Vec<MinerReward>,
         pub matured_rewards_info: Option<MinerRewardInfo>,
         pub reward_set_data: Option<RewardSetData>,
+        pub state_writes: Option<Vec<StateWrite>>,
     }
 
     pub struct TestEventObserver {
@@ -2599,6 +2601,7 @@ pub mod test {
             _signer_bitvec: &Option<BitVec<4000>>,
             _block_timestamp: Option<u64>,
             _coinbase_height: u64,
+            state_writes: Option<&[StateWrite]>,
         ) {
             self.blocks.lock().unwrap().push(TestEventObserverBlock {
                 block: block.clone(),
@@ -2609,6 +2612,7 @@ pub mod test {
                 matured_rewards: matured_rewards.to_owned(),
                 matured_rewards_info: matured_rewards_info.cloned(),
                 reward_set_data: reward_set_data.clone(),
+                state_writes: state_writes.map(<[StateWrite]>::to_vec),
             })
         }
 

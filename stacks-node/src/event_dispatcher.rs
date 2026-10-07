@@ -45,6 +45,7 @@ use stacks::chainstate::stacks::events::{
 };
 use stacks::chainstate::stacks::miner::TransactionEvent;
 use stacks::chainstate::stacks::{StacksBlock, StacksMicroblock, StacksTransaction};
+use stacks::clarity_vm::state_writes::{state_write_entries, tx_index_map, StateWrite};
 use stacks::config::{Config, EventKeyType, EventObserverConfig};
 use stacks::core::mempool::{MemPoolDropReason, MemPoolEventDispatcher, ProposalCallbackReceiver};
 use stacks::libstackerdb::StackerDBChunkData;
@@ -171,6 +172,21 @@ fn serialize_block_vm_events(
     serde_json::Value::Array(out)
 }
 
+/// Block-order `state_writes`: every Clarity MARF write the block made, as
+/// recorded by the storage layer. `tx_index` matches the `transactions` array of
+/// the same payload (`null` = block-level write). Unlike `vm_events`, aborted and
+/// problematic-skipped receipts are not filtered: the storage layer never sees
+/// their rolled-back writes, and the fee and nonce writes they did commit are
+/// real trie changes.
+fn serialize_block_state_writes(
+    state_writes: &[StateWrite],
+    receipts: &[StacksTransactionReceipt],
+) -> serde_json::Value {
+    let tx_index_of = tx_index_map(receipts.iter().map(|receipt| receipt.transaction.txid()));
+    serde_json::to_value(state_write_entries(state_writes, &tx_index_of))
+        .expect("FATAL: failed to serialize state writes")
+}
+
 #[cfg(test)]
 static TEST_EVENT_OBSERVER_SKIP_RETRY: LazyLock<TestFlag<bool>> = LazyLock::new(TestFlag::default);
 
@@ -234,6 +250,8 @@ pub struct EventDispatcher {
     storage_observers_lookup: HashSet<u16>,
     /// Opt-in nested contract-call traces (`"contract_calls"`). Not included in `"*"`.
     contract_call_observers_lookup: HashSet<u16>,
+    /// Opt-in storage-layer MARF write log (`"state_writes"`). Not included in `"*"`.
+    state_writes_observers_lookup: HashSet<u16>,
     /// Channel for sending StackerDB events to the miner coordinator
     pub stackerdb_channel: Arc<Mutex<StackerDBChannel>>,
     /// Path to the database where pending payloads are stored.
@@ -395,6 +413,7 @@ impl BlockEventDispatcher for EventDispatcher {
         signer_bitvec: &Option<BitVec<4000>>,
         block_timestamp: Option<u64>,
         coinbase_height: u64,
+        state_writes: Option<&[StateWrite]>,
     ) {
         self.process_chain_tip(
             block,
@@ -414,6 +433,7 @@ impl BlockEventDispatcher for EventDispatcher {
             signer_bitvec,
             block_timestamp,
             coinbase_height,
+            state_writes,
         );
     }
 
@@ -491,6 +511,7 @@ impl EventDispatcher {
             block_proposal_observers_lookup: HashSet::new(),
             storage_observers_lookup: HashSet::new(),
             contract_call_observers_lookup: HashSet::new(),
+            state_writes_observers_lookup: HashSet::new(),
             db_path,
             worker,
         }
@@ -659,6 +680,7 @@ impl EventDispatcher {
         signer_bitvec: &Option<BitVec<4000>>,
         block_timestamp: Option<u64>,
         coinbase_height: u64,
+        state_writes: Option<&[StateWrite]>,
     ) {
         let (dispatch_matrix, events) = self.create_dispatch_matrix_and_event_vector(receipts);
 
@@ -685,6 +707,12 @@ impl EventDispatcher {
             };
 
             let mature_rewards = serde_json::Value::Array(mature_rewards_vec);
+
+            // Serialized once and shared by every opted-in observer. Absent when
+            // writes were not collected for this block (e.g. the boot block).
+            let state_writes_json = state_writes
+                .filter(|_| self.emit_state_writes())
+                .map(|writes| serialize_block_state_writes(writes, receipts));
 
             #[cfg(any(test, feature = "testing"))]
             if test_skip_block_announcement(block) {
@@ -717,6 +745,18 @@ impl EventDispatcher {
                     coinbase_height,
                     !self.registered_observers[observer_id].disable_contract_interface,
                 );
+
+                if let Some(state_writes_json) = state_writes_json.as_ref() {
+                    if self
+                        .state_writes_observers_lookup
+                        .contains(&(observer_id as u16))
+                    {
+                        payload
+                            .as_object_mut()
+                            .expect("payload is an object")
+                            .insert("state_writes".into(), state_writes_json.clone());
+                    }
+                }
 
                 if self.observer_wants_vm_events(observer_id) {
                     let i = observer_id as u16;
@@ -1061,6 +1101,11 @@ impl EventDispatcher {
         !self.storage_observers_lookup.is_empty() || !self.contract_call_observers_lookup.is_empty()
     }
 
+    /// True if any observer opted into the storage-layer write log.
+    pub fn emit_state_writes(&self) -> bool {
+        !self.state_writes_observers_lookup.is_empty()
+    }
+
     fn observer_wants_vm_events(&self, observer_index: usize) -> bool {
         let i = observer_index as u16;
         self.storage_observers_lookup.contains(&i)
@@ -1147,6 +1192,9 @@ impl EventDispatcher {
                 }
                 EventKeyType::ContractCallEvent => {
                     self.contract_call_observers_lookup.insert(observer_index);
+                }
+                EventKeyType::StateWrites => {
+                    self.state_writes_observers_lookup.insert(observer_index);
                 }
             }
         }

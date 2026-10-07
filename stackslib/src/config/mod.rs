@@ -4902,6 +4902,7 @@ pub enum EventKeyType {
     BlockProposal,
     StorageEvent,
     ContractCallEvent,
+    StateWrites,
 }
 
 impl EventKeyType {
@@ -4940,6 +4941,10 @@ impl EventKeyType {
 
         if raw_key == "contract_calls" {
             return Some(EventKeyType::ContractCallEvent);
+        }
+
+        if raw_key == "state_writes" {
+            return Some(EventKeyType::StateWrites);
         }
 
         let comps: Vec<_> = raw_key.split("::").collect();
@@ -5043,9 +5048,17 @@ mod tests {
             EventKeyType::from_string("contract_calls"),
             Some(EventKeyType::ContractCallEvent)
         );
+        assert_eq!(
+            EventKeyType::from_string("state_writes"),
+            Some(EventKeyType::StateWrites)
+        );
         assert_ne!(
             EventKeyType::from_string("*"),
             EventKeyType::from_string("storage")
+        );
+        assert_ne!(
+            EventKeyType::from_string("*"),
+            EventKeyType::from_string("state_writes")
         );
         assert!(EventKeyType::from_string("contract_call").is_none());
     }

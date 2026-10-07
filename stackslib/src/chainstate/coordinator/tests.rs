@@ -61,6 +61,7 @@ use crate::chainstate::stacks::db::{
 use crate::chainstate::stacks::miner::{BlockBuilder, TransactionResourceBudgets};
 use crate::chainstate::stacks::*;
 use crate::clarity_vm::clarity::ClarityConnection;
+use crate::clarity_vm::state_writes::StateWrite;
 use crate::core::*;
 use crate::util_lib::boot::{boot_code_addr, boot_code_id};
 use crate::util_lib::strings::StacksString;
@@ -403,6 +404,7 @@ impl BlockEventDispatcher for NullEventDispatcher {
         _signer_bitvec: &Option<BitVec<4000>>,
         _block_timestamp: Option<u64>,
         _coinbase_height: u64,
+        _state_writes: Option<&[StateWrite]>,
     ) {
         error!("We should never try to announce to the null dispatcher");
         panic!();

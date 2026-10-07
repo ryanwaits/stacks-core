@@ -90,6 +90,11 @@ Below is a comprehensive list of valid keys and their behaviors:
     *   **Events delivered to**: `/proposal_response`.
     *   **Note**: Requires specific subscription; not included in `*`.
 
+*   `"state_writes"`: Subscribes to the block's storage-layer write log.
+    *   **Description**: Adds a `state_writes` array to `/new_block`: every `(key, value)` the block wrote to the Clarity MARF, recorded where the writes reach the trie (below the Clarity evaluator). Collection is off unless an observer sets this key.
+    *   **Events delivered to**: `/new_block` (field `state_writes`).
+    *   **Note**: Requires specific subscription; not included in `*`. Not delivered for the boot (genesis) block.
+
 *   **Smart Contract Event**: Subscribes to a specific smart contract event.
     *   **Description**: Allows subscription to events emitted by a particular smart contract.
     *   **Format**: `"{deployer_address}.{contract_name}::{event_name}"`
@@ -254,6 +259,38 @@ The section below has example json encodings for each of the burnchain operation
    ]
 }
 ```
+
+#### `state_writes` (opt-in, `"state_writes"` key)
+
+```json
+"state_writes": [
+  { "tx_index": 0, "ordinal": 0, "key": "vm-account::STC9RPHTR8F040J3XY0VSFC5R1MRXPC3P305DHYK::19", "value_hex": "3030...3030" },
+  { "tx_index": 0, "ordinal": 1, "key": "vm::STC9RPHTR8F040J3XY0VSFC5R1MRXPC3P305DHYK.state-writes::1::c", "value_hex": "30313030303030303030303030303030303030303030303030303030303030303062" },
+  { "tx_index": 0, "ordinal": 2, "key": "vm-account::STC9RPHTR8F040J3XY0VSFC5R1MRXPC3P305DHYK::18", "value_hex": "33" },
+  { "tx_index": 3, "ordinal": 10, "key": "vm::STC9RPHTR8F040J3XY0VSFC5R1MRXPC3P305DHYK.state-writes::0::kv::0100000000000000000000000000000001", "value_hex": "306130313030303030303030303030303030303030303030303030303030303030303036" },
+  { "tx_index": null, "ordinal": 37, "key": "_stx-data::ustx_liquid_supply", "value_hex": "3031..." }
+]
+```
+
+*   `tx_index`: index of the producing transaction in this payload's `transactions` array (burnchain operations included), or `null` for a block-level write made outside any transaction (matured miner rewards, PoX unlocks, epoch transitions, tenure and block-time bookkeeping, signer-set updates).
+*   `ordinal`: position in the block's write order, from 0. A key can appear more than once; the last write wins.
+*   `key`: the MARF key string. Its trie path is `sha512/256(key)` (`TrieHash::from_key`).
+*   `value_hex`: hex of the side-store value string's bytes. The trie leaf value is `MARFValue::from_value(value)`. Values are not always hex:
+
+| write | key | value string |
+|---|---|---|
+| `var-set` | `vm::<contract>::1::<var>` | serialized value hex |
+| `map-set` / `map-insert` | `vm::<contract>::0::<map>::<serialized key hex>` | serialized `(some v)` hex (starts `0a`) |
+| `map-delete` | same as `map-set` | serialized `none` hex (`09`) |
+| FT balance | `vm::<contract>::2::<token>::<principal as serde JSON>` (e.g. `{"Standard":[26,[...20 bytes]]}`) | JSON number |
+| FT supply | `vm::<contract>::3::<token>` | JSON number |
+| NFT owner | `vm::<contract>::4::<token>::<asset hex>` | `(some principal)` / `none` hex |
+| STX balance | `vm-account::<principal>::19` | `STXBalance` bytes as hex |
+| nonce | `vm-account::<principal>::18` | JSON number |
+| contract commitment | `clarity-contract::<contract>` | source hash hex + block height hex |
+| chain bookkeeping | e.g. `_stx-data::ustx_liquid_supply` | serialized value hex |
+
+Only committed writes are recorded. A transaction aborted by its response or by a post-condition contributes just the fee debit and nonce bump it committed; its rolled-back writes never reach the trie. The MARF's own bookkeeping keys (`__MARF_BLOCK_HEIGHT_SELF`, `__MARF_BLOCK_HEIGHT_TO_HASH::*`, `__MARF_BLOCK_HASH_TO_HEIGHT::*`) are written by the MARF itself and are not listed; contract metadata (`vm-metadata::*`) lives outside the trie and is not listed either. Every other leaf whose value the block changed is named.
 
 ## Burnchain Operations
 When a transaction in the `/new_block` payload has a `raw_tx` field of `"0x00"`, it signifies a "burnchain operation." These are Stacks operations initiated via the Bitcoin network. The specific operation details are found in the `burnchain_op` field of that transaction object.

@@ -35,6 +35,7 @@ use crate::clarity_vm::clarity::{
 };
 use crate::clarity_vm::database::marf::ReadOnlyMarfStore;
 use crate::clarity_vm::special::handle_contract_call_special_cases;
+use crate::clarity_vm::state_writes::StateWriteLog;
 use crate::core::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
 
 /// Ephemeral MARF store.
@@ -55,6 +56,8 @@ pub struct EphemeralMarfStore<'a> {
     ephemeral_marf: MarfTransaction<'a, StacksBlockId>,
     /// Handle to on-disk MARF
     read_only_marf: ReadOnlyMarfStore<'a>,
+    /// Record of `put_all_data` writes; `None` unless collection was enabled
+    state_writes: Option<StateWriteLog>,
 }
 
 impl ClarityMarfStore for EphemeralMarfStore<'_> {}
@@ -235,6 +238,7 @@ impl<'a> EphemeralMarfStore<'a> {
             base_tip_height,
             ephemeral_marf: ephemeral_marf_tx,
             read_only_marf,
+            state_writes: None,
         };
 
         // setup views so that the ephemeral MARF's data and metadata tables show all MARF
@@ -698,6 +702,9 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
                     &value, &e
                 )
             });
+            if let Some(log) = self.state_writes.as_mut() {
+                log.record(&key, &value);
+            }
 
             keys.push(key);
             values.push(marf_value);
@@ -773,4 +780,12 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
     }
 }
 
-impl WritableMarfStore for EphemeralMarfStore<'_> {}
+impl WritableMarfStore for EphemeralMarfStore<'_> {
+    fn enable_state_write_log(&mut self) {
+        self.state_writes.get_or_insert_with(StateWriteLog::default);
+    }
+
+    fn state_write_log(&mut self) -> Option<&mut StateWriteLog> {
+        self.state_writes.as_mut()
+    }
+}

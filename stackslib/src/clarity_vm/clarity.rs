@@ -34,7 +34,7 @@ use clarity::vm::resource_limiter::ResourceBudget;
 use clarity::vm::types::{BoundedErrorString, PrincipalData, QualifiedContractIdentifier, Value};
 use clarity::vm::{ClarityVersion, ContractName};
 use stacks_common::consts::SIGNER_SLOTS_PER_USER;
-use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
+use stacks_common::types::chainstate::{StacksBlockId, TrieHash, Txid};
 
 use crate::burnchains::PoxConstants;
 use crate::chainstate::nakamoto::signer_set::NakamotoSigners;
@@ -58,6 +58,7 @@ use crate::chainstate::stacks::{
 use crate::clarity_vm::database::marf::{
     BoxedClarityMarfStoreTransaction, MarfedKV, ReadOnlyMarfStore,
 };
+use crate::clarity_vm::state_writes::{StateWrite, StateWriteLog};
 use crate::core::{StacksEpoch, StacksEpochId, FIRST_STACKS_BLOCK_ID, GENESIS_EPOCH};
 use crate::util_lib::boot::{boot_code_acc, boot_code_addr, boot_code_id, boot_code_tx_auth};
 use crate::util_lib::db::Error as DatabaseError;
@@ -94,6 +95,9 @@ pub struct ClarityInstance {
     emit_vm_trace: bool,
     /// Per-tx eval-hook trace cap in bytes. `0` = unlimited.
     vm_trace_max_bytes: u64,
+    /// Record every MARF write of each block begun with `begin_block` /
+    /// `begin_ephemeral` (see [`StateWriteLog`]).
+    collect_state_writes: bool,
 }
 
 ///
@@ -187,6 +191,14 @@ pub trait ClarityMarfStore: ClarityBackingStore {
 pub trait WritableMarfStore:
     ClarityMarfStore + ClarityMarfStoreTransaction + BoxedClarityMarfStoreTransaction
 {
+    /// Start recording every `(key, value)` handed to `put_all_data` (see
+    /// [`StateWriteLog`]). Stores that do not record ignore this.
+    fn enable_state_write_log(&mut self) {}
+
+    /// The write log, if recording was enabled.
+    fn state_write_log(&mut self) -> Option<&mut StateWriteLog> {
+        None
+    }
 }
 
 /// A MARF store transaction for a chainstate block's trie.
@@ -500,6 +512,7 @@ impl ClarityInstance {
             datastore,
             emit_vm_trace: false,
             vm_trace_max_bytes: 0,
+            collect_state_writes: false,
             mainnet,
             chain_id,
         }
@@ -507,6 +520,18 @@ impl ClarityInstance {
 
     pub fn set_emit_vm_trace(&mut self, on: bool) {
         self.emit_vm_trace = on;
+    }
+
+    pub fn emit_vm_trace(&self) -> bool {
+        self.emit_vm_trace
+    }
+
+    pub fn set_collect_state_writes(&mut self, on: bool) {
+        self.collect_state_writes = on;
+    }
+
+    pub fn collect_state_writes(&self) -> bool {
+        self.collect_state_writes
     }
 
     pub fn set_vm_trace_max_bytes(&mut self, max_bytes: u64) {
@@ -567,6 +592,9 @@ impl ClarityInstance {
         );
         conn.emit_vm_trace = self.emit_vm_trace;
         conn.vm_trace_max_bytes = self.vm_trace_max_bytes;
+        if self.collect_state_writes {
+            conn.datastore.enable_state_write_log();
+        }
         conn
     }
 
@@ -860,6 +888,10 @@ impl ClarityInstance {
                 .expect("FAIL: problem instantiating cost tracking"),
             )
         };
+
+        if self.collect_state_writes {
+            datastore.enable_state_write_log();
+        }
 
         ClarityBlockConnection {
             datastore: Box::new(datastore),
@@ -2326,6 +2358,28 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
 
     pub fn seal(&mut self) -> TrieHash {
         self.datastore.seal_trie()
+    }
+
+    /// Attribute this block's subsequent MARF writes to `txid` until
+    /// [`Self::clear_state_write_owner`]. `txid` is only computed when writes
+    /// are being recorded.
+    pub fn set_state_write_owner(&mut self, txid: impl FnOnce() -> Txid) {
+        if let Some(log) = self.datastore.state_write_log() {
+            log.set_owner(Some(txid()));
+        }
+    }
+
+    /// Attribute this block's subsequent MARF writes to the block itself.
+    pub fn clear_state_write_owner(&mut self) {
+        if let Some(log) = self.datastore.state_write_log() {
+            log.set_owner(None);
+        }
+    }
+
+    /// Every MARF write this block has made so far, in write order, or `None`
+    /// if writes are not being recorded.
+    pub fn take_state_writes(&mut self) -> Option<Vec<StateWrite>> {
+        self.datastore.state_write_log().map(StateWriteLog::take)
     }
 
     pub fn destruct(self) -> Box<dyn WritableMarfStore + 'a> {

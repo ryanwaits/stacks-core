@@ -88,6 +88,7 @@ use crate::chainstate::stacks::{
 use crate::clarity::vm::clarity::TransactionConnection;
 use crate::clarity_vm::clarity::{ClarityInstance, PreCommitClarityBlock};
 use crate::clarity_vm::database::SortitionDBRef;
+use crate::clarity_vm::state_writes::StateWrite;
 use crate::core::{
     BOOT_BLOCK_HASH, BURNCHAIN_TX_SEARCH_WINDOW, NAKAMOTO_SIGNER_BLOCK_APPROVAL_THRESHOLD,
 };
@@ -2589,6 +2590,7 @@ impl NakamotoChainState {
                 &Some(signer_bitvec),
                 Some(block_timestamp),
                 receipt.coinbase_height,
+                receipt.state_writes.as_deref(),
             );
         }
 
@@ -4963,6 +4965,7 @@ impl NakamotoChainState {
         signers_updated: bool,
         coinbase_height: u64,
         phantom_lockup_events: Vec<StacksTransactionEvent>,
+        state_writes: Option<Vec<StateWrite>>,
     ) -> Result<
         (
             StacksEpochReceipt,
@@ -5003,6 +5006,7 @@ impl NakamotoChainState {
             epoch_transition: applied_epoch_transition,
             signers_updated,
             coinbase_height,
+            state_writes,
         };
 
         return Ok((epoch_receipt, clarity_commit, None, phantom_lockup_events));
@@ -5367,6 +5371,7 @@ impl NakamotoChainState {
         let block_limit = clarity_tx
             .block_limit()
             .ok_or_else(|| ChainstateError::InvalidChainstateDB)?;
+        let state_writes = clarity_tx.connection().take_state_writes();
         let clarity_commit =
             clarity_tx.precommit_to_block(&block.header.consensus_hash, &block_hash);
 
@@ -5407,6 +5412,7 @@ impl NakamotoChainState {
                 signer_set_calc.is_some(),
                 coinbase_height,
                 lockup_events,
+                state_writes,
             );
         }
 
@@ -5516,6 +5522,7 @@ impl NakamotoChainState {
             epoch_transition: applied_epoch_transition,
             signers_updated,
             coinbase_height,
+            state_writes,
         };
 
         Ok((

@@ -1434,3 +1434,52 @@ fn test_http_delivery_always_blocks_if_queue_size_is_zero() {
 
     mock.assert();
 }
+
+#[test]
+/// `state_writes` resolve to the position of their receipt in the payload's
+/// `transactions` array. A post-condition-aborted receipt keeps its writes (the
+/// fee and nonce it committed), unlike `vm_events`.
+fn state_writes_payload_uses_transaction_positions() {
+    let receipt = |txid: Txid, post_condition_aborted: bool| StacksTransactionReceipt {
+        transaction: TransactionOrigin::Burn(BlockstackOperationType::PreStx(PreStxOp {
+            output: StacksAddress::new(0, Hash160([1; 20])).unwrap(),
+            txid,
+            vtxindex: 0,
+            block_height: 1,
+            burn_header_hash: BurnchainHeaderHash([5u8; 32]),
+        })),
+        events: vec![],
+        post_condition_aborted,
+        result: Value::okay_true(),
+        contract_analysis: None,
+        execution_cost: ExecutionCost::ZERO,
+        microblock_header: None,
+        vm_error: None,
+        problematic_skipped: None,
+        vm_events: vec![],
+        stx_burned: 0u128,
+        tx_index: 0,
+    };
+    let receipts = vec![receipt(Txid([1; 32]), true), receipt(Txid([2; 32]), false)];
+    let write = |txid: Option<Txid>, key: &str| StateWrite {
+        txid,
+        key: key.into(),
+        value: "01".into(),
+    };
+    let writes = vec![
+        write(None, "setup"),
+        write(Some(Txid([2; 32])), "second"),
+        write(Some(Txid([1; 32])), "aborted-fee"),
+        write(None, "teardown"),
+    ];
+
+    assert_eq!(
+        serialize_block_state_writes(&writes, &receipts),
+        serde_json::json!([
+            { "tx_index": null, "ordinal": 0, "key": "setup", "value_hex": "3031" },
+            { "tx_index": 1, "ordinal": 1, "key": "second", "value_hex": "3031" },
+            { "tx_index": 0, "ordinal": 2, "key": "aborted-fee", "value_hex": "3031" },
+            { "tx_index": null, "ordinal": 3, "key": "teardown", "value_hex": "3031" },
+        ])
+    );
+}
