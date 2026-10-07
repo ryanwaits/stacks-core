@@ -39,6 +39,7 @@ use crate::chainstate::stacks::miner::{
     BlockBuilder, BlockLimitFunction, TransactionResourceBudgets, TransactionResult,
 };
 use crate::chainstate::stacks::{Error as ChainError, StacksTransaction, TransactionPayload};
+use crate::clarity_vm::state_writes::{state_write_entries, tx_index_map, StateWriteEntry};
 use crate::config::DEFAULT_MAX_TENURE_BYTES;
 use crate::net::http::{
     parse_json, Error, HttpNotFound, HttpRequest, HttpRequestContents, HttpRequestPreamble,
@@ -155,6 +156,18 @@ pub struct RPCNakamotoBlockReplayRequestHandler {
     pub block_id: Option<StacksBlockId>,
     pub auth: Option<String>,
     pub profiler: bool,
+    pub trace: ReplayTrace,
+}
+
+/// Optional execution traces for a replayed block. Each is collected through the
+/// same `ClarityInstance` switches live block processing uses, so a replay
+/// reports what the node emitted (or would emit) for the block.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ReplayTrace {
+    /// Eval-hook `vm_events` (`?vm_events=1`), as `/new_block.vm_events`.
+    pub vm_events: bool,
+    /// Storage-layer MARF writes (`?state_writes=1`), as `/new_block.state_writes`.
+    pub state_writes: bool,
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
@@ -185,6 +198,44 @@ pub fn remine_nakamoto_block<F0, F1>(
     sortdb: &SortitionDB,
     chainstate: &mut StacksChainState,
     enable_profiler: bool,
+    trace: ReplayTrace,
+    get_transactions: F0,
+    before_mining: F1,
+) -> Result<RPCReplayedBlock, ChainError>
+where
+    F0: FnOnce(&NakamotoBlock) -> Vec<StacksTransaction>,
+    F1: FnOnce(&mut ClarityTx) -> Result<(), ChainError>,
+{
+    // Turn on the requested collectors for this replay only, then put the
+    // instance back the way the node configured it.
+    let clarity = &mut chainstate.clarity_state;
+    let (emit_vm_trace, collect_state_writes) =
+        (clarity.emit_vm_trace(), clarity.collect_state_writes());
+    clarity.set_emit_vm_trace(trace.vm_events);
+    clarity.set_collect_state_writes(trace.state_writes);
+
+    let result = remine_nakamoto_block_inner(
+        block_id,
+        sortdb,
+        chainstate,
+        enable_profiler,
+        trace,
+        get_transactions,
+        before_mining,
+    );
+
+    let clarity = &mut chainstate.clarity_state;
+    clarity.set_emit_vm_trace(emit_vm_trace);
+    clarity.set_collect_state_writes(collect_state_writes);
+    result
+}
+
+fn remine_nakamoto_block_inner<F0, F1>(
+    block_id: &StacksBlockId,
+    sortdb: &SortitionDB,
+    chainstate: &mut StacksChainState,
+    enable_profiler: bool,
+    trace: ReplayTrace,
     get_transactions: F0,
     before_mining: F1,
 ) -> Result<RPCReplayedBlock, ChainError>
@@ -302,6 +353,7 @@ where
 
         let mut total_receipts = 0;
 
+        tenure_tx.connection().set_state_write_owner(|| tx.txid());
         let tx_result = builder.try_mine_tx_with_len(
             &mut tenure_tx,
             tx,
@@ -310,6 +362,7 @@ where
             &TransactionResourceBudgets::unlimited(),
             &mut total_receipts,
         );
+        tenure_tx.connection().clear_state_write_owner();
 
         if let Some(profiler) = profiler {
             profiler_result = Some(profiler.collect());
@@ -319,7 +372,9 @@ where
 
         let err = match tx_result {
             TransactionResult::Success(tx_result) => {
-                txs_receipts.push((tx_result.receipt, execution_tracker, profiler_result));
+                let mut receipt = tx_result.receipt;
+                receipt.tx_index = u32::try_from(i).expect("more than u32::MAX transactions");
+                txs_receipts.push((receipt, execution_tracker, profiler_result));
                 Ok(())
             }
             TransactionResult::ProcessingError(e) => Err(BoundedErrorString::from_display(
@@ -342,6 +397,7 @@ where
     }
 
     let mut replayed_block = builder.mine_nakamoto_block(&mut tenure_tx, burn_chain_height);
+    let state_writes = tenure_tx.connection().take_state_writes();
 
     // copy values that will contribute to the block_hash that cannot be the same in the new replayed block
     replayed_block.header.timestamp = block.header.timestamp;
@@ -363,6 +419,33 @@ where
         rpc_replayed_block.transactions.push(transaction);
     }
 
+    if trace.vm_events {
+        rpc_replayed_block.vm_events = Some(
+            txs_receipts
+                .iter()
+                .filter(|(receipt, ..)| {
+                    !receipt.post_condition_aborted && receipt.problematic_skipped.is_none()
+                })
+                .flat_map(|(receipt, ..)| {
+                    let txid = receipt.transaction.txid();
+                    receipt
+                        .vm_events
+                        .iter()
+                        .map(move |event| event.json_serialize(&txid, true))
+                })
+                .collect(),
+        );
+    }
+    if trace.state_writes {
+        let tx_index_of = tx_index_map(
+            txs_receipts
+                .iter()
+                .map(|(receipt, ..)| receipt.transaction.txid()),
+        );
+        rpc_replayed_block.state_writes =
+            state_writes.map(|writes| state_write_entries(&writes, &tx_index_of));
+    }
+
     Ok(rpc_replayed_block)
 }
 
@@ -372,6 +455,7 @@ impl RPCNakamotoBlockReplayRequestHandler {
             block_id: None,
             auth,
             profiler: false,
+            trace: ReplayTrace::default(),
         }
     }
 
@@ -391,6 +475,7 @@ impl RPCNakamotoBlockReplayRequestHandler {
             sortdb,
             chainstate,
             self.profiler,
+            self.trace,
             |block| {
                 tx_merkle_root = Some(block.header.tx_merkle_root.clone());
                 block.txs.clone()
@@ -523,6 +608,15 @@ pub struct RPCReplayedBlock {
     pub transactions: Vec<RPCReplayedBlockTransaction>,
     /// check if the computed merkle tree root hash matches the one from the original block
     pub valid_merkle_root: bool,
+    /// Eval-hook VM traces in block order, serialized as `/new_block.vm_events`.
+    /// Present only when requested with `?vm_events=1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_events: Option<Vec<serde_json::Value>>,
+    /// Every Clarity MARF write the replayed block made, in write order, as
+    /// `/new_block.state_writes`; `tx_index` is the position in `transactions`.
+    /// Present only when requested with `?state_writes=1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_writes: Option<Vec<StateWriteEntry>>,
 }
 
 impl RPCReplayedBlock {
@@ -549,6 +643,8 @@ impl RPCReplayedBlock {
             signer_signature: block.header.signer_signature.clone(),
             transactions: vec![],
             valid_merkle_root: false,
+            vm_events: None,
+            state_writes: None,
         }
     }
 }
@@ -606,11 +702,12 @@ impl HttpRequest for RPCNakamotoBlockReplayRequestHandler {
 
         if let Some(query_string) = query {
             for (key, value) in form_urlencoded::parse(query_string.as_bytes()) {
-                if key == "profiler" {
-                    if value == "1" {
-                        self.profiler = true;
-                    }
-                    break;
+                let on = value == "1";
+                match key.as_ref() {
+                    "profiler" => self.profiler = on,
+                    "vm_events" => self.trace.vm_events = on,
+                    "state_writes" => self.trace.state_writes = on,
+                    _ => {}
                 }
             }
         }
@@ -623,6 +720,8 @@ impl RPCRequestHandler for RPCNakamotoBlockReplayRequestHandler {
     /// Reset internal state
     fn restart(&mut self) {
         self.block_id = None;
+        self.profiler = false;
+        self.trace = ReplayTrace::default();
     }
 
     /// Make the response
@@ -677,6 +776,24 @@ impl StacksHttpRequest {
             "GET".into(),
             format!("/v3/blocks/replay/{block_id}"),
             HttpRequestContents::new(),
+        )
+        .expect("FATAL: failed to construct request from infallible data")
+    }
+
+    /// Make a new block_replay request asking for the requested execution traces
+    pub fn new_block_replay_with_trace(
+        host: PeerHost,
+        block_id: &StacksBlockId,
+        trace: ReplayTrace,
+    ) -> StacksHttpRequest {
+        let flag = |on: bool| if on { "1".to_string() } else { "0".to_string() };
+        StacksHttpRequest::new_for_peer(
+            host,
+            "GET".into(),
+            format!("/v3/blocks/replay/{block_id}"),
+            HttpRequestContents::new()
+                .query_arg("vm_events".into(), flag(trace.vm_events))
+                .query_arg("state_writes".into(), flag(trace.state_writes)),
         )
         .expect("FATAL: failed to construct request from infallible data")
     }

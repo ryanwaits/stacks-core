@@ -2429,6 +2429,20 @@ paths:
           schema:
             type: string
             pattern: "^[0-9a-f]{64}$"
+        - name: vm_events
+          in: query
+          description: Set to `1` to include the block's eval-hook `vm_events`
+          required: false
+          schema:
+            type: string
+            enum: ["0", "1"]
+        - name: state_writes
+          in: query
+          description: Set to `1` to include every Clarity MARF write the block made
+          required: false
+          schema:
+            type: string
+            enum: ["0", "1"]
       responses:
         "200":
           description: Content of the replayed block

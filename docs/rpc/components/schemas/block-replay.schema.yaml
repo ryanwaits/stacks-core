@@ -49,6 +49,40 @@ properties:
     type: array
     items:
       $ref: "./block-replay-transaction.schema.yaml"
+  vm_events:
+    type: array
+    description: |
+      Eval-hook VM traces of the replayed block, in block order, serialized as
+      `/new_block.vm_events`. Present only when requested with `vm_events=1`.
+    items:
+      type: object
+  state_writes:
+    type: array
+    description: |
+      Every Clarity MARF write the replayed block made, in write order, as
+      `/new_block.state_writes`. `tx_index` is the position in `transactions`.
+      Present only when requested with `state_writes=1`.
+    items:
+      type: object
+      properties:
+        tx_index:
+          type: integer
+          nullable: true
+          description: Producing transaction, or null for a block-level write
+        ordinal:
+          type: integer
+          description: Position in the block's write order, from 0
+        key:
+          type: string
+          description: MARF key string
+        value_hex:
+          type: string
+          description: Hex of the side-store value string's bytes
+      required:
+        - tx_index
+        - ordinal
+        - key
+        - value_hex
 required:
   - block_hash
   - block_id

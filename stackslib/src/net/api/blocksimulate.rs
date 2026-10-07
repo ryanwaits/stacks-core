@@ -25,7 +25,7 @@ use url::form_urlencoded;
 use crate::chainstate::burn::db::sortdb::SortitionDB;
 use crate::chainstate::stacks::db::StacksChainState;
 use crate::chainstate::stacks::{Error as ChainError, StacksTransaction};
-use crate::net::api::blockreplay::{remine_nakamoto_block, RPCReplayedBlock};
+use crate::net::api::blockreplay::{remine_nakamoto_block, RPCReplayedBlock, ReplayTrace};
 use crate::net::http::{
     parse_json, Error, HttpContentType, HttpNotFound, HttpRequest, HttpRequestContents,
     HttpRequestPreamble, HttpResponse, HttpResponseContents, HttpResponsePayload,
@@ -104,6 +104,7 @@ impl RPCNakamotoBlockSimulateRequestHandler {
             sortdb,
             chainstate,
             self.profiler,
+            ReplayTrace::default(),
             |_| self.transactions.clone(),
             |tenure_tx| {
                 if !self.mint.is_empty() {
