@@ -1,0 +1,2 @@
+# Witness fixtures are raw bytes; the root `* text eol=lf` would rewrite CRLF pairs.
+*.witness binary
