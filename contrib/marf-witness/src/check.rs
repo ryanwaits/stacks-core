@@ -414,9 +414,10 @@ pub fn check_leaves(
     named_paths.extend(named.iter().map(|n| n.path));
 
     if let Some(writes) = &log.writes {
-        // Block-level writes (no tx) run before the block's transactions.
+        // `ordinal` is the block's write order (block-level setup and teardown writes
+        // included), so it alone decides which write to a key is last.
         let mut writes = writes.clone();
-        writes.sort_by_key(|w| (w.tx_index.is_some(), w.tx_index, w.ordinal));
+        writes.sort_by_key(|w| w.ordinal);
         let mut named = vec![];
         for w in writes {
             let describe = move || {

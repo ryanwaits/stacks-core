@@ -368,6 +368,35 @@ fn only_the_last_write_to_a_key_must_match() {
 }
 
 #[test]
+fn a_block_level_write_after_the_transactions_is_the_last_write() {
+    // Teardown writes carry no tx_index but come after the block's transactions,
+    // so the last write to a key is decided by ordinal alone.
+    let c = chain();
+    let key = map_key(&uint(HOT_KEY));
+    let mut writes = c.writes();
+    let idx: Vec<usize> = writes
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w["block_height"] == 5 && w["key"] == key)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(idx.len() >= 2, "hot key needs several writes in block 5");
+    let last = *idx
+        .iter()
+        .max_by_key(|&&i| writes[i]["ordinal"].as_i64().unwrap())
+        .unwrap();
+    for &i in &idx {
+        if i != last {
+            writes[i]["tx_index"] = json!(0);
+            writes[i]["value_hex"] = json!("6666");
+        }
+    }
+    writes[last]["tx_index"] = Json::Null;
+    let (ok, report) = c.check(c.rows(), Some(writes), &["--height", "5"]);
+    assert!(ok, "{report:#}");
+}
+
+#[test]
 fn unknown_block_is_reported_and_the_rest_still_checked() {
     let c = chain();
     let (good, bad) = (block(3).to_string(), block(9999).to_string());
