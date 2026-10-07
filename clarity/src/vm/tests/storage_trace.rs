@@ -378,3 +378,370 @@ fn env_tiny_cap_emits_truncated() {
         VmTraceEvent::Truncated { dropped: 1 }
     ));
 }
+
+// ---------------------------------------------------------------------------
+// A write row must record the key and value the storage builtin itself
+// evaluated, never a value from a call nested inside its arguments or from a
+// callee contract whose expression ids collide with the builtin's.
+// ---------------------------------------------------------------------------
+
+const WRITES: &str = r#"
+(define-data-var c uint u10)
+(define-data-var n uint u0)
+(define-map kv uint uint)
+(define-map reserve principal uint)
+(define-private (get-reserve (who principal))
+  (default-to u0 (map-get? reserve who)))
+(define-private (mix (a uint) (b uint) (d uint))
+  (+ (* a u100) (* b u10) d))
+(define-public (bump)
+  (ok (var-set c (+ (var-get c) u1))))
+(define-public (add-reserve (who principal) (amount uint))
+  (ok (map-set reserve who (+ amount (get-reserve who)))))
+(define-public (set-sum-value (k uint))
+  (ok (map-set kv k (+ u1 u2 u3))))
+(define-public (set-sum-key (a uint) (b uint))
+  (ok (map-set kv (+ a b) u7)))
+(define-public (insert-sum-value (k uint))
+  (ok (map-insert kv k (+ u1 u2 u3))))
+(define-public (insert-sum-key (a uint) (b uint))
+  (ok (map-insert kv (+ a b) u7)))
+(define-public (insert-reserve (who principal) (amount uint))
+  (ok (map-insert reserve who (+ amount (get-reserve who)))))
+(define-public (delete-sum-key (a uint) (b uint))
+  (ok (map-delete kv (+ a b))))
+(define-public (seed (k uint) (v uint))
+  (ok (map-set kv k v)))
+(define-public (write-inside-write (k uint))
+  (ok (map-set kv k (begin (var-set n u2) u5))))
+(define-public (set-mixed)
+  (ok (map-set kv (mix u1 u2 u3) (mix u4 u5 u6))))
+(define-public (insert-mixed)
+  (ok (map-insert kv (mix u1 u2 u3) (mix u4 u5 u6))))
+(define-public (delete-mixed)
+  (ok (map-delete kv (mix u1 u2 u3))))
+"#;
+
+// The callee's top-level prefix is token-for-token the same shape as the
+// caller's, so `k` and `u40` carry the ids of the caller's key and value
+// arguments.
+const TWIN: &str = r#"
+(define-map kv uint uint)
+(define-public (go (k uint))
+  (ok (+ k k u40)))
+"#;
+
+const OUTER_SET: &str = r#"
+(define-map kv uint uint)
+(define-public (go (k uint))
+  (ok (map-set kv k (unwrap-panic (contract-call? .twin go k)))))
+"#;
+
+const OUTER_INSERT: &str = r#"
+(define-map kv uint uint)
+(define-public (go (k uint))
+  (ok (map-insert kv k (unwrap-panic (contract-call? .twin go k)))))
+"#;
+
+// `u40` carries the id of the caller's map-delete key argument.
+const TWIN_DEL: &str = r#"
+(define-map kv uint uint)
+(define-public (go (k uint))
+  (ok (+ k u40)))
+"#;
+
+const OUTER_DELETE: &str = r#"
+(define-map kv uint uint)
+(define-public (go (k uint))
+  (ok (map-delete kv (unwrap-panic (contract-call? .twin-del go k)))))
+(define-public (seed (k uint) (v uint))
+  (ok (map-set kv k v)))
+"#;
+
+const FT_TOKEN: &str = r#"
+(define-public (get-decimals)
+  (ok u6))
+"#;
+
+const VAULT: &str = r#"
+(define-trait ft-trait ((get-decimals () (response uint uint))))
+(define-map reserve principal uint)
+(define-read-only (get-reserve (token principal))
+  (default-to u0 (map-get? reserve token)))
+(define-public (add-to-reserve (token <ft-trait>) (amount uint))
+  (ok (map-set reserve (contract-of token) (+ amount (get-reserve (contract-of token))))))
+"#;
+
+const ROUTER: &str = r#"
+(define-public (route (amount uint))
+  (contract-call? .vault add-to-reserve .token amount))
+"#;
+
+/// Transient issuer (`S1G2081040…`): every test contract's issuer and the tx sender.
+const ISSUER_HEX: &str = "0x05010101010101010101010101010101010101010101";
+/// `<issuer>.token`.
+const TOKEN_HEX: &str = "0x0601010101010101010101010101010101010101010105746f6b656e";
+
+fn uint_hex(n: u128) -> String {
+    format!("0x01{n:032x}")
+}
+
+fn deploy(env: &mut OwnedEnvironment, name: &str, src: &str) -> QualifiedContractIdentifier {
+    let id = QualifiedContractIdentifier::local(name).unwrap();
+    env.initialize_versioned_contract(id.clone(), ClarityVersion::Clarity2, src, None)
+        .unwrap();
+    id
+}
+
+/// One line per storage write of the last transaction, in order.
+fn writes(env: &OwnedEnvironment) -> Vec<String> {
+    env.vm_trace_events()
+        .iter()
+        .filter_map(|e| match e {
+            VmTraceEvent::Storage(StorageEvent::VarSet(d)) => {
+                Some(format!("var_set {} {}", d.var_name, d.raw_value))
+            }
+            VmTraceEvent::Storage(StorageEvent::MapSet(d)) => Some(format!(
+                "map_set {} {} {}",
+                d.map_name, d.raw_key, d.raw_value
+            )),
+            VmTraceEvent::Storage(StorageEvent::MapInsert(d)) => Some(format!(
+                "map_insert {} {} {}",
+                d.map_name, d.raw_key, d.raw_value
+            )),
+            VmTraceEvent::Storage(StorageEvent::MapDelete(d)) => {
+                Some(format!("map_delete {} {}", d.map_name, d.raw_key))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn writes_env(
+    marf: &mut MemoryBackingStore,
+) -> (OwnedEnvironment<'_, '_>, QualifiedContractIdentifier) {
+    let mut env = OwnedEnvironment::new(marf.as_clarity_db(), StacksEpochId::latest());
+    let id = deploy(&mut env, "writes", WRITES);
+    env.set_emit_vm_trace(true);
+    (env, id)
+}
+
+fn run_ok(
+    env: &mut OwnedEnvironment,
+    contract: &QualifiedContractIdentifier,
+    name: &str,
+    args: Vec<Value>,
+) {
+    let (value, _) = exec(env, contract, name, args);
+    assert!(is_ok_true(&value), "{name} -> {value:?}");
+}
+
+#[test]
+fn var_set_value_from_nested_arithmetic() {
+    let mut marf = MemoryBackingStore::new();
+    let (mut env, id) = writes_env(&mut marf);
+    run_ok(&mut env, &id, "bump", vec![]);
+    assert_eq!(writes(&env), vec![format!("var_set c {}", uint_hex(11))]);
+}
+
+#[test]
+fn map_set_key_survives_user_fn_reading_old_value() {
+    let mut marf = MemoryBackingStore::new();
+    let (mut env, id) = writes_env(&mut marf);
+    run_ok(
+        &mut env,
+        &id,
+        "add-reserve",
+        vec![Value::from(issuer()), Value::UInt(5)],
+    );
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_set reserve {ISSUER_HEX} {}", uint_hex(5))]
+    );
+    run_ok(
+        &mut env,
+        &id,
+        "add-reserve",
+        vec![Value::from(issuer()), Value::UInt(7)],
+    );
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_set reserve {ISSUER_HEX} {}", uint_hex(12))]
+    );
+}
+
+#[test]
+fn map_set_value_from_three_arg_builtin() {
+    let mut marf = MemoryBackingStore::new();
+    let (mut env, id) = writes_env(&mut marf);
+    run_ok(&mut env, &id, "set-sum-value", vec![Value::UInt(1)]);
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_set kv {} {}", uint_hex(1), uint_hex(6))]
+    );
+}
+
+#[test]
+fn map_set_key_from_nested_arithmetic() {
+    let mut marf = MemoryBackingStore::new();
+    let (mut env, id) = writes_env(&mut marf);
+    run_ok(
+        &mut env,
+        &id,
+        "set-sum-key",
+        vec![Value::UInt(2), Value::UInt(3)],
+    );
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_set kv {} {}", uint_hex(5), uint_hex(7))]
+    );
+}
+
+#[test]
+fn map_insert_key_and_value_from_nested_calls() {
+    let mut marf = MemoryBackingStore::new();
+    let (mut env, id) = writes_env(&mut marf);
+    run_ok(&mut env, &id, "insert-sum-value", vec![Value::UInt(1)]);
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_insert kv {} {}", uint_hex(1), uint_hex(6))]
+    );
+    run_ok(
+        &mut env,
+        &id,
+        "insert-sum-key",
+        vec![Value::UInt(2), Value::UInt(3)],
+    );
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_insert kv {} {}", uint_hex(5), uint_hex(7))]
+    );
+    run_ok(
+        &mut env,
+        &id,
+        "insert-reserve",
+        vec![Value::from(issuer()), Value::UInt(4)],
+    );
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_insert reserve {ISSUER_HEX} {}", uint_hex(4))]
+    );
+}
+
+#[test]
+fn map_delete_key_from_nested_arithmetic() {
+    let mut marf = MemoryBackingStore::new();
+    let (mut env, id) = writes_env(&mut marf);
+    run_ok(&mut env, &id, "seed", vec![Value::UInt(5), Value::UInt(9)]);
+    run_ok(
+        &mut env,
+        &id,
+        "delete-sum-key",
+        vec![Value::UInt(2), Value::UInt(3)],
+    );
+    assert_eq!(writes(&env), vec![format!("map_delete kv {}", uint_hex(5))]);
+}
+
+#[test]
+fn write_nested_in_write_value_records_both_in_order() {
+    let mut marf = MemoryBackingStore::new();
+    let (mut env, id) = writes_env(&mut marf);
+    run_ok(&mut env, &id, "write-inside-write", vec![Value::UInt(1)]);
+    assert_eq!(
+        writes(&env),
+        vec![
+            format!("var_set n {}", uint_hex(2)),
+            format!("map_set kv {} {}", uint_hex(1), uint_hex(5)),
+        ]
+    );
+}
+
+#[test]
+fn three_arg_user_fns_in_key_and_value() {
+    let mut marf = MemoryBackingStore::new();
+    let (mut env, id) = writes_env(&mut marf);
+    run_ok(&mut env, &id, "set-mixed", vec![]);
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_set kv {} {}", uint_hex(123), uint_hex(456))]
+    );
+    run_ok(&mut env, &id, "delete-mixed", vec![]);
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_delete kv {}", uint_hex(123))]
+    );
+    run_ok(&mut env, &id, "insert-mixed", vec![]);
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_insert kv {} {}", uint_hex(123), uint_hex(456))]
+    );
+}
+
+#[test]
+fn trait_param_principal_key_mirrors_amm_vault() {
+    let mut marf = MemoryBackingStore::new();
+    let mut env = OwnedEnvironment::new(marf.as_clarity_db(), StacksEpochId::latest());
+    deploy(&mut env, "token", FT_TOKEN);
+    deploy(&mut env, "vault", VAULT);
+    let router = deploy(&mut env, "router", ROUTER);
+    env.set_emit_vm_trace(true);
+
+    run_ok(&mut env, &router, "route", vec![Value::UInt(5)]);
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_set reserve {TOKEN_HEX} {}", uint_hex(5))]
+    );
+    run_ok(&mut env, &router, "route", vec![Value::UInt(7)]);
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_set reserve {TOKEN_HEX} {}", uint_hex(12))]
+    );
+}
+
+#[test]
+fn map_set_value_ignores_callee_with_colliding_expr_ids() {
+    let mut marf = MemoryBackingStore::new();
+    let mut env = OwnedEnvironment::new(marf.as_clarity_db(), StacksEpochId::latest());
+    deploy(&mut env, "twin", TWIN);
+    let outer = deploy(&mut env, "outer-set", OUTER_SET);
+    env.set_emit_vm_trace(true);
+    run_ok(&mut env, &outer, "go", vec![Value::UInt(1)]);
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_set kv {} {}", uint_hex(1), uint_hex(42))]
+    );
+}
+
+#[test]
+fn map_insert_value_ignores_callee_with_colliding_expr_ids() {
+    let mut marf = MemoryBackingStore::new();
+    let mut env = OwnedEnvironment::new(marf.as_clarity_db(), StacksEpochId::latest());
+    deploy(&mut env, "twin", TWIN);
+    let outer = deploy(&mut env, "outer-insert", OUTER_INSERT);
+    env.set_emit_vm_trace(true);
+    run_ok(&mut env, &outer, "go", vec![Value::UInt(1)]);
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_insert kv {} {}", uint_hex(1), uint_hex(42))]
+    );
+}
+
+#[test]
+fn map_delete_key_ignores_callee_with_colliding_expr_ids() {
+    let mut marf = MemoryBackingStore::new();
+    let mut env = OwnedEnvironment::new(marf.as_clarity_db(), StacksEpochId::latest());
+    deploy(&mut env, "twin-del", TWIN_DEL);
+    let outer = deploy(&mut env, "outer-delete", OUTER_DELETE);
+    env.set_emit_vm_trace(true);
+    run_ok(
+        &mut env,
+        &outer,
+        "seed",
+        vec![Value::UInt(41), Value::UInt(7)],
+    );
+    run_ok(&mut env, &outer, "go", vec![Value::UInt(1)]);
+    assert_eq!(
+        writes(&env),
+        vec![format!("map_delete kv {}", uint_hex(41))]
+    );
+}

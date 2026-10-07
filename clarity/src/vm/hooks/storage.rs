@@ -27,11 +27,37 @@ enum PendingKind {
     MapDelete,
 }
 
+impl PendingKind {
+    fn of(call: &CallHook) -> Option<Self> {
+        let CallHook::Builtin { clarity_name, .. } = call else {
+            return None;
+        };
+        match *clarity_name {
+            "var-set" => Some(Self::VarSet),
+            "map-set" => Some(Self::MapSet),
+            "map-insert" => Some(Self::MapInsert),
+            "map-delete" => Some(Self::MapDelete),
+            _ => None,
+        }
+    }
+}
+
 struct PendingStorageCall {
     kind: PendingKind,
     name: String,
+    /// Contract whose code the builtin's argument expressions belong to.
+    /// Expression ids are only unique within one contract.
+    contract: QualifiedContractIdentifier,
     arg_ids: Vec<u64>,
     values: Vec<Option<Value>>,
+}
+
+/// One open callable invocation. Every `will_begin_call` pushes one and every
+/// `did_finish_call` pops one, so the innermost entry is always the call whose
+/// arguments are being evaluated right now.
+enum OpenCall {
+    Storage(PendingStorageCall),
+    Other,
 }
 
 /// One rollback frame of traces, with a running size used by the per-tx cap.
@@ -49,7 +75,7 @@ pub struct StorageTraceCollector {
     max_bytes: usize,
     batches: Vec<TraceBatch>,
     committed: TraceBatch,
-    pending: Vec<PendingStorageCall>,
+    calls: Vec<OpenCall>,
 }
 
 impl StorageTraceCollector {
@@ -118,7 +144,7 @@ impl StorageTraceCollector {
 
     /// Take committed traces for the finished transaction.
     pub fn take_committed(&mut self) -> Vec<VmTraceEvent> {
-        self.pending.clear();
+        self.calls.clear();
         self.batches.clear();
         std::mem::take(&mut self.committed).events
     }
@@ -182,20 +208,20 @@ impl StorageTraceCollector {
         target.events.push(event);
     }
 
-    /// Open a storage builtin call we might emit.
-    pub fn will_begin_call(&mut self, call: &CallHook, args: CallArguments) {
+    /// Open a call frame: a storage frame for a storage builtin we might
+    /// emit, a marker for anything else.
+    pub fn will_begin_call(
+        &mut self,
+        invoke_ctx: &InvocationContext,
+        call: &CallHook,
+        args: CallArguments,
+    ) {
         if !self.enabled {
             return;
         }
-        let CallHook::Builtin { clarity_name, .. } = call else {
+        let Some(kind) = PendingKind::of(call) else {
+            self.calls.push(OpenCall::Other);
             return;
-        };
-        let kind = match *clarity_name {
-            "var-set" => PendingKind::VarSet,
-            "map-set" => PendingKind::MapSet,
-            "map-insert" => PendingKind::MapInsert,
-            "map-delete" => PendingKind::MapDelete,
-            _ => return,
         };
         let name = atom_at(args, 0).unwrap_or_default();
         let (arg_ids, n) = match args {
@@ -204,32 +230,52 @@ impl StorageTraceCollector {
             }
             CallArguments::Values(vals) => (Vec::new(), vals.len()),
         };
-        self.pending.push(PendingStorageCall {
+        self.calls.push(OpenCall::Storage(PendingStorageCall {
             kind,
             name,
+            contract: invoke_ctx.contract_context.contract_identifier.clone(),
             arg_ids,
             values: vec![None; n],
-        });
+        }));
+    }
+
+    /// The storage frame whose own arguments are being evaluated, if the
+    /// innermost open call is one. Any call nested in an argument sits above
+    /// it, so its arguments never reach the storage frame.
+    fn innermost_storage_frame(&mut self) -> Option<&mut PendingStorageCall> {
+        match self.calls.last_mut() {
+            Some(OpenCall::Storage(frame)) => Some(frame),
+            _ => None,
+        }
     }
 
     /// Fill an evaluated argument by index (apply / apply_evaluated paths).
+    /// Only the innermost open call's arguments are reported here.
     pub fn did_evaluate_call_argument(&mut self, arg_index: usize, value: &Value) {
         if !self.enabled {
             return;
         }
-        if let Some(frame) = self.pending.last_mut()
+        if let Some(frame) = self.innermost_storage_frame()
             && let Some(slot) = frame.values.get_mut(arg_index)
         {
             *slot = Some(value.clone());
         }
     }
 
-    /// Fill a special-form argument by expression id.
-    pub fn did_finish_eval(&mut self, expr: &SymbolicExpression, value: &Value) {
+    /// Fill a special-form argument by expression id. The expression must be
+    /// evaluated directly by the innermost storage builtin, in that builtin's
+    /// own contract (ids collide across contracts).
+    pub fn did_finish_eval(
+        &mut self,
+        invoke_ctx: &InvocationContext,
+        expr: &SymbolicExpression,
+        value: &Value,
+    ) {
         if !self.enabled {
             return;
         }
-        if let Some(frame) = self.pending.last_mut()
+        if let Some(frame) = self.innermost_storage_frame()
+            && frame.contract == invoke_ctx.contract_context.contract_identifier
             && let Some(index) = frame.arg_ids.iter().position(|id| *id == expr.id)
             && let Some(slot) = frame.values.get_mut(index)
             && slot.is_none()
@@ -238,33 +284,22 @@ impl StorageTraceCollector {
         }
     }
 
-    /// Emit a storage event if this pending call was a matching builtin that
-    /// actually changed storage.
-    pub fn did_finish_call(
-        &mut self,
-        invoke_ctx: &InvocationContext,
-        call: &CallHook,
-        res: &Result<Value, VmExecutionError>,
-    ) {
+    /// Close the innermost call frame. Emit a storage event if it was a
+    /// storage builtin that actually changed storage.
+    pub fn did_finish_call(&mut self, call: &CallHook, res: &Result<Value, VmExecutionError>) {
         if !self.enabled {
             return;
         }
-        let CallHook::Builtin { clarity_name, .. } = call else {
+        let Some(OpenCall::Storage(frame)) = self.calls.pop() else {
             return;
         };
-        if !matches!(
-            *clarity_name,
-            "var-set" | "map-set" | "map-insert" | "map-delete"
-        ) {
+        if PendingKind::of(call) != Some(frame.kind) {
             return;
         }
-        let Some(frame) = self.pending.pop() else {
-            return;
-        };
         let Ok(result) = res else {
             return;
         };
-        let contract = invoke_ctx.contract_context.contract_identifier.clone();
+        let contract = frame.contract;
         let event = match frame.kind {
             PendingKind::VarSet => {
                 let Some(value) = frame.values.get(1).and_then(|v| v.as_ref()) else {

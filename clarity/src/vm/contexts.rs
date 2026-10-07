@@ -1370,7 +1370,7 @@ impl EvalHookNotifier for ExecutionState<'_, '_, '_> {
         {
             self.global_context
                 .storage_trace
-                .did_finish_eval(expr, value_ref.as_ref());
+                .did_finish_eval(invoke_ctx, expr, value_ref.as_ref());
         }
         self.for_each_eval_hook(|hook, env| {
             hook.did_finish_eval(env, invoke_ctx, context, expr, res)
@@ -1386,7 +1386,7 @@ impl EvalHookNotifier for ExecutionState<'_, '_, '_> {
         if self.global_context.emit_vm_trace {
             self.global_context
                 .storage_trace
-                .will_begin_call(call, args);
+                .will_begin_call(invoke_ctx, call, args);
         }
         self.for_each_eval_hook(|hook, env| hook.will_begin_call(env, invoke_ctx, call, args));
     }
@@ -1415,9 +1415,7 @@ impl EvalHookNotifier for ExecutionState<'_, '_, '_> {
         res: &core::result::Result<Value, VmExecutionError>,
     ) {
         if self.global_context.emit_vm_trace {
-            self.global_context
-                .storage_trace
-                .did_finish_call(invoke_ctx, call, res);
+            self.global_context.storage_trace.did_finish_call(call, res);
         }
         self.for_each_eval_hook(|hook, env| hook.did_finish_call(env, invoke_ctx, call, res));
     }
