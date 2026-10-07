@@ -21,6 +21,7 @@ use clarity::vm::{ClarityName, ContractName};
 use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::chainstate::StacksBlockId;
 
+use crate::chainstate::nakamoto::tests::state_writes::{payload_entries, StateWriteFixture};
 use crate::chainstate::stacks::{
     Error as ChainError, StacksTransaction, StacksTransactionSigner, TransactionAnchorMode,
     TransactionContractCall, TransactionPayload, TransactionPostConditionMode, TransactionVersion,
@@ -409,4 +410,93 @@ fn test_try_make_response_with_unsuccessful_transaction() {
         resp.transactions.last().unwrap().vm_error.as_deref(),
         Some(":0:0: use of unresolved function 'broken'")
     );
+}
+
+/// Replaying a block with `?vm_events=1&state_writes=1` runs the same collectors as
+/// live processing, so it reports exactly what the node announced for the block.
+#[test]
+fn replay_reports_the_same_state_writes_and_vm_events_as_live_processing() {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 33333);
+
+    let test_observer = TestEventObserver::new();
+    let (fixture, tenures, balances) = StateWriteFixture::new();
+    let rpc_test =
+        TestRPC::setup_nakamoto_with_boot_plan(function_name!(), &test_observer, |boot_plan| {
+            boot_plan
+                .with_boot_tenures(tenures)
+                .with_ignore_transaction_errors(true)
+                .with_initial_balances(balances)
+                .with_block_traces(true)
+        });
+    let live = fixture.find_block(&test_observer);
+    assert_eq!(rpc_test.canonical_tip, live.metadata.index_block_hash());
+
+    let trace = blockreplay::ReplayTrace {
+        vm_events: true,
+        state_writes: true,
+    };
+    let mut traced =
+        StacksHttpRequest::new_block_replay_with_trace(addr.into(), &rpc_test.canonical_tip, trace);
+    traced.add_header("authorization".into(), "password".into());
+    let mut plain = StacksHttpRequest::new_block_replay(addr.into(), &rpc_test.canonical_tip);
+    plain.add_header("authorization".into(), "password".into());
+
+    let mut responses = rpc_test.run(vec![traced, plain]);
+    let traced = responses.remove(0).decode_replayed_block().unwrap();
+    let plain = responses.remove(0).decode_replayed_block().unwrap();
+
+    let live_state_writes = payload_entries(&live);
+    assert!(!live_state_writes.is_empty());
+    assert_eq!(traced.state_writes, Some(live_state_writes));
+
+    let live_vm_events: Vec<serde_json::Value> = live
+        .receipts
+        .iter()
+        .filter(|r| !r.post_condition_aborted && r.problematic_skipped.is_none())
+        .flat_map(|r| {
+            let txid = r.transaction.txid();
+            r.vm_events
+                .iter()
+                .map(move |event| event.json_serialize(&txid, true))
+        })
+        .collect();
+    assert!(!live_vm_events.is_empty());
+    assert_eq!(traced.vm_events, Some(live_vm_events));
+
+    // replayed transactions carry their position in the block
+    for (i, tx) in traced.transactions.iter().enumerate() {
+        assert_eq!(tx.tx_index, i as u32);
+    }
+
+    // traces are opt-in: a plain replay has neither field
+    assert_eq!(plain.vm_events, None);
+    assert_eq!(plain.state_writes, None);
+}
+
+#[test]
+fn replay_request_parses_trace_flags() {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 33333);
+    let mut http = StacksHttp::new(addr.clone(), &ConnectionOptions::default());
+    let trace = blockreplay::ReplayTrace {
+        vm_events: true,
+        state_writes: true,
+    };
+    let mut request = StacksHttpRequest::new_block_replay_with_trace(
+        addr.into(),
+        &StacksBlockId([0x01; 32]),
+        trace,
+    );
+    request.add_header("authorization".into(), "password".into());
+    let bytes = request.try_serialize().unwrap();
+    let (parsed_preamble, offset) = http.read_preamble(&bytes).unwrap();
+    let mut handler =
+        blockreplay::RPCNakamotoBlockReplayRequestHandler::new(Some("password".into()));
+    http.handle_try_parse_request(
+        &mut handler,
+        &parsed_preamble.expect_request(),
+        &bytes[offset..],
+    )
+    .unwrap();
+    assert_eq!(handler.trace, trace);
+    assert!(!handler.profiler);
 }

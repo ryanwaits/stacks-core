@@ -203,6 +203,10 @@ pub struct TestChainstateConfig {
     /// (NOTE: will be used post-Nakamoto)
     pub aggregate_public_key: Option<Vec<u8>>,
     pub txindex: bool,
+    /// Record each processed block's eval-hook `vm_events` and Clarity MARF
+    /// writes, as a node with `"storage"`/`"contract_calls"`/`"state_writes"`
+    /// observers does
+    pub block_traces: bool,
 }
 
 impl Default for TestChainstateConfig {
@@ -235,6 +239,7 @@ impl Default for TestChainstateConfig {
             test_stackers: None,
             test_signers: None,
             txindex: false,
+            block_traces: false,
         }
     }
 }
@@ -660,6 +665,9 @@ impl<'a> TestChainstate<'a> {
             None,
             config.txindex,
         );
+        let clarity_state = &mut coord.chain_state_db.clarity_state;
+        clarity_state.set_emit_vm_trace(config.block_traces);
+        clarity_state.set_collect_state_writes(config.block_traces);
         coord.handle_new_burnchain_block().unwrap();
 
         let mut stacks_node = TestStacksNode::from_chainstate(chainstate);

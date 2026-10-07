@@ -105,6 +105,8 @@ pub struct NakamotoBootPlan {
     pub malleablized_blocks: bool,
     pub network_id: u32,
     pub txindex: bool,
+    /// Record each processed block's `vm_events` and Clarity MARF writes
+    pub block_traces: bool,
     pub epoch: StacksEpochId,
     pub epochs: Option<EpochList<ExecutionCost>>,
     /// Additional transactions to include in the tip block
@@ -156,6 +158,7 @@ impl NakamotoBootPlan {
             malleablized_blocks: true,
             network_id: default_config.network_id,
             txindex: false,
+            block_traces: false,
             extra_tenures: vec![],
             epoch: StacksEpochId::Epoch30,
             epochs: None,
@@ -169,6 +172,7 @@ impl NakamotoBootPlan {
         let mut chainstate_config = TestChainstateConfig::new(&self.test_name);
         chainstate_config.network_id = self.network_id;
         chainstate_config.txindex = self.txindex;
+        chainstate_config.block_traces = self.block_traces;
 
         let addr = StacksAddress::from_public_keys(
             C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
@@ -297,6 +301,11 @@ impl NakamotoBootPlan {
 
     pub fn with_txindex(mut self, txindex: bool) -> Self {
         self.txindex = txindex;
+        self
+    }
+
+    pub fn with_block_traces(mut self, block_traces: bool) -> Self {
+        self.block_traces = block_traces;
         self
     }
 
