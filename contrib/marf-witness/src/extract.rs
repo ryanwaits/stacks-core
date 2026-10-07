@@ -90,7 +90,7 @@ impl ReadOnlyMarf {
             .map_err(|e| format!("root hash of {block}: {e:?}"))
     }
 
-    /// Emit the v2 witness of `block`'s trie.
+    /// Emit the v3 witness of `block`'s trie.
     pub fn witness(&mut self, block: &StacksBlockId) -> Result<Vec<u8>, String> {
         self.marf.with_conn(|conn| {
             conn.open_block(block)
@@ -160,43 +160,38 @@ pub struct WitnessMeta {
     pub bytes: usize,
 }
 
-/// Extract, self-check and write the witness for each block. The recomputed
-/// root must equal the MARF's root for that block, or nothing is written for it
-/// and extraction stops.
-pub fn extract_blocks(
+/// Extract, self-check and write `block`'s witness. The recomputed root must
+/// equal the MARF's root for that block, or nothing is written for it.
+pub fn extract_block(
     marf: &mut ReadOnlyMarf,
-    blocks: &[StacksBlockId],
+    block: &StacksBlockId,
     out_dir: &Path,
-) -> Result<Vec<WitnessMeta>, String> {
-    std::fs::create_dir_all(out_dir).map_err(|e| format!("create {}: {e}", out_dir.display()))?;
-    let mut metas = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        let height = marf.height_of(block)?;
-        let expected = marf.root_hash_at(block)?;
-        let bytes = marf.witness(block)?;
-        let v = wire::verify(&bytes).map_err(|e| format!("witness of {block}: {e}"))?;
-        if v.root != expected {
-            return Err(format!(
-                "witness of {block} recomputes root {} but the MARF root is {expected}",
-                v.root
-            ));
-        }
-        let meta = WitnessMeta {
-            block: block.to_string(),
-            height,
-            root_hex: to_hex(expected.as_bytes()),
-            leaves: v.leaves.len(),
-            nodes: v.nodes,
-            bytes: bytes.len(),
-        };
-        let base = out_dir.join(block.to_string());
-        let json = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
-        std::fs::write(base.with_extension("witness"), &bytes)
-            .and_then(|_| std::fs::write(base.with_extension("json"), json))
-            .map_err(|e| format!("write {}: {e}", base.display()))?;
-        metas.push(meta);
+) -> Result<WitnessMeta, String> {
+    let height = marf.height_of(block)?;
+    let expected = marf.root_hash_at(block)?;
+    let bytes = marf.witness(block)?;
+    let v = wire::verify(&bytes).map_err(|e| format!("witness of {block}: {e}"))?;
+    if v.root != expected {
+        return Err(format!(
+            "witness of {block} recomputes root {} but the MARF root is {expected}",
+            v.root
+        ));
     }
-    Ok(metas)
+    let meta = WitnessMeta {
+        block: block.to_string(),
+        height,
+        root_hex: to_hex(expected.as_bytes()),
+        leaves: v.leaves.len(),
+        nodes: v.nodes,
+        bytes: bytes.len(),
+    };
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("create {}: {e}", out_dir.display()))?;
+    let base = out_dir.join(block.to_string());
+    let json = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
+    std::fs::write(base.with_extension("witness"), &bytes)
+        .and_then(|_| std::fs::write(base.with_extension("json"), json))
+        .map_err(|e| format!("write {}: {e}", base.display()))?;
+    Ok(meta)
 }
 
 /// `tip` and its ancestors, newest first, at most `count` blocks.

@@ -22,7 +22,7 @@ use std::path::Path;
 
 use common::*;
 use marf_witness::extract::{ReadOnlyMarf, WitnessMeta};
-use marf_witness::wire;
+use marf_witness::wire::{self, Encoder, Ptr};
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::to_hex;
 use stackslib::chainstate::stacks::index::MARFValue;
@@ -153,9 +153,19 @@ fn tip_walk_follows_the_tip_fork_and_stops_at_genesis() {
     let o = extract(&local.path, &some, &["--block", &a, &b]);
     assert!(o.status.success(), "{}", stderr(&o));
     assert_eq!(read_meta(&some, &local.fork[0]).height, 37);
-    let o = extract(&local.path, &some, &["--block", &block(9999).to_string()]);
+
+    // An unknown block is reported with its id; the blocks after it still extract.
+    let rest = tmp.path().join("rest");
+    let (bad, good) = (block(9999).to_string(), local.blocks[5].to_string());
+    let o = extract(&local.path, &rest, &["--block", &bad, &good]);
     assert!(!o.status.success());
-    assert!(stderr(&o).contains("not in this MARF"), "{}", stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains(&format!("block {bad}")) && err.contains("not in this MARF"),
+        "{err}"
+    );
+    assert!(err.contains("1 of 2 blocks failed"), "{err}");
+    assert_eq!(read_meta(&rest, &local.blocks[5]).height, 5);
 }
 
 #[test]
@@ -268,4 +278,64 @@ fn missing_marf_is_not_created() {
     assert!(!o.status.success());
     assert!(stderr(&o).contains("not found"));
     assert!(!missing.exists());
+}
+
+#[test]
+fn witness_with_more_than_65535_ancestor_blocks_round_trips() {
+    // Root Node256 -> 256 local Node256s, each with 255 backptrs and one local
+    // Node4 of 4 backptrs: 256 * 259 = 66,304 distinct ancestor blocks.
+    const NODE4: u8 = 2;
+    const NODE256: u8 = 5;
+    const BACK: u8 = 0x80;
+    let mut next = 0u32;
+    let mut back = |chr: u8| {
+        let mut block = [0u8; 32];
+        block[..4].copy_from_slice(&next.to_be_bytes());
+        block[31] = 0xab;
+        next += 1;
+        Ptr::Back {
+            id: BACK | NODE256,
+            chr,
+            block,
+        }
+    };
+    let ancestors = vec![TrieHash([7u8; 32]), TrieHash([8u8; 32])];
+    let mut enc = Encoder::new(ancestors.clone());
+    let root: Vec<Ptr> = (0..=255u8)
+        .map(|chr| Ptr::Local { id: NODE256, chr })
+        .collect();
+    enc.node(NODE256, &[], &root).unwrap();
+    for _ in 0..256 {
+        let mut ptrs: Vec<Ptr> = (0..255u8).map(&mut back).collect();
+        ptrs.push(Ptr::Local {
+            id: NODE4,
+            chr: 255,
+        });
+        enc.node(NODE256, &[], &ptrs).unwrap();
+        let ptrs: Vec<Ptr> = (0..4u8).map(&mut back).collect();
+        enc.node(NODE4, &[], &ptrs).unwrap();
+    }
+    let bytes = enc.finish().unwrap();
+    assert_eq!(next, 66_304);
+
+    let v = wire::verify(&bytes).unwrap();
+    assert_eq!((v.nodes, v.leaves.len()), (513, 0));
+    let tbl_at = 1 + 4 + 32 * ancestors.len();
+    let n_tbl = u32::from_be_bytes(bytes[tbl_at..tbl_at + 4].try_into().unwrap());
+    assert_eq!(n_tbl, 66_304);
+    eprintln!(
+        "synthetic witness: {} table entries, {} bytes",
+        n_tbl,
+        bytes.len()
+    );
+
+    // The last table entry (index 66,303) is hashed into the root.
+    let mut t = bytes.clone();
+    t[tbl_at + 4 + 32 * (n_tbl as usize - 1)] ^= 1;
+    assert_ne!(wire::verify(&t).unwrap().root, v.root);
+    // A table index past the end is rejected.
+    let mut t = bytes.clone();
+    let n = t.len();
+    t[n - 4..].copy_from_slice(&n_tbl.to_be_bytes());
+    assert!(wire::verify(&t).unwrap_err().contains("out of range"));
 }

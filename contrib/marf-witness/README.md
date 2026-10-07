@@ -53,7 +53,7 @@ marf-witness burn --sortition-db /data/mainnet/burnchain/sortition/marf.sqlite \
 marf-witness stats ./witnesses
 ```
 
-`extract` writes `<block>.witness` (wire format v2, see `src/wire.rs`) and
+`extract` writes `<block>.witness` (wire format v3, see below) and
 `<block>.json`:
 
 ```json
@@ -61,7 +61,24 @@ marf-witness stats ./witnesses
 ```
 
 Before writing, every witness is verified and its recomputed root must equal
-the MARF's root for that block; otherwise extraction stops with an error.
+the MARF's root for that block. A block that fails is reported on stderr with
+its id and skipped; the rest still extract, and the exit status is 1.
+
+## Wire format v3
+
+```text
+witness := u8 version=3 | u32 n_anc | [32]*n_anc ancestor roots
+         | u32 n_tbl | [32]*n_tbl ancestor block ids | node
+node    := u8 id | u8 path_len | path | u16 n_ptrs | ptr* | child*   (one child per local ptr, in order)
+ptr     := u8 id | (id != 0: u8 chr) | (id & 0x80: u32 table index)
+leaf    := u8 1 | u8 path_len | path | [32] value hash
+```
+
+Big-endian. Node ids: 1 leaf, 2/3/4/5 = Node4/16/48/256 (`n_ptrs` 4/16/48/256);
+`id & 0x80` marks a backptr into an ancestor trie. A ptr is 1 byte (empty),
+2 (local) or 6 (backptr); each distinct ancestor block costs 32 bytes once.
+v3 widens v2's u16 counts and table indexes: busy mainnet blocks reference
+more than 65,535 ancestor tries. Hashing is documented in `src/wire.rs`.
 
 ## Read-only guarantees
 
@@ -88,8 +105,9 @@ cargo test -p marf-witness
 
 Builds local MARFs (300 blocks, 5-700 writes per block, a sibling fork, a
 compressed variant, a squashed copy) and checks read-only access, root
-equality for every block, write completeness, tamper detection, and the burn
-preimage against mainnet sortition rows for burn block 970269.
+equality for every block, write completeness, tamper detection, a witness
+with more than 65,535 ancestor blocks, and the burn preimage against mainnet
+sortition rows for burn block 970269.
 
 `tests/fixtures/witness/` holds three witnesses with their expected roots for
 cross-language verifiers. They are regenerated, deterministically, with:

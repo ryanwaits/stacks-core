@@ -91,13 +91,24 @@ fn run(cmd: Command) -> Result<(), String> {
                     .map(|b| block_id(b))
                     .collect::<Result<_, _>>()?,
             };
-            for meta in extract::extract_blocks(&mut m, &blocks, &out)? {
-                println!(
-                    "{} height={} leaves={} nodes={} bytes={} root={}",
-                    meta.block, meta.height, meta.leaves, meta.nodes, meta.bytes, meta.root_hex
-                );
+            // A failed block is reported and skipped; the rest still extract.
+            let mut failed = 0usize;
+            for block in &blocks {
+                match extract::extract_block(&mut m, block, &out) {
+                    Ok(meta) => println!(
+                        "{} height={} leaves={} nodes={} bytes={} root={}",
+                        meta.block, meta.height, meta.leaves, meta.nodes, meta.bytes, meta.root_hex
+                    ),
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("error: block {block}: {e}");
+                    }
+                }
             }
-            Ok(())
+            match failed {
+                0 => Ok(()),
+                n => Err(format!("{n} of {} blocks failed", blocks.len())),
+            }
         }
         Command::Verify { witness, root } => {
             let bytes =

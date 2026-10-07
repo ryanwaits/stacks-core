@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Witness wire format (v2) and its storage-free verifier.
+//! Witness wire format (v3) and its storage-free verifier.
 //!
 //! A witness holds every node of one block's trie that lives in that block
 //! (copy-on-write: the nodes on paths to keys written or carried in the block),
@@ -23,14 +23,20 @@
 //! bytes alone and learns every leaf (path + value hash) of the block's trie.
 //!
 //! ```text
-//! witness := u8 version=2 | u16 n_anc | [32]*n_anc ancestor roots
-//!          | u16 n_tbl | [32]*n_tbl ancestor block ids | node
+//! witness := u8 version=3 | u32 n_anc | [32]*n_anc ancestor roots
+//!          | u32 n_tbl | [32]*n_tbl ancestor block ids | node
 //! node    := u8 id | u8 path_len | path | u16 n_ptrs | ptr* | child*   (one child per local ptr, in order)
-//! ptr     := u8 id | (id != 0: u8 chr) | (backptr: u16 table index)  (empty ptr = 0x00, chr 0)
+//! ptr     := u8 id | (id != 0: u8 chr) | (backptr: u32 table index)  (empty ptr = 0x00, chr 0)
 //! leaf    := u8 1 | u8 path_len | path | [32] value hash
 //! ```
 //!
-//! All integers are big-endian. Node hashing follows stackslib exactly:
+//! All integers are big-endian. Counts and table indexes are u32: a busy
+//! mainnet block's trie points into more than 65,535 distinct ancestor tries
+//! (v2 used u16 and could not encode them). `n_ptrs` (4/16/48/256) and
+//! `path_len` (at most 32) stay small. A ptr costs 1 byte (empty), 2 (local)
+//! or 6 (backptr), and each distinct ancestor block costs 32 bytes once.
+//!
+//! Node hashing follows stackslib exactly:
 //! `sha512/256(id ‖ (ptr.id ‖ ptr.chr ‖ back_block)* ‖ path ‖ child_hash*)`, where an
 //! empty child hashes to zeros and a backptr child contributes its ancestor block id.
 //! The root is `sha512/256(node_root ‖ ancestor roots)` (or `node_root` alone).
@@ -45,7 +51,7 @@ use stackslib::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
 use stackslib::chainstate::stacks::index::node::is_backptr;
 use stackslib::chainstate::stacks::index::{MARFValue, ProofTrieNode, ProofTriePtr, TrieLeaf};
 
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 const EMPTY: u8 = 0;
 const LEAF: u8 = 1;
@@ -85,11 +91,11 @@ pub enum Ptr {
     },
 }
 
-/// Streaming v2 encoder. Feed nodes in preorder, then [`Encoder::finish`].
+/// Streaming v3 encoder. Feed nodes in preorder, then [`Encoder::finish`].
 pub struct Encoder {
     ancestors: Vec<TrieHash>,
     table: Vec<[u8; 32]>,
-    table_index: HashMap<[u8; 32], u16>,
+    table_index: HashMap<[u8; 32], u32>,
     body: Vec<u8>,
 }
 
@@ -136,8 +142,8 @@ impl Encoder {
                     let idx = match self.table_index.get(block) {
                         Some(i) => *i,
                         None => {
-                            let i = u16::try_from(self.table.len())
-                                .map_err(|_| "more than 65535 ancestor blocks")?;
+                            let i = u32::try_from(self.table.len())
+                                .map_err(|_| "more than 2^32-1 ancestor blocks")?;
                             self.table.push(*block);
                             self.table_index.insert(*block, i);
                             i
@@ -152,16 +158,17 @@ impl Encoder {
     }
 
     pub fn finish(self) -> Result<Vec<u8>, String> {
-        let n_anc = u16::try_from(self.ancestors.len()).map_err(|_| "too many ancestor roots")?;
+        let n_anc = u32::try_from(self.ancestors.len()).map_err(|_| "too many ancestor roots")?;
+        let n_tbl = u32::try_from(self.table.len()).map_err(|_| "too many ancestor blocks")?;
         let mut out = Vec::with_capacity(
-            5 + 32 * (self.ancestors.len() + self.table.len()) + self.body.len(),
+            9 + 32 * (self.ancestors.len() + self.table.len()) + self.body.len(),
         );
         out.push(VERSION);
         out.extend_from_slice(&n_anc.to_be_bytes());
         for a in &self.ancestors {
             out.extend_from_slice(a.as_bytes());
         }
-        out.extend_from_slice(&(self.table.len() as u16).to_be_bytes());
+        out.extend_from_slice(&n_tbl.to_be_bytes());
         for b in &self.table {
             out.extend_from_slice(b);
         }
@@ -207,6 +214,10 @@ impl<'a> Reader<'a> {
     fn u16(&mut self) -> Result<u16, String> {
         let s = self.take(2)?;
         Ok(u16::from_be_bytes([s[0], s[1]]))
+    }
+    fn u32(&mut self) -> Result<u32, String> {
+        let s = self.take(4)?;
+        Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
     }
     fn hash(&mut self) -> Result<[u8; 32], String> {
         Ok(self.take(32)?.try_into().expect("32 bytes"))
@@ -279,7 +290,7 @@ impl Verifier<'_> {
             }
             let chr = self.r.u8()?;
             let back_block = if is_backptr(pid) {
-                let idx = self.r.u16()? as usize;
+                let idx = self.r.u32()? as usize;
                 *self
                     .table
                     .get(idx)
@@ -326,11 +337,11 @@ pub fn verify(witness: &[u8]) -> Result<Verified, String> {
     if version != VERSION {
         return Err(format!("unsupported witness version {version}"));
     }
-    let n_anc = r.u16()? as usize;
+    let n_anc = r.u32()? as usize;
     let ancestors = (0..n_anc)
         .map(|_| r.hash().map(TrieHash))
         .collect::<Result<Vec<_>, _>>()?;
-    let n_tbl = r.u16()? as usize;
+    let n_tbl = r.u32()? as usize;
     let table = (0..n_tbl)
         .map(|_| r.hash())
         .collect::<Result<Vec<_>, _>>()?;
