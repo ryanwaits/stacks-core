@@ -150,6 +150,40 @@ pub fn build_marf(dir: &Path, n: u64, fork_len: u64, compress: bool) -> LocalMar
     }
 }
 
+/// Build a main chain whose block `i` applies `blocks[i]` (key, value-string
+/// writes in execution order; a later write to a key wins) into
+/// `dir/marf.sqlite` + `.blobs`, then close it.
+pub fn build_marf_with(dir: &Path, blocks: &[Vec<(String, String)>]) -> LocalMarf {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("marf.sqlite");
+    let mut m = MARF::<StacksBlockId>::from_path(path.to_str().unwrap(), node_opts(false)).unwrap();
+    let (mut ids, mut writes) = (vec![], vec![]);
+    let mut parent = StacksBlockId::sentinel();
+    for (i, block_writes) in blocks.iter().enumerate() {
+        let cur = block(i as u64);
+        let w: BTreeMap<String, String> = block_writes.iter().cloned().collect();
+        let mut tx = m.begin_tx().unwrap();
+        tx.begin(&parent, &cur).unwrap();
+        tx.set_block_heights(&parent, &cur, i as u32).unwrap();
+        let (ks, vs): (Vec<String>, Vec<MARFValue>) = w
+            .iter()
+            .map(|(k, v)| (k.clone(), MARFValue::from_value(v)))
+            .unzip();
+        tx.insert_batch(&ks, vs).unwrap();
+        tx.commit().unwrap();
+        ids.push(cur.clone());
+        writes.push(w);
+        parent = cur;
+    }
+    drop(m);
+    LocalMarf {
+        path,
+        blocks: ids,
+        writes,
+        fork: vec![],
+    }
+}
+
 /// sha512/256 of every file in `dir` (non-recursive), keyed by file name.
 /// Comparing two snapshots also catches created or deleted files.
 pub fn digests(dir: &Path) -> BTreeMap<String, String> {

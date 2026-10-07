@@ -13,11 +13,12 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use marf_witness::{burn, extract, stats, wire};
+use marf_witness::{burn, check, extract, stats, wire};
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::util::hash::to_hex;
 
@@ -67,11 +68,169 @@ enum Command {
     },
     /// Size distribution of an extract output directory.
     Stats { dir: PathBuf },
+    /// Verify a write log against each block's state witness (no re-execution).
+    /// Prints a JSON report; exits 1 on any failure.
+    Check {
+        /// Clarity MARF, e.g. <chainstate>/vm/clarity/marf.sqlite
+        #[arg(long, required_unless_present = "witness")]
+        marf: Option<PathBuf>,
+        /// Index block hash(es) to check
+        #[arg(long, num_args = 1.., conflicts_with_all = ["height", "from"])]
+        block: Vec<String>,
+        /// Height(s) to check, on the fork of the MARF's latest block
+        #[arg(long, num_args = 1.., conflicts_with = "from")]
+        height: Vec<u32>,
+        /// First height of an inclusive range (with --to)
+        #[arg(long, requires = "to")]
+        from: Option<u32>,
+        #[arg(long, requires = "from")]
+        to: Option<u32>,
+        /// vm_events rows as JSON lines, or - for stdin
+        #[arg(long)]
+        rows: PathBuf,
+        /// Storage-layer writes as JSON lines; every changed leaf must then be named
+        #[arg(long)]
+        writes: Option<PathBuf>,
+        /// Node RPC (http://host:port): also compare the header state_index_root
+        #[arg(long)]
+        rpc: Option<String>,
+        /// Offline: check one witness file instead of a MARF (no root or carried check)
+        #[arg(long, hide = true, conflicts_with_all = ["marf", "block", "height", "from", "rpc"])]
+        witness: Option<PathBuf>,
+    },
 }
 
 fn block_id(hex: &str) -> Result<StacksBlockId, String> {
     StacksBlockId::from_hex(hex.trim_start_matches("0x"))
         .map_err(|_| format!("not a 32-byte index block hash: {hex}"))
+}
+
+fn read_log<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<Vec<T>, String> {
+    if path == Path::new("-") {
+        return check::read_jsonl(std::io::stdin().lock(), what);
+    }
+    let f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    check::read_jsonl(std::io::BufReader::new(f), what)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_check(
+    marf: Option<PathBuf>,
+    block: Vec<String>,
+    height: Vec<u32>,
+    range: Option<(u32, u32)>,
+    rows: PathBuf,
+    writes: Option<PathBuf>,
+    rpc: Option<String>,
+    witness: Option<PathBuf>,
+) -> Result<(), String> {
+    let rows: Vec<check::Row> = read_log(&rows, "rows")?;
+    let writes: Option<Vec<check::Write>> = writes.map(|w| read_log(&w, "writes")).transpose()?;
+    let rpc = rpc.map(|u| check::Rpc::parse(&u)).transpose()?;
+
+    let mut rows_by_height: HashMap<u64, Vec<&check::Row>> = HashMap::new();
+    for r in &rows {
+        rows_by_height.entry(r.block_height).or_default().push(r);
+    }
+    let mut writes_by_height: HashMap<u64, Vec<&check::Write>> = HashMap::new();
+    for w in writes.iter().flatten() {
+        writes_by_height.entry(w.block_height).or_default().push(w);
+    }
+    let log = |h: u32| check::BlockLog {
+        rows: rows_by_height
+            .get(&u64::from(h))
+            .cloned()
+            .unwrap_or_default(),
+        writes: writes.as_ref().map(|_| {
+            writes_by_height
+                .get(&u64::from(h))
+                .cloned()
+                .unwrap_or_default()
+        }),
+    };
+
+    let mut tip = None;
+    let blocks = if let Some(path) = witness {
+        let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| block_id(s).is_ok())
+            .map(str::to_string);
+        vec![check::check_witness(&bytes, id, &log)]
+    } else {
+        let mut m = extract::ReadOnlyMarf::open(&marf.ok_or("--marf is required")?)?;
+        let heights: Vec<u32> = match range {
+            Some((from, to)) if from > to => return Err(format!("--from {from} > --to {to}")),
+            Some((from, to)) => (from..=to).collect(),
+            None => height,
+        };
+        let ids: Vec<Result<StacksBlockId, Box<check::BlockReport>>> = if !heights.is_empty() {
+            let latest = m.latest_block()?;
+            tip = Some(latest.to_string());
+            heights
+                .into_iter()
+                .map(|h| {
+                    m.block_at(h, &latest).map_err(|e| {
+                        Box::new(check::BlockReport {
+                            height: Some(h),
+                            error: Some(e),
+                            ..Default::default()
+                        })
+                    })
+                })
+                .collect()
+        } else if !block.is_empty() {
+            block
+                .iter()
+                .map(|b| {
+                    block_id(b).map_err(|e| {
+                        Box::new(check::BlockReport {
+                            id: Some(b.clone()),
+                            error: Some(e),
+                            ..Default::default()
+                        })
+                    })
+                })
+                .collect()
+        } else {
+            return Err("give --block, --height or --from/--to".into());
+        };
+        ids.into_iter()
+            .map(|id| match id {
+                Ok(id) => check::check_marf_block(&mut m, &id, &log, rpc.as_ref()),
+                Err(report) => *report,
+            })
+            .collect()
+    };
+
+    let checked: HashSet<u64> = blocks
+        .iter()
+        .filter_map(|b| b.height)
+        .map(u64::from)
+        .collect();
+    let unmatched = rows
+        .iter()
+        .filter(|r| !checked.contains(&r.block_height))
+        .count()
+        + writes
+            .iter()
+            .flatten()
+            .filter(|w| !checked.contains(&w.block_height))
+            .count();
+    let report = check::summarize(blocks, writes.is_some(), unmatched, tip);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+    );
+    let s = &report.summary;
+    match s.ok {
+        true => Ok(()),
+        false => Err(format!(
+            "check failed: {} of {} blocks",
+            s.blocks_failed, s.blocks
+        )),
+    }
 }
 
 fn run(cmd: Command) -> Result<(), String> {
@@ -140,6 +299,26 @@ fn run(cmd: Command) -> Result<(), String> {
             );
             Ok(())
         }
+        Command::Check {
+            marf,
+            block,
+            height,
+            from,
+            to,
+            rows,
+            writes,
+            rpc,
+            witness,
+        } => run_check(
+            marf,
+            block,
+            height,
+            from.zip(to),
+            rows,
+            writes,
+            rpc,
+            witness,
+        ),
         Command::Stats { dir } => {
             let s = stats::stats(&dir)?;
             println!("blocks {}", s.count);

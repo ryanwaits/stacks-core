@@ -25,6 +25,7 @@ use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, MarfConnect
 use stackslib::chainstate::stacks::index::node::{TrieNodeType, TriePtr, is_backptr};
 use stackslib::chainstate::stacks::index::storage::{TrieFileStorage, TrieStorageConnection};
 use stackslib::chainstate::stacks::index::trie::Trie;
+use stackslib::chainstate::stacks::index::trie_sql;
 
 use crate::wire::{self, Encoder, Ptr};
 
@@ -88,6 +89,26 @@ impl ReadOnlyMarf {
         self.marf
             .get_root_hash_at(block)
             .map_err(|e| format!("root hash of {block}: {e:?}"))
+    }
+
+    /// The most recently committed block. On a node that is the chain tip,
+    /// barring a sibling fork committed last.
+    pub fn latest_block(&mut self) -> Result<StacksBlockId, String> {
+        trie_sql::get_latest_confirmed_block_hash(self.marf.sqlite_conn())
+            .map_err(|e| format!("latest block of the MARF: {e:?}"))
+    }
+
+    /// Value hash of the leaf at `path` as of `block`, if the key exists there.
+    pub fn value_at(
+        &mut self,
+        block: &StacksBlockId,
+        path: &[u8; 32],
+    ) -> Result<Option<[u8; 32]>, String> {
+        let v = self
+            .marf
+            .with_conn(|conn| MARF::get_by_hash(conn, block, &TrieHash(*path)))
+            .map_err(|e| format!("read {} at {block}: {e:?}", TrieHash(*path)))?;
+        Ok(v.map(|v| v.0[..32].try_into().expect("32 bytes")))
     }
 
     /// Emit the v3 witness of `block`'s trie.

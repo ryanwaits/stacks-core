@@ -21,6 +21,7 @@
 //! own `__MARF_BLOCK_*` keys. See `wire` for the format.
 
 pub mod burn;
+pub mod check;
 pub mod extract;
 pub mod stats;
 pub mod wire;
