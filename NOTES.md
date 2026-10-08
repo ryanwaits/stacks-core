@@ -1,4 +1,10 @@
-# Stateless re-execution spike (phase 1)
+# Stateless re-execution spike
+
+Phase 1 (below, through "Why replay diverged"): re-execute a block from a
+read witness. Phase 2a (after it): make every witness entry provable and
+verify it. Phase 2b: a mainnet block.
+
+# Phase 1: re-execute from a read witness
 
 Goal: prove a block's prints, events and inner calls the way its state diff
 is proven. Re-execute the block's transactions (proven by `tx_merkle_root`)
@@ -115,41 +121,210 @@ per-entry proofs.**
 - What catches it is the entry's own proof: `Data{at: X, key}` must verify against X's root, and the parent's value fails that check.
 - With proofs, a buggy or lying server can't make a client accept wrong history.
 
-## How a client verifies each entry
+# Phase 2a: proof-carrying witness
 
-| Entry | Check |
+Rebased onto `6e005af` (dispatcher emits microblock receipts first). It
+applied cleanly: the dispatcher keeps both the `_read_witness` argument and
+the microblock-first partition. Phase-1 tests pass.
+
+Phase 1 showed the gap: a read that only feeds a print changes no write, so
+matching the state diff proves nothing about events. Phase 2a gives every
+witness entry its own evidence and adds a verifier.
+
+```
+node (prover)                                  client (verifier)
+ReadWitness ─► prove_store_reads   ─► StoreProof per entry ─┐
+            ─► prove_contracts     ─► ContractEvidence      ├─► verify_read_witness ─► execute_statelessly
+            ─► burn preimages, tenure txs                   │     ▲
+                                                            │     HeaderChain + BitcoinChain + NetworkParams
+                                                            └─► Ok | Rejection { entry, reason }
+```
+
+| Piece | Where |
 |---|---|
-| tx list | `tx_merkle_root` in a signer-signed header |
-| `Data{at: None}` / `Path` | MARF proof of `TrieHash::from_key(key)` → `MARFValue::from_value(value)` against the parent's `state_index_root`. The leaf commits to `hash(value string)`. `None` needs a **non-membership** proof |
-| `Data{at: X}`, `CurrentHeight{X}` | Same, against X's root. X's header comes from the authenticated header chain |
-| `AtBlock`, `BlockAtHeight` | MARF bookkeeping leaves against the parent's root. Not an ancestor = non-membership |
-| `Metadata` | Get the deploy tx (tx root of block `block`), check `hash(source)` against the `clarity-contract::` commitment (a proven `Data` read), re-run analysis under that block's epoch and Clarity version, and compare. Boot contracts: ship locally |
-| header env (`stacks_block_header_hash`, `stacks_block_time`, `consensus_hash`, `burn_block_height_for_block`) | Authenticated headers. Id = hash(consensus_hash, block_hash) |
-| burn env (`burn_header_hash`, `burn_block_time`, `tip_burn_block_height`, `tip_sortition_id`) | Consensus-hash preimage (marf-witness `burn`) plus Bitcoin headers, under the block's burn view (tenure-change tx) |
-| `vrf_seed_for_block` | VRF proof in the tenure's coinbase tx (proven by tx root) |
-| `miner_address`, `tokens_spent_*`, `tokens_earned`, `pox_payout_addrs` | Block-commit Bitcoin tx plus sortition rules / reward accounting. Not covered |
-| epochs, unlock heights, PoX lengths | Network constants |
-| block-level writes | Compare with the proven state diff where no tx overwrites the key. Otherwise the check is only indirect |
-| final | Re-executed writes == proven state diff (marf-witness); receipts are the output |
+| MARF absence proofs | `stackslib/src/chainstate/stacks/index/absence.rs`, tests in `index/test/absence.rs` |
+| Evidence types, prover, verifier | `stackslib/src/clarity_vm/witness_proof.rs` |
+| Metadata re-derivation | `stateless.rs::derive_contract_metadata` |
+| Typed environment queries (`EnvQuery`) | `read_witness.rs` |
+| Clarity-level tests | `stackslib/src/chainstate/nakamoto/tests/proven_witness.rs` |
 
-## Gaps
+`verify_read_witness(block, txs, trusted, proven)` takes the block id, its
+transactions and `TrustedState { headers, bitcoin, net }`. The parent root and
+every `at-block` root come from the header chain, so they are not separate
+arguments. It checks the tx list against the header's tx root, then every
+store entry, the metadata, and every environment lookup. It returns the first
+failing entry.
 
-1. **Non-membership proofs.** In the fixture, 5 of 18 parent reads were `None` (absent map entry, zero balance, unhandled cycle). MARF ships inclusion proofs (`get_with_proof`) but no absence proofs. A path walk over trie nodes (like the state witness) or a new proof type is needed.
-2. **Metadata is about 95% of bytes and can't be MARF-proven.** It needs deterministic re-analysis (version- and epoch-sensitive) or an AST cache keyed by source hash.
-3. **Block-level writes aren't re-executed.** Lockup, unlock and SIP-031 events attached to the coinbase receipt are block-level and are not covered.
-4. **Env authentication for burnchain-derived answers** (spend, payout, reward) isn't covered. Neither is the burn view for replayed tenure-start/extend blocks.
-5. Epoch 2.x / microblocks and problematic-tx markers: the executor takes `TxToProcess`, but the tests don't cover them.
-6. The witness has no wire format yet. Env answers are typed in memory.
+## Absence proofs
 
-## Phase 2: a mainnet block via replay on a fixed-image node
+The MARF only had inclusion proofs. An absence proof is the read's own walk:
+start at the tip trie's root and follow back-pointers into ancestor tries,
+exactly as `MARF::walk` does, until the walk stops without a leaf for the key.
 
-- Build a node image from this branch. It needs `f0f9d6b`, or replay witnesses are wrong for `at-block`.
-- Add a `read_witness=1` replay query flag and a JSON wire format:
-  - store: `{kind, at, key | path | height, value_hex | null}`
-  - env: `{method, args, answer}` as typed JSON (needs serde for `StacksEpoch` and `TupleData`).
-- Fix the replay burn view to match live: use the block's tenure-change burn view, not `index_handle_at_block(parent)`.
-- First target: the `sbtc-yield-rewards-v3` block.
-  - Replay with witness, re-execute offline.
-  - Compare the writes to that block's marf-witness state diff, and the prints to live `/new_block`.
-- Produce a proof per entry: MARF `get_with_proof` at the parent or the `at-block` target, plus absence proofs. Measure proof bytes against witness bytes on real blocks.
-- Client cache for boot-contract metadata (`costs-3`, `pox-4`, …).
+- **Shape.** Same as an inclusion proof: one segment proof per trie, oldest first. Shunt proofs link each trie's root into the next trie's skip-list. The difference is the deepest node. Instead of the value's leaf, the proof carries the node where the walk ended, whole, with every child hash (`AbsenceEnd`):
+  - an intermediate node with no child, not even a back-pointer, at the key's next byte, or
+  - a node whose compressed path, or a leaf whose remaining path, differs from the key's.
+- **Hashing.** The MARF's own: a back-pointer child hashes as the ancestor block id, an empty child as `TrieHash::EMPTY`, a trie root as its node hash plus its ancestors' roots (the skip-list).
+- **Verifier.** It accepts only if all of these hold:
+  - the bytes walked above the end node are a prefix of the key;
+  - the end node shows the key cannot continue;
+  - every newer trie's segment walks a prefix of that path;
+  - the hash chain reaches the root. This reuses the inclusion verifier's chain check (`verify_proof_chain`, refactored out of `verify_proof`).
+- **Inclusion verifier hardening.** The chain check now rejects a node with the wrong number of children. Before, `get_segment_proof_hash` asserted on it and a malformed proof panicked.
+- **No deletions.** `map-delete` writes a none value, so "absent" means never written on this fork.
+
+| Test (`index/test/absence.rs`, 8-block MARF, 40 keys per block) | Shows |
+|---|---|
+| `absent_paths_verify_and_present_paths_cannot_be_proven_absent` | 300 absent keys verify, with both leaf ends and node ends, including walks across back-pointers. The prover refuses all 320 written keys |
+| `near_miss_of_a_written_leaf_is_absent_but_the_leaf_is_not` | A path one byte off a written key (bytes 31, 20, 5, 1) is provably absent and ends at that leaf. The same proof fails for the written key, and so does the written key's inclusion proof dressed as an absence proof |
+| `tampering_with_any_part_of_an_absence_proof_breaks_it` | Flipping an end-node child hash, emptying an occupied child slot, or changing any segment node or shunt hash fails. A different root fails too |
+| `absence_holds_until_the_block_that_writes_the_key` | A key written in block 5 is provably absent at block 4, through a root back-pointer into block 0. That proof fails at block 5 and the tip, where only inclusion proves |
+
+## Store entries
+
+| Entry | Evidence |
+|---|---|
+| `Data` / `Path` at the open block | Inclusion or absence proof against the parent's `state_index_root` |
+| `Data` / `Path` inside `at-block X` | Same, against X's root from its header |
+| `CurrentHeight { at: X }` | `__MARF_BLOCK_HEIGHT_SELF` at X |
+| `BlockAtHeight { h }` | `__MARF_BLOCK_HEIGHT_TO_HASH::h` at the parent, or at X inside `at-block`. Deterministic, no proof: h = open height gives the miner tip; h = open height - 1 gives the parent id; inside `at-block X` with h = X's height gives X (MARF shortcut) |
+| `AtBlock { X }` | `__MARF_BLOCK_HASH_TO_HEIGHT::X` and back, at the parent (`check_ancestor_block_hash`). Not an ancestor: absence, or a mismatched height. X = parent is deterministic |
+| `Metadata` | Re-derived (next section) |
+
+Two findings fixed the special cases:
+
+- **The open trie rewrites its parent's height-to-hash entry.** A processed Nakamoto block's own trie maps its height to the miner placeholder id. The child trie rewrites it to the real id. So `BlockAtHeight(parent height)` can't be proven against the parent root, and the verifier derives it from the parent id instead.
+- **The genesis header has a zero `state_index_root`.** The client pins the genesis MARF root (boot code plus allocations) as a network constant. Every other header root equals the MARF root.
+
+## Contract metadata
+
+Contract metadata is not in the MARF. What the MARF does commit is
+`clarity-contract::<id>` = sha512/256(source) plus the deploy height
+(`ContractCommitment`, written by `insert_contract_hash`). Boot contracts get
+the same commitment, because epoch transitions deploy them as synthetic
+boot-code transactions through the same path.
+
+Evidence per contract (`ContractEvidence`):
+
+- the deploying block D (an ancestor, header authenticated);
+- the commitment at D's root (inclusion proof);
+- `vm-epoch::epoch-version` at D's root (inclusion proof, or absence, which means 2.0);
+- the source: for a user contract, the deploy tx plus its Merkle path to D's tx root; for a boot contract, the client's bundled boot code.
+
+The verifier:
+
+1. Checks that hash(source) equals the commitment and the commitment height equals D's height.
+2. Re-runs the real deploy path (`process_transaction_payload`: analysis, initialization, `save_analysis`). It runs in an empty, unmetered store that holds only contracts already derived.
+3. Compares every witnessed metadata row with its re-derivation. `ContractContext` serializes hash maps and sets, so JSON is compared up to their order.
+
+**Dependencies.** The prover finds them by re-deriving and reading which commitment was missing: `relay` needs `ledger`, and the state-writes fixture needs `tok-impl`. The verifier re-derives in that order.
+
+**Limit.** Any other read during re-derivation fails as `WitnessIncomplete`. A contract whose initialization reads chain state (a top-level `contract-call?`, balances, block info) needs the deploy block's own witness. That recursion is phase 2b or later.
+
+**Boot table.** `pox`, `lockup`, `costs`, `cost-voting`, `bns`, `genesis`, `costs-2`, `pox-2`, `costs-3`, `pox-3`, `pox-4`, `signers`, `signers-voting` and `costs-4`, each with the Clarity version its transition pins. Not covered yet: `signers-stackerdb` (generated), `sip-031` (generated body), `pox-5`. In the fixtures, `lockup` and `costs-3` are read every block. Both re-derive.
+
+**Cost.** Re-derivation is about 90% of verify time (below). Cache the results by source hash; boot contracts need it once per network.
+
+## Environment lookups
+
+| Lookup (`EnvQuery`) | Clarity surface | Class | Verified by |
+|---|---|---|---|
+| `StacksBlockHeaderHash` | `get-stacks-block-info? header-hash`, `get-block-info? header-hash` | a | Header block hash (or none if the epoch picks the other header table) |
+| `ConsensusHashForBlock` | tenure lookups | a | Header consensus hash |
+| `StacksBlockTime` | `get-stacks-block-info? time`, `stacks-block-time` | a | Nakamoto header timestamp. None for 2.x |
+| `VrfSeed` | `get-tenure-info? vrf-seed`, `get-block-info? vrf-seed` | a | Nakamoto: the tenure coinbase's VRF proof, with a tx Merkle path in a block of that tenure (a coinbase only appears in a tenure's first block). 2.x: the header's VRF proof |
+| `BurnHeaderHashForBlock` | `get-block-info? burnchain-header-hash`, `get-tenure-info? burnchain-header-hash` | b | Preimage of the header's consensus hash |
+| `BurnBlockHeightForBlock` | epoch of the parent, tenure info | b | Preimage, then that Bitcoin block's height |
+| `BurnBlockTime` | `get-block-info? time`, `get-tenure-info? time` | b | Bitcoin header timestamp |
+| `TipBurnBlockHeight` | `burn-block-height` | b | Burn view preimage, then Bitcoin height |
+| `TipSortitionId` | key for burn lookups | b | sha512/256(burn hash ‖ pox_id), both from the burn view preimage |
+| `BurnHeaderHash(h, sortition)` | `get-burn-block-info? header-hash` | b | Bitcoin header at h, if first burn height ≤ h ≤ burn view. Only the burn view's sortition is accepted |
+| `BurnBlockHeight(sortition)`, `SortitionIdFromConsensusHash` | internal | b | Preimage of a sortition's consensus hash |
+| `StacksEpoch`, `StacksEpochById`, unlock heights, PoX activation heights, `BurnStartHeight`, prepare and cycle lengths, rejection fraction | epoch gates, PoX, lockup | const | Network constants |
+| `StacksHeightForTenureHeight` | `get-block-info?` and `block-height` in Clarity 1/2 contracts on Nakamoto | c | Provable with MARF proofs of `_stx-data::tenure_height` at two adjacent headers. Not implemented |
+| `MinerAddress` | `get-block-info? miner-address`, `get-tenure-info? miner-address` | c | Tenure's miner payment address (headers DB `payments`). Likely the coinbase's origin or alt recipient, so provable by coinbase inclusion once that equality is checked. Not implemented |
+| `TokensSpentWinning` | `get-tenure-info? miner-spend-winner` | c | The winning block-commit's burn: an SPV tx proof of the commit in the sortition's Bitcoin block, then parse it |
+| `TokensSpent` | `get-tenure-info? miner-spend-total` | c | Sum over all of the sortition's block-commits: the full Bitcoin block (or a proof of every commit in it) |
+| `PoxPayoutAddrs` | `get-burn-block-info? pox-addrs` | c | The reward set (pox state at the anchor block, MARF-provable) plus the reward slots each burn block pays (commit outputs) |
+| `TokensEarned` | `get-tenure-info? block-reward`, `get-block-info? block-reward` | d | Matured miner reward (coinbase plus fees after maturity, reward accounting in the headers DB). No proof format. Reproducible only by replaying reward accounting over the tenure tx lists |
+
+The verifier rejects every class (c) and (d) lookup as "not provable yet".
+Class (b) uses the same consensus-hash preimage that marf-witness `burn`
+serves. The pox_id inside the preimage also yields the sortition id.
+
+Other environment checks:
+
+- **Burn view.** The last tenure change's `burn_view_consensus_hash`: in the block itself, else proven by a tx Merkle path in an earlier block of the same tenure.
+- **Epoch.** The witness epoch must be the epoch of the parent's burn height (`ClarityInstance::get_epoch_of`).
+
+## Results (`proven_witness.rs`)
+
+| Test | Shows |
+|---|---|
+| `honest_proof_carrying_witness_verifies_and_reexecution_reproduces_the_block` | History fixture: 35 store entries, 14 lookups, 4 contracts (`lockup`, `costs-3` from boot code; `ledger`, `relay` from deploy txs). It verifies, and re-execution reproduces the live writes and receipts |
+| `honest_proof_carrying_witness_verifies_for_the_state_writes_fixture` | Same for the 12-tx fixture (trait dependency `tok-impl`) |
+| `forged_print_only_read_is_caught_by_its_proof` | **The phase-1 hole, closed.** Forging `note` (feeds only a print) still re-executes to the live writes with a forged event, but the verifier rejects it: "MARF proof fails" on `vm::…::1::note`. A forged block time (also print-only) is rejected on `stacks_block_time_for_block` |
+| `forged_absence_is_caught` | A present key claimed absent with another key's absence proof is rejected, and the prover can't make an honest one. An absent key claimed present is rejected |
+| `forged_at_block_value_is_caught` | The replay bug's output (parent value 15 at `at-block`, with the parent read's valid proof) is rejected: the proof doesn't hold at X's root |
+| `forged_metadata_is_caught` | A contract context with `data_size + 1` fails ("metadata differs from its re-derivation"). So does another contract's deploy tx as the source, and so does dropping the contract's evidence |
+| `every_witness_entry_has_its_own_evidence` | Every store entry kind maps to the evidence the verifier expects |
+
+## Measurements (test blocks, optimized + debuginfo, Apple silicon)
+
+| | history fixture | state-writes fixture |
+|---|---|---|
+| Store entries (inclusion / absence proofs) | 35 (20 / 5) | 29 (13 / 7) |
+| Witness without proofs | 92.6 KB (metadata 88.7 KB) | 87.2 KB (metadata 84.8 KB) |
+| MARF proofs, one per entry | 654 KB | 552 KB |
+| Contract evidence (deploy txs, commitment and epoch proofs) | 140 KB | 141 KB |
+| Burn preimages, tenure-tx proofs | 0.9 KB | 0.5 KB |
+| Witness with naive proofs | 888 KB | 781 KB |
+| Same, metadata derived instead of shipped | 799 KB | 696 KB |
+| All MARF proofs as one multiproof | 143 KB | 143 KB |
+| Same, compact (no rebuildable child hashes) | 83 KB | 82 KB |
+| Verify | 6.8 ms | 6.4 ms |
+| Verify without metadata re-derivation | 0.68 ms | 0.59 ms |
+| Re-execute | 1.6 ms | 2.0 ms |
+
+- **Per-entry MARF proofs are big: about 26 KB each.** Every trie a walk visits adds its root Node256 step: 255 sibling hashes (8 KB) plus 256 pointers with 32-byte `back_block` ids (8.7 KB). A read that crosses back-pointers visits several tries.
+- **The tries are shared across entries.** One multiproof ships each node once and is 5.5x smaller. It can also drop child hashes the verifier rebuilds (empty slots, and back-pointers whose hash is their `back_block`), for another 1.7x. Interning `back_block` ids in a per-proof table would shrink root pointers further (not measured).
+- **Metadata no longer has to ship.** It was 95% of the phase-1 witness, and the verifier now re-derives it from sources. Those sources are tiny next to the proofs.
+- **Verify is dominated by re-deriving 4 contracts.** Without that it costs less than re-execution.
+
+## Remaining gaps
+
+1. **Environment classes (c) and (d)** (table above). A block that reads them is rejected, not accepted.
+2. **Burn view recency.** The verifier checks that the tenure change is in this tenure, not that no later extend happened before the block. A client verifying blocks in order has every tx list and can check it. A one-block client needs every intermediate block's tx list.
+3. **Nested `at-block`.** Ancestry is checked against the parent, not the enclosing `at-block` target.
+4. **Contracts whose initialization reads chain state** need the deploy block's own witness (recursive). Boot contracts not in the table are rejected.
+5. **Block-level writes** (setup and teardown, coinbase-attached events) are still inputs. Not covered.
+6. **Epoch 2.x and microblocks**: no tests.
+7. **Signer signatures and Bitcoin PoW** are assumed checked by whoever builds `HeaderChain` / `BitcoinChain`.
+8. **No wire format.** Evidence types are in-memory Rust. `TrieMerkleProof` and transactions have consensus codecs; `TrieAbsenceProof`, `ContractEvidence` and the typed env answers do not.
+
+# Phase 2b: a mainnet block on a scratch node
+
+What it needs, in order:
+
+1. **Build a scratch node from this branch** (it carries `f0f9d6b`, or replay witnesses are wrong for `at-block`). Fix replay's burn view to the tenure-change burn view, not `index_handle_at_block(parent)`.
+2. **Add a replay flag returning the proof-carrying witness.** For example `/v3/blocks/replay/{id}?read_witness=1&proofs=1`. The node already holds everything the prover needs:
+   - the MARF, for `prove_store_reads` and the contract commitment and epoch proofs;
+   - Nakamoto staging blocks and the 2.x block store, for `find_deploy` (deploy txs, tenure changes, coinbases) and their Merkle paths;
+   - the sortition DB, for consensus-hash preimages (reuse marf-witness `burn`).
+3. **Wire format v1**, one JSON envelope:
+   - `witness`: `{open_tip, open_height, epoch, store: [{kind, at, key | path | height | target | contract+key, value_hex | null}], env: [{query: EnvQuery, answer}]}`. `EnvQuery` is now typed, so serde derives work. Answers need serde for `StacksEpoch`, `TupleData` and `VRFSeed`;
+   - `store_proofs`: per entry `{marf: inclusion | absence, hex} | {ancestor: [hex, hex]} | open_block | rederived`. Inclusion proofs use the existing consensus codec; add one for `TrieAbsenceProof`. Then a multiproof (dedupe nodes, drop rebuildable hashes, intern block ids) once the per-entry format works;
+   - `contracts`: `{contract, block, source: {tx_hex, merkle_path} | boot, commitment, commitment_proof, epoch_key, epoch_key_proof}`;
+   - `burn`: preimages as marf-witness `burn` serves them, plus pox_id length so the client can split them;
+   - `burn_view`, `coinbases`: `{block, tx_hex, merkle_path}`.
+   - Leave out metadata values: the client re-derives them.
+4. **Client inputs**:
+   - signer-verified header chain from genesis to the block (state roots, tx roots, timestamps);
+   - Bitcoin headers (the marf-witness sidecar's `/headers`);
+   - mainnet network constants: epochs, PoX constants, genesis MARF root;
+   - mainnet boot sources (add `pox-5`, `sip-031`, `signers-stackerdb`);
+   - a re-derivation cache keyed by source hash.
+5. **First target: the `sbtc-yield-rewards-v3` block.**
+   - Replay with proofs, verify offline, re-execute.
+   - Compare the writes with marf-witness's state diff and the prints with live `/new_block`.
+   - Record which class (c)/(d) lookups mainnet blocks hit, and how many tries a mainnet read crosses (proof size scales with it).
