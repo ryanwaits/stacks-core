@@ -21,6 +21,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use rusqlite::{Connection, params};
+use serde_json::Value;
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::util::hash::{Sha512Trunc256Sum, to_hex};
 use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts};
@@ -238,4 +240,91 @@ pub fn stdout(o: &Output) -> String {
 
 pub fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// The `snapshots` columns the preimage needs (a subset of the sortition DB schema).
+pub fn create_snapshots(path: &Path) -> Connection {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE snapshots(
+            block_height INTEGER NOT NULL,
+            burn_header_hash TEXT NOT NULL,
+            sortition_id TEXT UNIQUE NOT NULL,
+            parent_sortition_id TEXT NOT NULL,
+            consensus_hash TEXT UNIQUE NOT NULL,
+            ops_hash TEXT NOT NULL,
+            total_burn TEXT NOT NULL,
+            pox_valid INTEGER NOT NULL,
+            PRIMARY KEY(sortition_id));",
+    )
+    .unwrap();
+    conn
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_snapshot(
+    conn: &Connection,
+    height: u64,
+    bhh: &str,
+    sortition_id: &str,
+    parent: &str,
+    ch: &str,
+    ops: &str,
+    total_burn: &str,
+) {
+    conn.execute(
+        "INSERT INTO snapshots VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+        params![
+            height as i64,
+            bhh,
+            sortition_id,
+            parent,
+            ch,
+            ops,
+            total_burn
+        ],
+    )
+    .unwrap();
+}
+
+pub fn burn_fixture(name: &str) -> Value {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/burn")
+        .join(name);
+    serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
+}
+
+/// Mainnet sortition rows for burn block 970269 and its 19 previous-consensus-hash heights.
+pub fn mainnet_sortition_db(dir: &Path) -> std::path::PathBuf {
+    let raw = burn_fixture("sortition-970269.json");
+    let path = dir.join("sortition.sqlite");
+    let conn = create_snapshots(&path);
+    let s = &raw["snapshot"];
+    let str_of = |v: &Value| v.as_str().unwrap().to_string();
+    insert_snapshot(
+        &conn,
+        s["block_height"].as_u64().unwrap(),
+        &str_of(&s["burn_header_hash"]),
+        &str_of(&s["sortition_id"]),
+        &str_of(&s["parent_sortition_id"]),
+        &str_of(&s["consensus_hash"]),
+        &str_of(&s["ops_hash"]),
+        &str_of(&s["total_burn"]),
+    );
+    for prev in raw["prev"].as_array().unwrap() {
+        let h = prev["height"].as_u64().unwrap();
+        for row in prev["rows"].as_array().unwrap() {
+            insert_snapshot(
+                &conn,
+                h,
+                &str_of(&row[1]),
+                &format!("fixture-sortition-{h}"),
+                &format!("fixture-parent-{h}"),
+                &str_of(&row[0]),
+                &"00".repeat(32),
+                "0",
+            );
+        }
+    }
+    path
 }

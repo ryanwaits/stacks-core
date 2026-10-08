@@ -20,8 +20,30 @@
 //! block's complete write set plus copy-on-write carried leaves and the MARF's
 //! own `__MARF_BLOCK_*` keys. See `wire` for the format.
 
+use std::path::Path;
+
+use rusqlite::{Connection, OpenFlags};
+
 pub mod burn;
 pub mod check;
 pub mod extract;
+pub mod headers;
+pub mod serve;
 pub mod stats;
 pub mod wire;
+
+/// Open a SQLite database strictly read-only: `SQLITE_OPEN_READ_ONLY` (never
+/// creates the file or its tables) plus `PRAGMA query_only`.
+pub fn open_sqlite_readonly(path: &Path, what: &str) -> Result<Connection, String> {
+    if !path.is_file() {
+        return Err(format!("{what} not found: {}", path.display()));
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("open {} read-only: {e}", path.display()))?;
+    conn.pragma_update(None, "query_only", true)
+        .map_err(|e| format!("set query_only: {e}"))?;
+    Ok(conn)
+}

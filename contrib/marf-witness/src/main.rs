@@ -14,11 +14,13 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use marf_witness::{burn, check, extract, stats, wire};
+use marf_witness::{burn, check, extract, serve, stats, wire};
 use stacks_common::types::chainstate::StacksBlockId;
 use stacks_common::util::hash::to_hex;
 
@@ -97,6 +99,33 @@ enum Command {
         /// Offline: check one witness file instead of a MARF (no root or carried check)
         #[arg(long, hide = true, conflicts_with_all = ["marf", "block", "height", "from", "rpc"])]
         witness: Option<PathBuf>,
+    },
+    /// Private HTTP sidecar serving witnesses, burn preimages and Bitcoin
+    /// headers. No auth: bind to localhost behind an authenticating API.
+    Serve {
+        /// Clarity MARF [default: <working-dir>/chainstate/vm/clarity/marf.sqlite]
+        #[arg(long, required_unless_present = "working_dir")]
+        marf: Option<PathBuf>,
+        /// Sortition DB [default: <working-dir>/burnchain/sortition/marf.sqlite]
+        #[arg(long, required_unless_present = "working_dir")]
+        sortition_db: Option<PathBuf>,
+        /// SPV headers DB [default: <working-dir>/headers.sqlite]
+        #[arg(long, required_unless_present = "working_dir")]
+        headers_db: Option<PathBuf>,
+        /// Node working dir for the network, e.g. /data/mainnet
+        #[arg(long)]
+        working_dir: Option<PathBuf>,
+        #[arg(long, default_value = "127.0.0.1:20450")]
+        listen: SocketAddr,
+        /// Witness extractions running at once; more get 503 + retry-after
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..))]
+        max_concurrent_extractions: u16,
+        /// LRU budget for extracted witness bytes
+        #[arg(long, default_value_t = 256 << 20)]
+        cache_bytes: usize,
+        /// Socket read/write timeout per request
+        #[arg(long, default_value_t = 30)]
+        request_timeout_secs: u64,
     },
 }
 
@@ -288,11 +317,9 @@ fn run(cmd: Command) -> Result<(), String> {
             first_burn_height,
         } => {
             let conn = burn::open_readonly(&sortition_db)?;
-            let p = burn::burn_preimage(
-                &conn,
-                consensus_hash.trim_start_matches("0x"),
-                first_burn_height,
-            )?;
+            let ch = consensus_hash.trim_start_matches("0x");
+            let p = burn::burn_preimage(&conn, ch, first_burn_height)?
+                .ok_or_else(|| format!("no snapshot with consensus hash {ch}"))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&p).map_err(|e| e.to_string())?
@@ -319,6 +346,45 @@ fn run(cmd: Command) -> Result<(), String> {
             rpc,
             witness,
         ),
+        Command::Serve {
+            marf,
+            sortition_db,
+            headers_db,
+            working_dir,
+            listen,
+            max_concurrent_extractions,
+            cache_bytes,
+            request_timeout_secs,
+        } => {
+            let under = |explicit: Option<PathBuf>, rel: &str| {
+                explicit
+                    .or_else(|| working_dir.as_ref().map(|w| w.join(rel)))
+                    .ok_or_else(|| format!("give --working-dir or the path of {rel}"))
+            };
+            let cfg = serve::Config {
+                marf: under(marf, "chainstate/vm/clarity/marf.sqlite")?,
+                sortition_db: under(sortition_db, "burnchain/sortition/marf.sqlite")?,
+                headers_db: under(headers_db, "headers.sqlite")?,
+                listen,
+                max_concurrent_extractions: max_concurrent_extractions.into(),
+                cache_bytes,
+                request_timeout: Duration::from_secs(request_timeout_secs),
+            };
+            if !listen.ip().is_loopback() {
+                eprintln!("warning: {listen} is not loopback; this server does no auth");
+            }
+            let (marf, sortition, headers) = (
+                cfg.marf.display().to_string(),
+                cfg.sortition_db.display().to_string(),
+                cfg.headers_db.display().to_string(),
+            );
+            let server = serve::Server::bind(cfg)?;
+            eprintln!(
+                "listening on {} marf={marf} sortition_db={sortition} headers_db={headers}",
+                server.local_addr()?
+            );
+            server.run()
+        }
         Command::Stats { dir } => {
             let s = stats::stats(&dir)?;
             println!("blocks {}", s.count);

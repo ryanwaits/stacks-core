@@ -71,10 +71,15 @@ impl ReadOnlyMarf {
     }
 
     pub fn height_of(&mut self, block: &StacksBlockId) -> Result<u32, String> {
+        self.find_height(block)?
+            .ok_or_else(|| format!("block {block} is not in this MARF"))
+    }
+
+    /// Height of `block`, or `None` when the MARF has no such block.
+    pub fn find_height(&mut self, block: &StacksBlockId) -> Result<Option<u32>, String> {
         self.marf
             .with_conn(|conn| MARF::get_block_height(conn, block, block))
-            .map_err(|e| format!("height of {block}: {e:?}"))?
-            .ok_or_else(|| format!("block {block} is not in this MARF"))
+            .map_err(|e| format!("height of {block}: {e:?}"))
     }
 
     /// The block at `height` on the fork ending at `tip`.
@@ -181,14 +186,16 @@ pub struct WitnessMeta {
     pub bytes: usize,
 }
 
-/// Extract, self-check and write `block`'s witness. The recomputed root must
-/// equal the MARF's root for that block, or nothing is written for it.
-pub fn extract_block(
+/// `block`'s witness bytes and metadata, self-checked: the recomputed root
+/// must equal the MARF's root for that block. `None` when the MARF has no
+/// such block.
+pub fn checked_witness(
     marf: &mut ReadOnlyMarf,
     block: &StacksBlockId,
-    out_dir: &Path,
-) -> Result<WitnessMeta, String> {
-    let height = marf.height_of(block)?;
+) -> Result<Option<(Vec<u8>, WitnessMeta)>, String> {
+    let Some(height) = marf.find_height(block)? else {
+        return Ok(None);
+    };
     let expected = marf.root_hash_at(block)?;
     let bytes = marf.witness(block)?;
     let v = wire::verify(&bytes).map_err(|e| format!("witness of {block}: {e}"))?;
@@ -206,6 +213,18 @@ pub fn extract_block(
         nodes: v.nodes,
         bytes: bytes.len(),
     };
+    Ok(Some((bytes, meta)))
+}
+
+/// Extract, self-check and write `block`'s witness. The recomputed root must
+/// equal the MARF's root for that block, or nothing is written for it.
+pub fn extract_block(
+    marf: &mut ReadOnlyMarf,
+    block: &StacksBlockId,
+    out_dir: &Path,
+) -> Result<WitnessMeta, String> {
+    let (bytes, meta) = checked_witness(marf, block)?
+        .ok_or_else(|| format!("block {block} is not in this MARF"))?;
     std::fs::create_dir_all(out_dir).map_err(|e| format!("create {}: {e}", out_dir.display()))?;
     let base = out_dir.join(block.to_string());
     let json = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;

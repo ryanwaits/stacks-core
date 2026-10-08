@@ -29,7 +29,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum, hex_bytes, to_hex};
 use stackslib::core::SYSTEM_FORK_SET_VERSION;
@@ -63,17 +63,7 @@ fn hash32(hex: &str, what: &str) -> Result<[u8; 32], String> {
 
 /// Open the sortition DB strictly read-only.
 pub fn open_readonly(path: &Path) -> Result<Connection, String> {
-    if !path.is_file() {
-        return Err(format!("sortition DB not found: {}", path.display()));
-    }
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| format!("open {} read-only: {e}", path.display()))?;
-    conn.pragma_update(None, "query_only", true)
-        .map_err(|e| format!("set query_only: {e}"))?;
-    Ok(conn)
+    crate::open_sqlite_readonly(path, "sortition DB")
 }
 
 fn snapshot_by_sortition_id(conn: &Connection, id: &str) -> Result<Option<Snapshot>, String> {
@@ -169,26 +159,20 @@ fn recover_pox_id(bhh: &[u8; 32], sortition_id: &[u8; 32]) -> Option<String> {
     None
 }
 
-/// Rebuild and check the consensus-hash preimage of the snapshot with `consensus_hash`.
+/// Rebuild and check the consensus-hash preimage of the snapshot with
+/// `consensus_hash`; `None` when the DB has no such snapshot.
 pub fn burn_preimage(
     conn: &Connection,
     consensus_hash: &str,
     first_burn_height: u64,
-) -> Result<BurnPreimage, String> {
+) -> Result<Option<BurnPreimage>, String> {
     let ch: [u8; 20] = hex_bytes(consensus_hash)
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or_else(|| format!("consensus hash is not 20 bytes of hex: {consensus_hash}"))?;
     let ch_hex = to_hex(&ch);
 
-    let (height, bhh_hex, ops_hex, total_burn, sortition_id, parent_sortition_id): (
-        i64,
-        String,
-        String,
-        String,
-        String,
-        String,
-    ) = conn
+    let snapshot: Option<(i64, String, String, String, String, String)> = conn
         .query_row(
             "SELECT block_height, burn_header_hash, ops_hash, total_burn, sortition_id, \
              parent_sortition_id FROM snapshots WHERE consensus_hash = ?1",
@@ -205,8 +189,11 @@ pub fn burn_preimage(
             },
         )
         .optional()
-        .map_err(|e| format!("read snapshot {ch_hex}: {e}"))?
-        .ok_or_else(|| format!("no snapshot with consensus hash {ch_hex}"))?;
+        .map_err(|e| format!("read snapshot {ch_hex}: {e}"))?;
+    let Some((height, bhh_hex, ops_hex, total_burn, sortition_id, parent_sortition_id)) = snapshot
+    else {
+        return Ok(None);
+    };
     let height = height as u64;
     let bhh = hash32(&bhh_hex, "burn_header_hash")?;
     let ops = hash32(&ops_hex, "ops_hash")?;
@@ -250,10 +237,10 @@ pub fn burn_preimage(
              (wrong --first-burn-height, or the sortition DB is inconsistent)"
         ));
     }
-    Ok(BurnPreimage {
+    Ok(Some(BurnPreimage {
         consensus_hash: ch_hex,
         burn_height: height,
         bitcoin_block_hash: to_hex(&bhh),
         preimage: to_hex(&pre),
-    })
+    }))
 }

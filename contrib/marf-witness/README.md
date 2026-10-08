@@ -11,7 +11,8 @@ node's Clarity MARF. A witness lets a client, with no access to the node:
 optionally storage-layer writes) block by block, without re-executing.
 
 It also rebuilds the consensus-hash preimage that binds a tenure to its
-Bitcoin block, from the sortition DB.
+Bitcoin block, from the sortition DB, and `serve` exposes witnesses,
+preimages and Bitcoin headers over a private HTTP sidecar.
 
 ## Build
 
@@ -174,19 +175,99 @@ marf-witness check --marf /data/mainnet/chainstate/vm/clarity/marf.sqlite \
   --height "$N" --rows - > "check-$N.json"
 ```
 
+## Serve
+
+A private HTTP sidecar next to a node, for a trustless index to fetch proof
+material from. It does **no auth and no rate limiting**: bind it to localhost
+behind an API that does both.
+
+```bash
+marf-witness serve --working-dir /data/mainnet
+# same as:
+marf-witness serve \
+  --marf /data/mainnet/chainstate/vm/clarity/marf.sqlite \
+  --sortition-db /data/mainnet/burnchain/sortition/marf.sqlite \
+  --headers-db /data/mainnet/headers.sqlite \
+  --listen 127.0.0.1:20450 --max-concurrent-extractions 2 \
+  --cache-bytes 268435456 --request-timeout-secs 30
+```
+
+An explicit path overrides the one derived from `--working-dir`. Every
+database is opened read-only at startup (a missing one is an error), then
+once per worker on first use.
+
+| Route | 200 response | Errors |
+|---|---|---|
+| `GET /witness/{index_block_hash}` | `application/octet-stream`: wire format v3 bytes, identical to `extract`'s `.witness`. Headers `x-block-height`, `x-state-root` (hex), `cache-control: public, max-age=31536000, immutable`, `x-cache: hit\|miss` | 400 bad hash, 404 not in the MARF, 503 + `retry-after: 1` when every extraction slot is busy |
+| `GET /burn/{consensus_hash}` | `{consensus_hash, burn_height, bitcoin_block_hash, preimage}`, as `burn` (mainnet first burn height); `preimage[4..36]` is the Bitcoin block hash in display order, no reversal | 400 bad hash, 404 unknown |
+| `GET /bitcoin/headers?from=H&count=N` | `{from, headers: [hex of the 80-byte wire header, …]}` in height order, `1 ≤ N ≤ 2016`; truncated at the tip (or a gap), empty past it | 400 bad or missing params |
+| `GET /health` | `{ok: true, marf_tip_height, bitcoin_tip_height}` | 503 `{ok: false, …, error}` |
+
+Errors are JSON `{error}`; other methods get 405. Every response closes the
+connection. Each served witness is self-checked like `extract`: its
+recomputed root must equal the MARF's root, else 500.
+
+Headers come from the SPV DB's columns (`SpvClient` in stackslib's
+`burnchains/bitcoin/spv.rs`) re-encoded with stackslib's `BlockHeader`
+consensus encoding, so `sha256d(header)` reversed is the block hash and
+bytes 4..36 are the previous header's `sha256d`.
+
+How it behaves under load:
+
+- The accept loop only queues connections (64 deep); a full queue gets an
+  immediate 503. `max-concurrent-extractions + 8` workers serve the queue,
+  each with its own read-only handles, so no handle crosses threads.
+- A witness that is not cached takes an extraction slot or gets 503 at
+  once, never waiting. Cache hits, burn, headers and health need no slot.
+- Extracted witnesses live in an LRU bounded by `--cache-bytes` (busy
+  mainnet blocks are up to ~12.5 MB) and are served without copying.
+- `--request-timeout-secs` is the socket read/write timeout. An extraction
+  in progress is not interrupted; the slot limit bounds how many run.
+- One log line per request on stderr:
+  `method=GET path=/witness/… status=200 bytes=19461 ms=12`.
+
+Run it as the node's uid (it needs read access to the databases and their
+`-shm`/`-wal`), niced, on loopback. systemd:
+
+```ini
+[Service]
+User=stacks
+ExecStart=/usr/local/bin/marf-witness serve --working-dir /data/mainnet --listen 127.0.0.1:20450
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+Restart=on-failure
+```
+
+Docker, sharing the host's loopback and the node's uid (the data mount is
+not `:ro`: SQLite maps the node's `-shm` to read a WAL database; the open
+flags keep it read-only):
+
+```bash
+docker run -d --name marf-witness --restart unless-stopped --network host \
+  --user "$(stat -c %u:%g /data/mainnet)" \
+  -v /data/mainnet:/data/mainnet \
+  -v "$PWD/target/linux-amd64/release/marf-witness:/usr/local/bin/marf-witness:ro" \
+  debian:bookworm-slim \
+  nice -n 10 marf-witness serve --working-dir /data/mainnet --listen 127.0.0.1:20450
+```
+
+A non-loopback `--listen` starts with a warning.
+
 ## Read-only guarantees
 
 | Database | How it is opened |
 |---|---|
 | Clarity MARF (`marf.sqlite`) | `TrieFileStorage::open_readonly`: `SQLITE_OPEN_READ_ONLY`, no table creation or migration (schema mismatch is an error), plus `PRAGMA query_only` |
 | MARF blobs (`marf.sqlite.blobs`) | `OpenOptions` read-only, no create |
-| Sortition DB | `SQLITE_OPEN_READ_ONLY` plus `PRAGMA query_only` |
+| Sortition DB, SPV headers DB | `SQLITE_OPEN_READ_ONLY` plus `PRAGMA query_only` |
 
 - A missing database is an error; nothing is created.
 - A squashed MARF is refused: its per-block tries below the squash height no
   longer exist. Use an unsquashed (archival) chainstate.
 - The tests hash the database and blob files before and after `extract` and
-  assert they are byte-identical.
+  `serve` and assert they are byte-identical.
 - SQLite itself needs `-shm`/`-wal` files to read a WAL-mode database. A running
   node already has them; on a stopped node's copy, SQLite creates them (the
   `-wal` stays empty). Nothing else is written next to the databases.
@@ -209,6 +290,14 @@ each fail as expected; carried and internal leaves are never flagged) and,
 offline, against mainnet block 1,230,200 (`tests/fixtures/mainnet/`): its
 witness plus two rows from the buggy collector, where ordinal 19 (`reserve`
 keyed by the previous value) is `key_not_written` and ordinal 22 passes.
+
+`serve` runs against a node-shaped working dir (local MARF, the mainnet
+sortition rows, an SPV headers DB of mainnet genesis plus chained headers):
+served witnesses equal `extract` output and recompute the MARF root, unknown
+blocks are 404, burn returns the mainnet preimage, header ranges come back
+in order as 80-byte wire headers (400 past 2016), held slots turn uncached
+witnesses into 503 while cache hits still serve, and every database file is
+byte-identical afterwards.
 
 `tests/fixtures/witness/` holds three witnesses with their expected roots for
 cross-language verifiers. They are regenerated, deterministically, with:

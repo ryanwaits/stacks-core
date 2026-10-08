@@ -17,113 +17,25 @@
 
 mod common;
 
-use std::path::Path;
-
 use common::*;
 use marf_witness::burn::{self, MAINNET_FIRST_BURN_HEIGHT};
-use rusqlite::{Connection, params};
 use serde_json::Value;
 use stacks_common::types::chainstate::{BurnchainHeaderHash, ConsensusHash, PoxId, SortitionId};
 use stacks_common::util::hash::{Hash160, Sha512Trunc256Sum, hex_bytes, to_hex};
 use stackslib::chainstate::burn::{ConsensusHashExtensions, OpsHash};
 
-/// The `snapshots` columns the preimage needs (a subset of the sortition DB schema).
-fn create_snapshots(path: &Path) -> Connection {
-    let conn = Connection::open(path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE snapshots(
-            block_height INTEGER NOT NULL,
-            burn_header_hash TEXT NOT NULL,
-            sortition_id TEXT UNIQUE NOT NULL,
-            parent_sortition_id TEXT NOT NULL,
-            consensus_hash TEXT UNIQUE NOT NULL,
-            ops_hash TEXT NOT NULL,
-            total_burn TEXT NOT NULL,
-            pox_valid INTEGER NOT NULL,
-            PRIMARY KEY(sortition_id));",
-    )
-    .unwrap();
-    conn
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert(
-    conn: &Connection,
-    height: u64,
-    bhh: &str,
-    sortition_id: &str,
-    parent: &str,
-    ch: &str,
-    ops: &str,
-    total_burn: &str,
-) {
-    conn.execute(
-        "INSERT INTO snapshots VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
-        params![
-            height as i64,
-            bhh,
-            sortition_id,
-            parent,
-            ch,
-            ops,
-            total_burn
-        ],
-    )
-    .unwrap();
-}
-
-fn fixture(name: &str) -> Value {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/burn")
-        .join(name);
-    serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
-}
-
-/// Mainnet sortition rows for burn block 970269 and its 19 previous-consensus-hash heights.
-fn mainnet_db(dir: &Path) -> std::path::PathBuf {
-    let raw = fixture("sortition-970269.json");
-    let path = dir.join("sortition.sqlite");
-    let conn = create_snapshots(&path);
-    let s = &raw["snapshot"];
-    let str_of = |v: &Value| v.as_str().unwrap().to_string();
-    insert(
-        &conn,
-        s["block_height"].as_u64().unwrap(),
-        &str_of(&s["burn_header_hash"]),
-        &str_of(&s["sortition_id"]),
-        &str_of(&s["parent_sortition_id"]),
-        &str_of(&s["consensus_hash"]),
-        &str_of(&s["ops_hash"]),
-        &str_of(&s["total_burn"]),
-    );
-    for prev in raw["prev"].as_array().unwrap() {
-        let h = prev["height"].as_u64().unwrap();
-        for row in prev["rows"].as_array().unwrap() {
-            insert(
-                &conn,
-                h,
-                &str_of(&row[1]),
-                &format!("fixture-sortition-{h}"),
-                &format!("fixture-parent-{h}"),
-                &str_of(&row[0]),
-                &"00".repeat(32),
-                "0",
-            );
-        }
-    }
-    path
-}
-
 #[test]
 fn mainnet_consensus_hash_reproduces_from_a_read_only_db() {
     let tmp = tempdir();
-    let path = mainnet_db(tmp.path());
-    let want = fixture("preimage-970269.json");
+    let path = mainnet_sortition_db(tmp.path());
+    let want = burn_fixture("preimage-970269.json");
     let ch = want["consensus_hash"].as_str().unwrap();
     let before = digests(tmp.path());
 
     let conn = burn::open_readonly(&path).unwrap();
-    let p = burn::burn_preimage(&conn, ch, MAINNET_FIRST_BURN_HEIGHT).unwrap();
+    let p = burn::burn_preimage(&conn, ch, MAINNET_FIRST_BURN_HEIGHT)
+        .unwrap()
+        .unwrap();
     drop(conn);
     assert_eq!(p.preimage, want["preimage"].as_str().unwrap());
     assert_eq!(p.burn_height, 970269);
@@ -162,7 +74,7 @@ fn mainnet_consensus_hash_reproduces_from_a_read_only_db() {
 #[test]
 fn wrong_first_burn_height_or_unknown_hash_fail_cleanly() {
     let tmp = tempdir();
-    let path = mainnet_db(tmp.path());
+    let path = mainnet_sortition_db(tmp.path());
     let ch = "e55512fc4410f497503e39d10ce1d1a3e894060c";
     let o = run(&[
         "burn",
@@ -259,7 +171,7 @@ fn forked_heights_resolve_through_parent_links() {
         } else {
             sort("main", h - 1)
         };
-        insert(
+        insert_snapshot(
             &conn,
             h,
             &to_hex(&h32("bhh", h)),
@@ -276,7 +188,7 @@ fn forked_heights_resolve_through_parent_links() {
         } else {
             sort("decoy", h - 1)
         };
-        insert(
+        insert_snapshot(
             &conn,
             h,
             &to_hex(&h32("bhh-decoy", h)),
@@ -293,7 +205,7 @@ fn forked_heights_resolve_through_parent_links() {
     let (bhh, ops) = (h32("bhh", 160), h32("ops", 160));
     let pox = PoxId::new("1111011111".chars().map(|c| c == '1').collect());
     let ch160 = expected_ch(&canonical, 160, first, &bhh, &ops, 4242, &pox);
-    insert(
+    insert_snapshot(
         &conn,
         160,
         &to_hex(&bhh),
@@ -322,7 +234,7 @@ fn forked_heights_resolve_through_parent_links() {
         5000,
         &PoxId::stubbed(),
     );
-    insert(
+    insert_snapshot(
         &conn,
         161,
         &to_hex(&bhh2),
@@ -336,7 +248,7 @@ fn forked_heights_resolve_through_parent_links() {
 
     let conn = burn::open_readonly(&path).unwrap();
     for (ch, height, bhh) in [(&ch160, 160, bhh), (&ch161, 161, bhh2)] {
-        let p = burn::burn_preimage(&conn, ch, first).unwrap();
+        let p = burn::burn_preimage(&conn, ch, first).unwrap().unwrap();
         assert_eq!(p.burn_height, height);
         assert_eq!(p.bitcoin_block_hash, to_hex(&bhh));
         assert_eq!(
