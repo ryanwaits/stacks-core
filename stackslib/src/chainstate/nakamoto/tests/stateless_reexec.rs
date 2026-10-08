@@ -32,7 +32,7 @@ use crate::chainstate::stacks::events::{StacksTransactionReceipt, TransactionOri
 use crate::chainstate::stacks::index::marf::MarfConnection;
 use crate::chainstate::stacks::index::MARFValue;
 use crate::chainstate::stacks::StacksTransaction;
-use crate::clarity_vm::read_witness::{ReadWitness, StoreQuery};
+use crate::clarity_vm::read_witness::{EnvQuery, ReadWitness, StoreQuery};
 use crate::clarity_vm::state_writes::StateWrite;
 use crate::clarity_vm::stateless::{
     execute_statelessly, BlockLevelWrites, StatelessBlock, StatelessError,
@@ -97,14 +97,14 @@ const RELAY_SRC: &str = "
 /// with nested reads, prints, moves FT and STX, calls across contracts, and
 /// reads `at-block` and block info two blocks back, where `counter` was 5
 /// (it is 15 at its parent).
-struct HistoryFixture {
-    ledger: QualifiedContractIdentifier,
-    snapshot: Txid,
-    note_time: Txid,
+pub(super) struct HistoryFixture {
+    pub(super) ledger: QualifiedContractIdentifier,
+    pub(super) snapshot: Txid,
+    pub(super) note_time: Txid,
 }
 
 impl HistoryFixture {
-    fn new() -> (Self, Vec<NakamotoBootTenure>, Vec<(PrincipalData, u64)>) {
+    pub(super) fn new() -> (Self, Vec<NakamotoBootTenure>, Vec<(PrincipalData, u64)>) {
         let privk = StacksPrivateKey::from_seed(b"stateless-reexec");
         let sender = to_addr(&privk);
         let recipient: PrincipalData =
@@ -185,12 +185,12 @@ impl HistoryFixture {
         (fixture, tenures, vec![(sender.into(), 10_000_000)])
     }
 
-    fn var_key(&self, var: &str) -> String {
+    pub(super) fn var_key(&self, var: &str) -> String {
         format!("vm::{}::1::{var}", self.ledger)
     }
 }
 
-fn boot<'a>(
+pub(super) fn boot<'a>(
     test_name: &str,
     observer: &'a TestEventObserver,
     tenures: Vec<NakamotoBootTenure>,
@@ -206,7 +206,7 @@ fn boot<'a>(
     peer
 }
 
-fn block_with_tx(observer: &TestEventObserver, txid: &Txid) -> TestEventObserverBlock {
+pub(super) fn block_with_tx(observer: &TestEventObserver, txid: &Txid) -> TestEventObserverBlock {
     observer
         .get_blocks()
         .into_iter()
@@ -221,16 +221,16 @@ fn block_with_tx(observer: &TestEventObserver, txid: &Txid) -> TestEventObserver
 
 /// What a client gets for a block: its transactions, its read witness, and
 /// its block-level writes.
-struct LiveBlock {
-    txs: Vec<StacksTransaction>,
-    receipts: Vec<StacksTransactionReceipt>,
-    witness: ReadWitness,
-    writes: Vec<StateWrite>,
-    block_level: BlockLevelWrites,
+pub(super) struct LiveBlock {
+    pub(super) txs: Vec<StacksTransaction>,
+    pub(super) receipts: Vec<StacksTransactionReceipt>,
+    pub(super) witness: ReadWitness,
+    pub(super) writes: Vec<StateWrite>,
+    pub(super) block_level: BlockLevelWrites,
 }
 
 impl LiveBlock {
-    fn of(block: &TestEventObserverBlock) -> Self {
+    pub(super) fn of(block: &TestEventObserverBlock) -> Self {
         let receipts: Vec<StacksTransactionReceipt> = block
             .receipts
             .iter()
@@ -255,7 +255,7 @@ impl LiveBlock {
         }
     }
 
-    fn reexecute(&self, witness: &ReadWitness) -> Result<StatelessBlock, StatelessError> {
+    pub(super) fn reexecute(&self, witness: &ReadWitness) -> Result<StatelessBlock, StatelessError> {
         execute_statelessly(
             witness,
             &self.block_level,
@@ -265,7 +265,7 @@ impl LiveBlock {
         )
     }
 
-    fn receipt(&self, txid: &Txid) -> &StacksTransactionReceipt {
+    pub(super) fn receipt(&self, txid: &Txid) -> &StacksTransactionReceipt {
         self.receipts
             .iter()
             .find(|r| &r.transaction.txid() == txid)
@@ -273,7 +273,7 @@ impl LiveBlock {
     }
 }
 
-fn receipt_of<'r>(
+pub(super) fn receipt_of<'r>(
     receipts: &'r [StacksTransactionReceipt],
     txid: &Txid,
 ) -> &'r StacksTransactionReceipt {
@@ -291,7 +291,7 @@ fn last_values(writes: &[StateWrite]) -> HashMap<String, String> {
         .collect()
 }
 
-fn tamper_store(witness: &mut ReadWitness, query: &StoreQuery, value: Option<String>) {
+pub(super) fn tamper_store(witness: &mut ReadWitness, query: &StoreQuery, value: Option<String>) {
     let entry = witness
         .store
         .iter_mut()
@@ -300,7 +300,7 @@ fn tamper_store(witness: &mut ReadWitness, query: &StoreQuery, value: Option<Str
     entry.1 = value;
 }
 
-fn uint_hex(n: u128) -> String {
+pub(super) fn uint_hex(n: u128) -> String {
     Value::UInt(n).serialize_to_hex().unwrap()
 }
 
@@ -539,7 +539,7 @@ fn dropped_read_fails_as_witness_incomplete() {
     let mut witness = live.witness.clone();
     witness
         .env
-        .retain(|read| !read.query.starts_with("stacks_block_time_for_block"));
+        .retain(|read| !matches!(read.query, EnvQuery::StacksBlockTime { .. }));
     match live.reexecute(&witness) {
         Err(StatelessError::WitnessIncomplete(missing)) => {
             assert!(missing
@@ -578,7 +578,7 @@ fn tampered_print_only_inputs_change_events_but_not_writes() {
     for read in witness
         .env
         .iter_mut()
-        .filter(|read| read.query.starts_with("stacks_block_time_for_block"))
+        .filter(|read| matches!(read.query, EnvQuery::StacksBlockTime { .. }))
     {
         read.set_answer(Some(1u64));
     }

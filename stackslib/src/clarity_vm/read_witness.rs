@@ -116,11 +116,103 @@ fn at_len(at: &Option<StacksBlockId>) -> usize {
     }
 }
 
+/// One `HeadersDB` / `BurnStateDB` question: the trait method and its
+/// arguments. `Display` renders it as `method(args)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum EnvQuery {
+    StacksBlockHeaderHash { id: StacksBlockId, epoch: StacksEpochId },
+    BurnHeaderHashForBlock { id: StacksBlockId },
+    ConsensusHashForBlock { id: StacksBlockId, epoch: StacksEpochId },
+    VrfSeed { id: StacksBlockId, tip: StacksBlockId, epoch: StacksEpochId },
+    StacksBlockTime { id: StacksBlockId },
+    BurnBlockTime { id: StacksBlockId, epoch: Option<StacksEpochId> },
+    BurnBlockHeightForBlock { id: StacksBlockId },
+    MinerAddress { id: StacksBlockId, tip: StacksBlockId, epoch: StacksEpochId },
+    TokensSpent { id: StacksBlockId, tip: StacksBlockId, epoch: StacksEpochId },
+    TokensSpentWinning { id: StacksBlockId, tip: StacksBlockId, epoch: StacksEpochId },
+    TokensEarned { id: StacksBlockId, tip: StacksBlockId, epoch: StacksEpochId },
+    StacksHeightForTenureHeight { tip: StacksBlockId, tenure_height: u32 },
+    TipBurnBlockHeight,
+    TipSortitionId,
+    V1UnlockHeight,
+    V2UnlockHeight,
+    V3UnlockHeight,
+    Pox3ActivationHeight,
+    Pox4ActivationHeight,
+    Pox5ActivationHeight,
+    BurnBlockHeight { sortition: SortitionId },
+    BurnStartHeight,
+    PoxPrepareLength,
+    PoxRewardCycleLength,
+    PoxRejectionFraction,
+    BurnHeaderHash { height: u32, sortition: SortitionId },
+    SortitionIdFromConsensusHash { consensus_hash: ConsensusHash },
+    StacksEpoch { height: u32 },
+    StacksEpochById { epoch: StacksEpochId },
+    PoxPayoutAddrs { height: u32, sortition: SortitionId },
+}
+
+impl fmt::Display for EnvQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use EnvQuery::*;
+        match self {
+            StacksBlockHeaderHash { id, epoch } => {
+                write!(f, "stacks_block_header_hash_for_block({id},{epoch:?})")
+            }
+            BurnHeaderHashForBlock { id } => write!(f, "burn_header_hash_for_block({id})"),
+            ConsensusHashForBlock { id, epoch } => {
+                write!(f, "consensus_hash_for_block({id},{epoch:?})")
+            }
+            VrfSeed { id, tip, epoch } => write!(f, "vrf_seed_for_block({id},{tip},{epoch:?})"),
+            StacksBlockTime { id } => write!(f, "stacks_block_time_for_block({id})"),
+            BurnBlockTime { id, epoch } => write!(f, "burn_block_time_for_block({id},{epoch:?})"),
+            BurnBlockHeightForBlock { id } => write!(f, "burn_block_height_for_block({id})"),
+            MinerAddress { id, tip, epoch } => write!(f, "miner_address({id},{tip},{epoch:?})"),
+            TokensSpent { id, tip, epoch } => {
+                write!(f, "burnchain_tokens_spent_for_block({id},{tip},{epoch:?})")
+            }
+            TokensSpentWinning { id, tip, epoch } => write!(
+                f,
+                "burnchain_tokens_spent_for_winning_block({id},{tip},{epoch:?})"
+            ),
+            TokensEarned { id, tip, epoch } => {
+                write!(f, "tokens_earned_for_block({id},{tip},{epoch:?})")
+            }
+            StacksHeightForTenureHeight { tip, tenure_height } => {
+                write!(f, "stacks_height_for_tenure_height({tip},{tenure_height})")
+            }
+            TipBurnBlockHeight => write!(f, "tip_burn_block_height()"),
+            TipSortitionId => write!(f, "tip_sortition_id()"),
+            V1UnlockHeight => write!(f, "v1_unlock_height()"),
+            V2UnlockHeight => write!(f, "v2_unlock_height()"),
+            V3UnlockHeight => write!(f, "v3_unlock_height()"),
+            Pox3ActivationHeight => write!(f, "pox_3_activation_height()"),
+            Pox4ActivationHeight => write!(f, "pox_4_activation_height()"),
+            Pox5ActivationHeight => write!(f, "pox_5_activation_height()"),
+            BurnBlockHeight { sortition } => write!(f, "burn_block_height({sortition})"),
+            BurnStartHeight => write!(f, "burn_start_height()"),
+            PoxPrepareLength => write!(f, "pox_prepare_length()"),
+            PoxRewardCycleLength => write!(f, "pox_reward_cycle_length()"),
+            PoxRejectionFraction => write!(f, "pox_rejection_fraction()"),
+            BurnHeaderHash { height, sortition } => {
+                write!(f, "burn_header_hash({height},{sortition})")
+            }
+            SortitionIdFromConsensusHash { consensus_hash } => {
+                write!(f, "sortition_id_from_consensus_hash({consensus_hash})")
+            }
+            StacksEpoch { height } => write!(f, "stacks_epoch({height})"),
+            StacksEpochById { epoch } => write!(f, "stacks_epoch_by_epoch_id({epoch:?})"),
+            PoxPayoutAddrs { height, sortition } => {
+                write!(f, "pox_payout_addrs({height},{sortition})")
+            }
+        }
+    }
+}
+
 /// One `HeadersDB` / `BurnStateDB` lookup and its answer.
 #[derive(Clone)]
 pub struct EnvRead {
-    /// Method and arguments, e.g. `stacks_block_time_for_block(<id>)`.
-    pub query: String,
+    pub query: EnvQuery,
     /// The typed answer, as the trait method returned it.
     pub answer: Arc<dyn Any + Send + Sync>,
     /// `Debug` rendering of the answer, for inspection and sizing.
@@ -142,7 +234,7 @@ impl PartialEq for EnvRead {
 }
 
 impl EnvRead {
-    fn new<R: fmt::Debug + Send + Sync + 'static>(query: String, answer: R) -> Self {
+    fn new<R: fmt::Debug + Send + Sync + 'static>(query: EnvQuery, answer: R) -> Self {
         EnvRead {
             query,
             shown: format!("{answer:?}"),
@@ -152,7 +244,7 @@ impl EnvRead {
 
     /// Replace the answer (tests: tamper with an environment value).
     pub fn set_answer<R: fmt::Debug + Send + Sync + 'static>(&mut self, answer: R) {
-        *self = EnvRead::new(std::mem::take(&mut self.query), answer);
+        *self = EnvRead::new(self.query.clone(), answer);
     }
 }
 
@@ -211,7 +303,7 @@ impl ReadWitness {
         }
         for read in self.env.iter() {
             size.env_lookups += 1;
-            size.env_bytes += read.query.len() + read.shown.len();
+            size.env_bytes += read.query.to_string().len() + read.shown.len();
         }
         size
     }
@@ -522,12 +614,12 @@ enum EnvSource<'a> {
         epoch: StacksEpoch,
     },
     /// Answer only from a witness.
-    Witness(HashMap<String, Arc<dyn Any + Send + Sync>>),
+    Witness(HashMap<EnvQuery, Arc<dyn Any + Send + Sync>>),
 }
 
 #[derive(Default)]
 struct EnvLog {
-    seen: HashSet<String>,
+    seen: HashSet<EnvQuery>,
     reads: Vec<EnvRead>,
     missing: Vec<String>,
 }
@@ -586,7 +678,7 @@ impl<'a> EnvTap<'a> {
 
     fn answer<R>(
         &self,
-        query: String,
+        query: EnvQuery,
         if_missing: R,
         live: impl FnOnce(&dyn HeadersDB, &dyn BurnStateDB) -> R,
     ) -> R
@@ -606,7 +698,7 @@ impl<'a> EnvTap<'a> {
                 match answers.get(&query).and_then(|a| a.downcast_ref::<R>()) {
                     Some(answer) => answer.clone(),
                     None => {
-                        self.log.borrow_mut().missing.push(query);
+                        self.log.borrow_mut().missing.push(query.to_string());
                         if_missing
                     }
                 }
@@ -622,7 +714,7 @@ impl HeadersDB for EnvTap<'_> {
         epoch: &StacksEpochId,
     ) -> Option<BlockHeaderHash> {
         self.answer(
-            format!("stacks_block_header_hash_for_block({id_bhh},{epoch:?})"),
+            EnvQuery::StacksBlockHeaderHash { id: id_bhh.clone(), epoch: *epoch },
             None,
             |h, _| h.get_stacks_block_header_hash_for_block(id_bhh, epoch),
         )
@@ -633,7 +725,7 @@ impl HeadersDB for EnvTap<'_> {
         id_bhh: &StacksBlockId,
     ) -> Option<BurnchainHeaderHash> {
         self.answer(
-            format!("burn_header_hash_for_block({id_bhh})"),
+            EnvQuery::BurnHeaderHashForBlock { id: id_bhh.clone() },
             None,
             |h, _| h.get_burn_header_hash_for_block(id_bhh),
         )
@@ -645,7 +737,7 @@ impl HeadersDB for EnvTap<'_> {
         epoch: &StacksEpochId,
     ) -> Option<ConsensusHash> {
         self.answer(
-            format!("consensus_hash_for_block({id_bhh},{epoch:?})"),
+            EnvQuery::ConsensusHashForBlock { id: id_bhh.clone(), epoch: *epoch },
             None,
             |h, _| h.get_consensus_hash_for_block(id_bhh, epoch),
         )
@@ -658,7 +750,7 @@ impl HeadersDB for EnvTap<'_> {
         epoch: &StacksEpochId,
     ) -> Option<VRFSeed> {
         self.answer(
-            format!("vrf_seed_for_block({id_bhh},{tip},{epoch:?})"),
+            EnvQuery::VrfSeed { id: id_bhh.clone(), tip: tip.clone(), epoch: *epoch },
             None,
             |h, _| h.get_vrf_seed_for_block(id_bhh, tip, epoch),
         )
@@ -666,7 +758,7 @@ impl HeadersDB for EnvTap<'_> {
 
     fn get_stacks_block_time_for_block(&self, id_bhh: &StacksBlockId) -> Option<u64> {
         self.answer(
-            format!("stacks_block_time_for_block({id_bhh})"),
+            EnvQuery::StacksBlockTime { id: id_bhh.clone() },
             None,
             |h, _| h.get_stacks_block_time_for_block(id_bhh),
         )
@@ -678,7 +770,7 @@ impl HeadersDB for EnvTap<'_> {
         epoch: Option<&StacksEpochId>,
     ) -> Option<u64> {
         self.answer(
-            format!("burn_block_time_for_block({id_bhh},{epoch:?})"),
+            EnvQuery::BurnBlockTime { id: id_bhh.clone(), epoch: epoch.copied() },
             None,
             |h, _| h.get_burn_block_time_for_block(id_bhh, epoch),
         )
@@ -686,7 +778,7 @@ impl HeadersDB for EnvTap<'_> {
 
     fn get_burn_block_height_for_block(&self, id_bhh: &StacksBlockId) -> Option<u32> {
         self.answer(
-            format!("burn_block_height_for_block({id_bhh})"),
+            EnvQuery::BurnBlockHeightForBlock { id: id_bhh.clone() },
             None,
             |h, _| h.get_burn_block_height_for_block(id_bhh),
         )
@@ -699,7 +791,7 @@ impl HeadersDB for EnvTap<'_> {
         epoch: &StacksEpochId,
     ) -> Option<StacksAddress> {
         self.answer(
-            format!("miner_address({id_bhh},{tip},{epoch:?})"),
+            EnvQuery::MinerAddress { id: id_bhh.clone(), tip: tip.clone(), epoch: *epoch },
             None,
             |h, _| h.get_miner_address(id_bhh, tip, epoch),
         )
@@ -712,7 +804,7 @@ impl HeadersDB for EnvTap<'_> {
         epoch: &StacksEpochId,
     ) -> Option<u128> {
         self.answer(
-            format!("burnchain_tokens_spent_for_block({id_bhh},{tip},{epoch:?})"),
+            EnvQuery::TokensSpent { id: id_bhh.clone(), tip: tip.clone(), epoch: *epoch },
             None,
             |h, _| h.get_burnchain_tokens_spent_for_block(id_bhh, tip, epoch),
         )
@@ -725,7 +817,7 @@ impl HeadersDB for EnvTap<'_> {
         epoch: &StacksEpochId,
     ) -> Option<u128> {
         self.answer(
-            format!("burnchain_tokens_spent_for_winning_block({id_bhh},{tip},{epoch:?})"),
+            EnvQuery::TokensSpentWinning { id: id_bhh.clone(), tip: tip.clone(), epoch: *epoch },
             None,
             |h, _| h.get_burnchain_tokens_spent_for_winning_block(id_bhh, tip, epoch),
         )
@@ -738,7 +830,7 @@ impl HeadersDB for EnvTap<'_> {
         epoch: &StacksEpochId,
     ) -> Option<u128> {
         self.answer(
-            format!("tokens_earned_for_block({id_bhh},{tip},{epoch:?})"),
+            EnvQuery::TokensEarned { id: id_bhh.clone(), tip: tip.clone(), epoch: *epoch },
             None,
             |h, _| h.get_tokens_earned_for_block(id_bhh, tip, epoch),
         )
@@ -750,7 +842,7 @@ impl HeadersDB for EnvTap<'_> {
         tenure_height: u32,
     ) -> Option<u32> {
         self.answer(
-            format!("stacks_height_for_tenure_height({tip},{tenure_height})"),
+            EnvQuery::StacksHeightForTenureHeight { tip: tip.clone(), tenure_height },
             None,
             |h, _| h.get_stacks_height_for_tenure_height(tip, tenure_height),
         )
@@ -759,81 +851,81 @@ impl HeadersDB for EnvTap<'_> {
 
 impl BurnStateDB for EnvTap<'_> {
     fn get_tip_burn_block_height(&self) -> Option<u32> {
-        self.answer("tip_burn_block_height()".into(), None, |_, b| {
+        self.answer(EnvQuery::TipBurnBlockHeight, None, |_, b| {
             b.get_tip_burn_block_height()
         })
     }
 
     fn get_tip_sortition_id(&self) -> Option<SortitionId> {
-        self.answer("tip_sortition_id()".into(), None, |_, b| {
+        self.answer(EnvQuery::TipSortitionId, None, |_, b| {
             b.get_tip_sortition_id()
         })
     }
 
     fn get_v1_unlock_height(&self) -> u32 {
-        self.answer("v1_unlock_height()".into(), 0, |_, b| {
+        self.answer(EnvQuery::V1UnlockHeight, 0, |_, b| {
             b.get_v1_unlock_height()
         })
     }
 
     fn get_v2_unlock_height(&self) -> u32 {
-        self.answer("v2_unlock_height()".into(), 0, |_, b| {
+        self.answer(EnvQuery::V2UnlockHeight, 0, |_, b| {
             b.get_v2_unlock_height()
         })
     }
 
     fn get_v3_unlock_height(&self) -> u32 {
-        self.answer("v3_unlock_height()".into(), 0, |_, b| {
+        self.answer(EnvQuery::V3UnlockHeight, 0, |_, b| {
             b.get_v3_unlock_height()
         })
     }
 
     fn get_pox_3_activation_height(&self) -> u32 {
-        self.answer("pox_3_activation_height()".into(), 0, |_, b| {
+        self.answer(EnvQuery::Pox3ActivationHeight, 0, |_, b| {
             b.get_pox_3_activation_height()
         })
     }
 
     fn get_pox_4_activation_height(&self) -> u32 {
-        self.answer("pox_4_activation_height()".into(), 0, |_, b| {
+        self.answer(EnvQuery::Pox4ActivationHeight, 0, |_, b| {
             b.get_pox_4_activation_height()
         })
     }
 
     fn get_pox_5_activation_height(&self) -> u32 {
-        self.answer("pox_5_activation_height()".into(), 0, |_, b| {
+        self.answer(EnvQuery::Pox5ActivationHeight, 0, |_, b| {
             b.get_pox_5_activation_height()
         })
     }
 
     fn get_burn_block_height(&self, sortition_id: &SortitionId) -> Option<u32> {
         self.answer(
-            format!("burn_block_height({sortition_id})"),
+            EnvQuery::BurnBlockHeight { sortition: sortition_id.clone() },
             None,
             |_, b| b.get_burn_block_height(sortition_id),
         )
     }
 
     fn get_burn_start_height(&self) -> u32 {
-        self.answer("burn_start_height()".into(), 0, |_, b| {
+        self.answer(EnvQuery::BurnStartHeight, 0, |_, b| {
             b.get_burn_start_height()
         })
     }
 
     fn get_pox_prepare_length(&self) -> u32 {
-        self.answer("pox_prepare_length()".into(), 0, |_, b| {
+        self.answer(EnvQuery::PoxPrepareLength, 0, |_, b| {
             b.get_pox_prepare_length()
         })
     }
 
     fn get_pox_reward_cycle_length(&self) -> u32 {
-        self.answer("pox_reward_cycle_length()".into(), 0, |_, b| {
+        self.answer(EnvQuery::PoxRewardCycleLength, 0, |_, b| {
             b.get_pox_reward_cycle_length()
         })
     }
 
     fn get_pox_rejection_fraction(&self) -> u64 {
-        self.answer("pox_rejection_fraction()".into(), 0, |_, b| {
+        self.answer(EnvQuery::PoxRejectionFraction, 0, |_, b| {
             b.get_pox_rejection_fraction()
         })
     }
@@ -844,7 +936,7 @@ impl BurnStateDB for EnvTap<'_> {
         sortition_id: &SortitionId,
     ) -> Option<BurnchainHeaderHash> {
         self.answer(
-            format!("burn_header_hash({height},{sortition_id})"),
+            EnvQuery::BurnHeaderHash { height, sortition: sortition_id.clone() },
             None,
             |_, b| b.get_burn_header_hash(height, sortition_id),
         )
@@ -855,21 +947,21 @@ impl BurnStateDB for EnvTap<'_> {
         consensus_hash: &ConsensusHash,
     ) -> Option<SortitionId> {
         self.answer(
-            format!("sortition_id_from_consensus_hash({consensus_hash})"),
+            EnvQuery::SortitionIdFromConsensusHash { consensus_hash: consensus_hash.clone() },
             None,
             |_, b| b.get_sortition_id_from_consensus_hash(consensus_hash),
         )
     }
 
     fn get_stacks_epoch(&self, height: u32) -> Option<StacksEpoch> {
-        self.answer(format!("stacks_epoch({height})"), None, |_, b| {
+        self.answer(EnvQuery::StacksEpoch { height }, None, |_, b| {
             b.get_stacks_epoch(height)
         })
     }
 
     fn get_stacks_epoch_by_epoch_id(&self, epoch_id: &StacksEpochId) -> Option<StacksEpoch> {
         self.answer(
-            format!("stacks_epoch_by_epoch_id({epoch_id:?})"),
+            EnvQuery::StacksEpochById { epoch: *epoch_id },
             None,
             |_, b| b.get_stacks_epoch_by_epoch_id(epoch_id),
         )
@@ -881,7 +973,7 @@ impl BurnStateDB for EnvTap<'_> {
         sortition_id: &SortitionId,
     ) -> Option<(Vec<TupleData>, u128)> {
         self.answer(
-            format!("pox_payout_addrs({height},{sortition_id})"),
+            EnvQuery::PoxPayoutAddrs { height, sortition: sortition_id.clone() },
             None,
             |_, b| b.get_pox_payout_addrs(height, sortition_id),
         )
