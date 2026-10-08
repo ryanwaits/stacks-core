@@ -2,7 +2,9 @@
 
 Phase 1 (below, through "Why replay diverged"): re-execute a block from a
 read witness. Phase 2a (after it): make every witness entry provable and
-verify it. Phase 2b: a mainnet block.
+verify it. Phase 2b prep (last): serve the proof-carrying witness from
+`/v3/blocks/replay`, a wire format, and a client that verifies and
+re-executes a mainnet block.
 
 # Phase 1: re-execute from a read witness
 
@@ -221,7 +223,7 @@ The verifier:
 
 **Limit.** Any other read during re-derivation fails as `WitnessIncomplete`. A contract whose initialization reads chain state (a top-level `contract-call?`, balances, block info) needs the deploy block's own witness. That recursion is phase 2b or later.
 
-**Boot table.** `pox`, `lockup`, `costs`, `cost-voting`, `bns`, `genesis`, `costs-2`, `pox-2`, `costs-3`, `pox-3`, `pox-4`, `signers`, `signers-voting` and `costs-4`, each with the Clarity version its transition pins. Not covered yet: `signers-stackerdb` (generated), `sip-031` (generated body), `pox-5`. In the fixtures, `lockup` and `costs-3` are read every block. Both re-derive.
+**Boot table.** `pox`, `lockup`, `costs`, `cost-voting`, `bns`, `genesis`, `costs-2`, `pox-2`, `costs-3`, `pox-3`, `pox-4`, `signers`, `signers-{0,1}-{0..12}` (the signer StackerDBs), `signers-voting`, `sip-031` (generated body), `costs-4` and `pox-5` (generated body), each with the Clarity version its transition pins. In the fixtures, `lockup` and `costs-3` are read every block. Both re-derive. Mainnet sources: see phase 2b.
 
 **Cost.** Re-derivation is about 90% of verify time (below). Cache the results by source hash; boot contracts need it once per network.
 
@@ -300,31 +302,163 @@ Other environment checks:
 5. **Block-level writes** (setup and teardown, coinbase-attached events) are still inputs. Not covered.
 6. **Epoch 2.x and microblocks**: no tests.
 7. **Signer signatures and Bitcoin PoW** are assumed checked by whoever builds `HeaderChain` / `BitcoinChain`.
-8. **No wire format.** Evidence types are in-memory Rust. `TrieMerkleProof` and transactions have consensus codecs; `TrieAbsenceProof`, `ContractEvidence` and the typed env answers do not.
+8. ~~No wire format.~~ Done in phase 2b (`witness_wire.rs`).
 
-# Phase 2b: a mainnet block on a scratch node
+# Phase 2b prep: serve, ship and check a witness
 
-What it needs, in order:
+```
+client                                       node (this branch)
+GET /v3/blocks/<id> ───────────────────────► staging block bytes
+GET /v3/blocks/replay/<id>?read_witness=1 ─► replay (same collectors as live)
+      &vm_events=1, Authorization: <token>     └► serve_witness: MARF proofs, contract
+                                                  evidence, burn preimages, headers,
+                                                  Bitcoin headers, write proofs
+◄──────────── RPCReplayedBlock + read_witness (WitnessEnvelope v1, JSON)
+hash headers → HeaderChain (+ pinned genesis root)
+fill metadata by re-derivation → check every entry → re-execute from the witness
+→ compare tx writes, prove final writes at the block root, compare events / vm_events
+```
 
-1. **Build a scratch node from this branch** (it carries `f0f9d6b`, or replay witnesses are wrong for `at-block`). Fix replay's burn view to the tenure-change burn view, not `index_handle_at_block(parent)`.
-2. **Add a replay flag returning the proof-carrying witness.** For example `/v3/blocks/replay/{id}?read_witness=1&proofs=1`. The node already holds everything the prover needs:
-   - the MARF, for `prove_store_reads` and the contract commitment and epoch proofs;
-   - Nakamoto staging blocks and the 2.x block store, for `find_deploy` (deploy txs, tenure changes, coinbases) and their Merkle paths;
-   - the sortition DB, for consensus-hash preimages (reuse marf-witness `burn`).
-3. **Wire format v1**, one JSON envelope:
-   - `witness`: `{open_tip, open_height, epoch, store: [{kind, at, key | path | height | target | contract+key, value_hex | null}], env: [{query: EnvQuery, answer}]}`. `EnvQuery` is now typed, so serde derives work. Answers need serde for `StacksEpoch`, `TupleData` and `VRFSeed`;
-   - `store_proofs`: per entry `{marf: inclusion | absence, hex} | {ancestor: [hex, hex]} | open_block | rederived`. Inclusion proofs use the existing consensus codec; add one for `TrieAbsenceProof`. Then a multiproof (dedupe nodes, drop rebuildable hashes, intern block ids) once the per-entry format works;
-   - `contracts`: `{contract, block, source: {tx_hex, merkle_path} | boot, commitment, commitment_proof, epoch_key, epoch_key_proof}`;
-   - `burn`: preimages as marf-witness `burn` serves them, plus pox_id length so the client can split them;
-   - `burn_view`, `coinbases`: `{block, tx_hex, merkle_path}`.
-   - Leave out metadata values: the client re-derives them.
-4. **Client inputs**:
-   - signer-verified header chain from genesis to the block (state roots, tx roots, timestamps);
-   - Bitcoin headers (the marf-witness sidecar's `/headers`);
-   - mainnet network constants: epochs, PoX constants, genesis MARF root;
-   - mainnet boot sources (add `pox-5`, `sip-031`, `signers-stackerdb`);
-   - a re-derivation cache keyed by source hash.
-5. **First target: the `sbtc-yield-rewards-v3` block.**
-   - Replay with proofs, verify offline, re-execute.
-   - Compare the writes with marf-witness's state diff and the prints with live `/new_block`.
-   - Record which class (c)/(d) lookups mainnet blocks hit, and how many tries a mainnet read crosses (proof size scales with it).
+| Piece | Where |
+|---|---|
+| Replay flag, burn-view fix, `block_vm_events` / `receipt_events` | `stackslib/src/net/api/blockreplay.rs` |
+| Node side: gather proofs and headers (`serve_witness`) | `stackslib/src/clarity_vm/witness_serve.rs` |
+| Wire format v1 (`ServedWitness` <-> `WitnessEnvelope`) | `stackslib/src/clarity_vm/witness_wire.rs` |
+| Client checks (`check_replayed_block`, `ClientParams::mainnet`) | `stackslib/src/clarity_vm/witness_client.rs` |
+| CLI | `contrib/reexec-verify` |
+| `TrieAbsenceProof` consensus codec | `stackslib/src/chainstate/stacks/index/absence.rs` |
+| Tests | `net/api/tests/blockreplay_witness.rs` (HTTP), `proven_witness.rs` (round trip), `stateless_reexec.rs` (burn view), `witness_proof.rs` (mainnet boot sources) |
+
+## Endpoint
+
+`GET /v3/blocks/replay/<id>?read_witness=1` (auth: `connection_options.auth_token` as `Authorization`). Same collector path as live processing (`ClarityInstance::set_collect_read_witness`), switched on only for that replay. Zero cost when off: the store wrapper and env tap are only installed when the flag is set.
+
+- `read_witness=1` implies `state_writes=1`: the client needs the block-level writes to re-execute, and the node proves each written key's final value.
+- Adds `read_witness` (the envelope) to the usual response. `transactions[].events`, `vm_events` (with `vm_events=1`) and `state_writes` are what the client compares against.
+- Proving can fail (e.g. a missing deploy block): the replay then answers 500 with the reason.
+- **Burn view fix.** Replay used `index_handle_at_block(parent)` (the parent's burn view). It now uses `get_block_burn_view` (the block's own tenure change, else the parent's), as `process_next_nakamoto_block` does. For a tenure-start block the old code printed `burn-block-height` one lower (`u42` vs `u43` in the test), and the client caught it from the proofs alone: `tip_burn_block_height() answered 52, proven 53`.
+
+## Wire format v1 (`WitnessEnvelope`)
+
+JSON. Binary as lowercase hex, no `0x`. Ids and hashes: their bytes. Proofs, transactions, headers, addresses: consensus encoding. Store values: the side-store string as is.
+
+| Field | Content | How the client checks it |
+|---|---|---|
+| `version` | `1` | Rejects anything else |
+| `network` | `{mainnet, chain_id}` | Must equal the client's pinned network |
+| `witness.open_tip`, `open_height` | Miner placeholder id, parent height + 1 | Exact |
+| `witness.epoch` | `{epoch_id, start_height, end_height, block_limit, network_epoch}` | Equals the pinned epoch at the parent's burn height |
+| `witness.store[]` | `{query: {kind: data\|path\|block_at_height\|current_height\|at_block\|metadata, ...}, value, proof}` | Per proof kind, below |
+| `witness.env[]` | `{query: {method: <snake_case EnvQuery>, ...args}, answer}` | Per class, below. Answer: hex, number, decimal string (`u128`), `null`, epoch object, or `{addrs: [clarity hex], payout}` |
+| `contracts[]` | `{contract, block, source: "boot" \| {tx: {block, tx, merkle_path}}, commitment, commitment_proof, epoch_key, epoch_key_proof, ancestry: [h2h, h2b] \| null}` | Deploy block is an ancestor of the parent (MARF `__MARF_BLOCK_HASH_TO_HEIGHT` / `HEIGHT_TO_HASH` at the parent root; replaces 2a's header walk, which needed every header back to the deploy); commitment and epoch proven at the deploy block's root; source hashes to the commitment; then re-derived |
+| `burn[]` | `{burn_header_hash, ops_hash, total_burn, pox_id: "1101…", prev_consensus_hashes}` | Hashes to the consensus hash it stands for |
+| `burn_view`, `coinbases[]` | `{block, tx, merkle_path: [[left\|right, hash]]}` | Merkle path to the named block's tx root |
+| `headers[]` | `{consensus_hash, nakamoto: hex}` or `{consensus_hash, epoch2: hex}` | Hashed to a block id; only ids reached that way exist for the client. Signer signatures stripped (the block hash does not commit to them) |
+| `bitcoin[]` | `{height, hash, parent, time}` | Must link by parent hash; heights trusted (SPV composes upstream) |
+| `writes[]` | `{key, proof}` | Inclusion of the re-executed final value at the block's own root |
+| `unproven_contracts[]` | `[contract, reason]` | Diagnostic only |
+
+Store proof kinds: `{"marf": {"present"\|"absent": hex}}` (inclusion or absence at the parent, or at the `at-block` target), `{"ancestor": [p, p]}`, `"open_block"` (deterministic), `"rederived"` (value left out, client fills it from re-derivation), `"served"` (value shipped as is, rejected: the contract cannot be re-derived from its deploy alone).
+
+Headers the node ships: the parent, `at-block` targets, every block an env lookup names, deploy blocks, the tenure-start blocks of coinbases, every block walked back to the burn-view tenure change, and every trie a MARF proof crosses (on-path back-pointer targets, `MarfProof::crossed_blocks`). Genesis is never shipped: its header has a zero root, so the client pins it (`MAINNET_2_0_GENESIS_ROOT_HASH`, the root every mainnet node asserts at boot, `9653c92b…52af`; recomputed from `stx-genesis` in 4.6 s to confirm).
+
+## Client (`check_replayed_block`, `contrib/reexec-verify`)
+
+```
+reexec-verify <block id> --node http://127.0.0.1:30443 --auth $TOKEN
+reexec-verify <block id> --chainstate /copy/of/working_dir/mainnet 
+```
+
+`--chainstate` runs the same replay handler in process on a stopped node's directory, then round-trips the response through JSON: no node, ports or bitcoind. Exit 0 only if every check passes. A rejected entry fails the run, but re-execution and the comparisons still run on the served values, so one run shows everything. Output (abridged), for the 7-tx history fixture over HTTP:
+
+```
+witness entries verified:
+  at-block ancestry 1, at-block inclusion 2, parent inclusion 16, parent absence 5,
+  open-block 1, metadata (re-derived) 10, contract (boot source) 2, contract (deploy tx) 2,
+  env (a) header 4, env (b) burn 6, env constant 4
+ok   headers        17 Stacks (hashed to their ids, genesis root pinned), 2 Bitcoin (heights trusted)
+ok   witness        35 store entries, 14 lookups, 4 contracts, 1 burn preimages
+ok   re-execute     7 receipts, 26 writes
+ok   writes         25 tx writes = replay state_writes
+ok   write proofs   10 final values proven at the block's state root
+ok   events         10 events (6 prints) and results = replay receipts
+ok   vm_events      4 = replay vm_events
+VERIFIED
+```
+
+What each comparison means:
+
+- **writes**: the transactions' re-executed writes equal the replay's `state_writes`, in order. This compares against the node's claim.
+- **write proofs**: each written key's final value (re-executed, plus setup and teardown) is proven at the block's own `state_index_root`. This is against the header. It does not prove completeness (a trie leaf re-execution did not write); listing the block trie's leaves would.
+- **events**: per tx, `events` and `result` equal the replay's. Replay's equal live `/new_block` (asserted in the HTTP test). Events are then as trustworthy as the witness entries: every input re-execution read is proven.
+
+## Results
+
+| Test | Shows |
+|---|---|
+| `served_witness_verifies_and_reexecutes_over_http` | History fixture through the RPC server: `VERIFIED`, every entry kind present, replay receipts equal live |
+| `served_witness_verifies_a_tenure_start_block_over_http` | Tenure-start block (own tenure change, new burn view): `VERIFIED`. Fails without the burn-view fix |
+| `tampered_witness_byte_fails_naming_the_entry` | One hex digit of the `note` value in transit: `vm::…::1::note: MARF proof fails`. One digit of its proof, and a block-time answer +1: rejected, named |
+| `unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs` | A contract whose `define-data-var` reads `burn-block-height`: its 3 metadata entries are served and rejected (`its deploy reads chain state: ["tip_burn_block_height()"]`); writes, write proofs and events still pass |
+| `served_witness_round_trips_through_json` | Envelope → JSON → envelope → `ServedWitness` → envelope is identical; decoded witness = live witness minus metadata values; a future version is refused |
+| `block_replay_uses_the_tenure_change_burn_view` | Replay result and events equal live for a tenure-start block (`u42` before the fix) |
+| `mainnet_boot_contracts_rederive_from_bundled_sources` | 40 of the 42 mainnet boot contracts re-derive from bundled sources in their transition epoch, except `signers-voting` (constant `pox-info` reads `pox-4` state, incl. `ustx_liquid_supply`) and `pox-5` (needs the user-deployed `sbtc-token` first) |
+
+Plus all phase 1/2a tests (40 witness, replay and absence tests pass). Fix found on the way: an epoch-2.0 deploy (genesis boot contracts, `vm-epoch::epoch-version` never set) failed re-derivation because the unset key read was missing; it now answers none.
+
+Size: the history fixture's envelope is 2.4 MB of JSON (35 entries, 10 write proofs, per-entry proofs, hex). Per-entry MARF proofs dominate (phase 2a: ~26 KB each, 5.5x smaller as a multiproof). A mainnet block with hundreds of entries and deeper tries will likely be tens of MB. Fine for a scratch run; the multiproof is the fix.
+
+## Scratch node: build and run
+
+Build (linux x86_64). The repo's `Dockerfile` builds the workspace in release (fat LTO) on `rust:bookworm`; `rust-toolchain.toml` pins 1.98.0, which rustup installs inside the build. The fork's CI (`.github/workflows/docker-image.yml`) runs `cargo build --features monitoring_prom,slog_json --profile release --workspace`. Build natively on an x86_64 box (QEMU emulation from Apple silicon is very slow):
+
+```
+docker build -t stacks-node:reexec-$(git rev-parse --short HEAD) \
+  --build-arg GIT_COMMIT=$(git rev-parse --short HEAD) .
+# or without Docker: cargo build --release --features monitoring_prom,slog_json -p stacks-node -p reexec-verify
+# (--profile release-lite: thin LTO, much less RAM and time)
+```
+
+Fat-LTO release builds of stackslib need a lot of RAM (plan for well over 8 GB); `release-lite` is the safer choice on a smaller box. `reexec-verify` builds anywhere (also macOS) and talks plain HTTP.
+
+Run, preferred first: no node at all. Stop nothing in production. Copy a stopped (or snapshotted) mainnet `working_dir` to scratch disk, then:
+
+```
+reexec-verify <block id> --chainstate /scratch/working_dir/mainnet
+```
+
+Run as a node (when RPC is wanted), on a **copy** of the chainstate: this branch may migrate DB schemas, and replay opens the chainstate read-write (it rolls back). Config:
+
+```toml
+[node]
+working_dir = "/scratch/reexec"     # copy of a mainnet working_dir
+rpc_bind = "127.0.0.1:30443"        # own ports, not the prod node's
+p2p_bind = "127.0.0.1:30444"
+miner = false
+stacker = false
+
+[burnchain]
+mode = "mainnet"
+peer_host = "<bitcoind host>"       # the run loop connects to the burnchain at start
+username = "..."
+password = "..."
+
+[connection_options]
+auth_token = "<random secret>"      # enables /v3/blocks/replay
+```
+
+`stacks-node start --config reexec.toml`, wait for RPC (`/v2/info`), then `reexec-verify <id> --node http://127.0.0.1:30443 --auth <secret>`.
+
+Memory: plan for a normal mainnet follower (8 GB+). Replay with `read_witness=1` adds the proofs and their JSON (tens of MB for a large block) plus metadata re-derivation of each contract read (milliseconds each). The client holds one block's witness and re-executes in milliseconds (phase 2a numbers).
+
+## Still blocking or untested for a mainnet run
+
+1. **Contracts whose initialization reads chain state** (gap 4). Their metadata is served and rejected; the run still re-executes and compares. Known: `signers-voting`. Unknown until run: `sbtc-token` and its dependencies (needed by `pox-5`), and the target's own contracts (e.g. `sbtc-yield-rewards-v3`). The fix is a deploy witness: the deploy tx's own reads, proven at its parent's root, re-executed to re-derive.
+2. **Env classes (c)/(d)** (miner address, block rewards, burn spends, PoX payouts, Clarity 1/2 `block-height` on Nakamoto) are rejected.
+3. **Never run on mainnet data.** In particular: the bundled `sip-031` and `pox-5` bodies must hash to mainnet's commitments byte for byte; mainnet MARF proofs must find full tries (a squashed or pruned chainstate breaks proofs into old tries; `marf-squash` output is not usable); `--chainstate` mode is only exercised through the shared handler code, not on a real directory.
+4. **Header and Bitcoin authenticity** are not checked here: headers by id hash only, Bitcoin heights from the node. `@secondlayer/verify` (signer signatures, canonical fork) and an SPV header chain compose on top by checking the same ids and hashes.
+5. **Burn-view recency** (gap 2) and **nested `at-block`** (gap 3) as in 2a.
+6. **Epoch 2.x**: a parent or `at-block` target in 2.x is shipped as an epoch-2 header (its parent id unknown, zero); untested. First Nakamoto blocks (2.x parent) untested.
+7. **Response size** (per-entry proofs). A multiproof is the fix.
+
+First target is still the `sbtc-yield-rewards-v3` block: run it and read which entries are rejected and why.
