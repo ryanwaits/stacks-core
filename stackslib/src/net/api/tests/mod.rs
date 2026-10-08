@@ -63,6 +63,7 @@ use crate::net::{
 };
 
 mod blockreplay;
+mod blockreplay_witness;
 mod blocksimulate;
 mod callreadonly;
 mod fastcallreadonly;

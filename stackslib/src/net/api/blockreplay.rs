@@ -41,6 +41,8 @@ use crate::chainstate::stacks::miner::{
 use crate::chainstate::stacks::{Error as ChainError, StacksTransaction, TransactionPayload};
 use crate::clarity_vm::read_witness::ReadWitness;
 use crate::clarity_vm::state_writes::{state_write_entries, tx_index_map, StateWriteEntry};
+use crate::clarity_vm::witness_serve::serve_witness;
+use crate::clarity_vm::witness_wire::WitnessEnvelope;
 use crate::config::DEFAULT_MAX_TENURE_BYTES;
 use crate::net::http::{
     parse_json, Error, HttpNotFound, HttpRequest, HttpRequestContents, HttpRequestPreamble,
@@ -169,7 +171,9 @@ pub struct ReplayTrace {
     pub vm_events: bool,
     /// Storage-layer MARF writes (`?state_writes=1`), as `/new_block.state_writes`.
     pub state_writes: bool,
-    /// Read witness (in-process only: no query flag or wire format yet).
+    /// Proof-carrying read witness (`?read_witness=1`, see
+    /// `clarity_vm::witness_wire`). Implies `state_writes`: a client needs the
+    /// block-level writes to re-execute.
     pub read_witness: bool,
 }
 
@@ -218,7 +222,7 @@ where
         clarity.collect_read_witness(),
     );
     clarity.set_emit_vm_trace(trace.vm_events);
-    clarity.set_collect_state_writes(trace.state_writes);
+    clarity.set_collect_state_writes(trace.state_writes || trace.read_witness);
     clarity.set_collect_read_witness(trace.read_witness);
 
     let result = remine_nakamoto_block_inner(
@@ -283,6 +287,15 @@ where
         Err(e) => return Err(ChainError::InvalidStacksBlock(e)),
     };
 
+    let parent_stacks_header_opt =
+        NakamotoChainState::get_block_header(chainstate.db(), &parent_block_id)?;
+
+    let Some(parent_stacks_header) = parent_stacks_header_opt else {
+        return Err(ChainError::InvalidStacksBlock(
+            "Invalid Parent Block".into(),
+        ));
+    };
+
     let burn_dbconn = match sortdb.index_handle_at_block(chainstate, &parent_block_id) {
         Ok(burn_dbconn) => burn_dbconn,
         Err(_) => return Err(ChainError::NoSuchBlockError),
@@ -302,15 +315,6 @@ where
             _ => None,
         })
         .unwrap_or(MinerTenureInfoCause::NoTenureChange);
-
-    let parent_stacks_header_opt =
-        NakamotoChainState::get_block_header(chainstate.db(), &parent_block_id)?;
-
-    let Some(parent_stacks_header) = parent_stacks_header_opt else {
-        return Err(ChainError::InvalidStacksBlock(
-            "Invalid Parent Block".into(),
-        ));
-    };
 
     let mut builder = match NakamotoBlockBuilder::new(
         &parent_stacks_header,
@@ -408,13 +412,29 @@ where
     let state_writes = tenure_tx.connection().take_state_writes();
     let read_witness = tenure_tx.connection().take_read_witness();
 
+    tenure_tx.rollback_block();
+    drop(miner_tenure_info);
+
+    let served_witness = match (
+        trace.read_witness,
+        read_witness.as_ref(),
+        state_writes.as_ref(),
+    ) {
+        (true, Some(witness), Some(writes)) => Some(
+            serve_witness(sortdb, chainstate, &block, witness, writes)
+                .and_then(|served| served.to_envelope())
+                .map_err(|e| {
+                    ChainError::InvalidStacksBlock(format!("cannot prove the read witness: {e}"))
+                })?,
+        ),
+        _ => None,
+    };
+
     // copy values that will contribute to the block_hash that cannot be the same in the new replayed block
     replayed_block.header.timestamp = block.header.timestamp;
     replayed_block.header.state_index_root = block.header.state_index_root;
     replayed_block.header.miner_signature = block.header.miner_signature;
     replayed_block.header.pox_treatment = block.header.pox_treatment;
-
-    tenure_tx.rollback_block();
 
     let mut rpc_replayed_block =
         RPCReplayedBlock::from_block(&replayed_block, block_fees, tenure_id, parent_block_id);
@@ -429,23 +449,11 @@ where
     }
 
     if trace.vm_events {
-        rpc_replayed_block.vm_events = Some(
-            txs_receipts
-                .iter()
-                .filter(|(receipt, ..)| {
-                    !receipt.post_condition_aborted && receipt.problematic_skipped.is_none()
-                })
-                .flat_map(|(receipt, ..)| {
-                    let txid = receipt.transaction.txid();
-                    receipt
-                        .vm_events
-                        .iter()
-                        .map(move |event| event.json_serialize(&txid, true))
-                })
-                .collect(),
-        );
+        rpc_replayed_block.vm_events = Some(block_vm_events(
+            txs_receipts.iter().map(|(receipt, ..)| receipt),
+        ));
     }
-    if trace.state_writes {
+    if trace.state_writes || trace.read_witness {
         let tx_index_of = tx_index_map(
             txs_receipts
                 .iter()
@@ -454,9 +462,44 @@ where
         rpc_replayed_block.state_writes =
             state_writes.map(|writes| state_write_entries(&writes, &tx_index_of));
     }
-    rpc_replayed_block.read_witness = read_witness;
+    rpc_replayed_block.recorded_witness = read_witness;
+    rpc_replayed_block.read_witness = served_witness;
 
     Ok(rpc_replayed_block)
+}
+
+/// A block's eval-hook VM traces in block order, as `/new_block.vm_events`.
+pub fn block_vm_events<'a>(
+    receipts: impl Iterator<Item = &'a StacksTransactionReceipt>,
+) -> Vec<serde_json::Value> {
+    receipts
+        .filter(|receipt| !receipt.post_condition_aborted && receipt.problematic_skipped.is_none())
+        .flat_map(|receipt| {
+            let txid = receipt.transaction.txid();
+            receipt
+                .vm_events
+                .iter()
+                .map(move |event| event.json_serialize(&txid, true))
+        })
+        .collect()
+}
+
+/// A receipt's events as the replay serializes them (none if a
+/// post-condition aborted the transaction).
+pub fn receipt_events(receipt: &StacksTransactionReceipt) -> Vec<serde_json::Value> {
+    if receipt.post_condition_aborted {
+        return vec![];
+    }
+    receipt
+        .events
+        .iter()
+        .enumerate()
+        .map(|(event_index, event)| {
+            event
+                .json_serialize(event_index, &receipt.transaction.txid(), true)
+                .unwrap()
+        })
+        .collect()
 }
 
 impl RPCNakamotoBlockReplayRequestHandler {
@@ -543,20 +586,7 @@ impl RPCReplayedBlockTransaction {
         execution_tracker: &BlockReplayExecutionTracker,
         profiler_result: &Option<BlockReplayProfilerResult>,
     ) -> Self {
-        let events = if receipt.post_condition_aborted {
-            vec![]
-        } else {
-            receipt
-                .events
-                .iter()
-                .enumerate()
-                .map(|(event_index, event)| {
-                    event
-                        .json_serialize(event_index, &receipt.transaction.txid(), true)
-                        .unwrap()
-                })
-                .collect()
-        };
+        let events = receipt_events(receipt);
 
         let transaction_data = match &receipt.transaction {
             TransactionOrigin::Stacks(stacks) => Some(stacks.clone()),
@@ -627,10 +657,13 @@ pub struct RPCReplayedBlock {
     /// Present only when requested with `?state_writes=1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_writes: Option<Vec<StateWriteEntry>>,
-    /// Everything the replay read from outside the block, when requested.
-    /// In-process only: it has no wire format yet.
+    /// The proof-carrying read witness (`clarity_vm::witness_wire`), when
+    /// requested with `?read_witness=1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_witness: Option<WitnessEnvelope>,
+    /// The read witness as recorded, in-process only.
     #[serde(skip)]
-    pub read_witness: Option<ReadWitness>,
+    pub recorded_witness: Option<ReadWitness>,
 }
 
 impl RPCReplayedBlock {
@@ -660,6 +693,7 @@ impl RPCReplayedBlock {
             vm_events: None,
             state_writes: None,
             read_witness: None,
+            recorded_witness: None,
         }
     }
 }
@@ -722,6 +756,7 @@ impl HttpRequest for RPCNakamotoBlockReplayRequestHandler {
                     "profiler" => self.profiler = on,
                     "vm_events" => self.trace.vm_events = on,
                     "state_writes" => self.trace.state_writes = on,
+                    "read_witness" => self.trace.read_witness = on,
                     _ => {}
                 }
             }
@@ -808,7 +843,8 @@ impl StacksHttpRequest {
             format!("/v3/blocks/replay/{block_id}"),
             HttpRequestContents::new()
                 .query_arg("vm_events".into(), flag(trace.vm_events))
-                .query_arg("state_writes".into(), flag(trace.state_writes)),
+                .query_arg("state_writes".into(), flag(trace.state_writes))
+                .query_arg("read_witness".into(), flag(trace.read_witness)),
         )
         .expect("FATAL: failed to construct request from infallible data")
     }

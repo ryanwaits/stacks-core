@@ -214,9 +214,18 @@ pub fn derive_contract_metadata(
             Some(open_tip.to_hex()),
         ),
     ];
+    let mut entries = entries;
     let mut setup = vec![];
-    if let Some(epoch_key) = deploy.epoch_key.as_ref() {
-        setup.push((EPOCH_VERSION_KEY.to_string(), epoch_key.clone()));
+    match deploy.epoch_key.as_ref() {
+        Some(epoch_key) => setup.push((EPOCH_VERSION_KEY.to_string(), epoch_key.clone())),
+        // never set (epoch 2.0): the read answers none
+        None => entries.push((
+            StoreQuery::Data {
+                at: None,
+                key: EPOCH_VERSION_KEY.to_string(),
+            },
+            None,
+        )),
     }
     let mut metadata = HashMap::new();
     for (known_id, (hash, rows)) in known.iter() {

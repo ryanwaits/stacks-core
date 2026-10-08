@@ -28,7 +28,6 @@ use super::stateless_reexec::{
     block_with_tx, boot, receipt_of, tamper_store, uint_hex, HistoryFixture, LiveBlock,
 };
 use crate::chainstate::burn::db::sortdb::SortitionDB;
-use crate::chainstate::burn::ConsensusHashExtensions;
 use crate::chainstate::nakamoto::tests::state_writes::StateWriteFixture;
 use crate::chainstate::nakamoto::NakamotoChainState;
 use crate::chainstate::stacks::events::TransactionOrigin;
@@ -38,9 +37,12 @@ use crate::chainstate::stacks::{StacksTransaction, TransactionPayload};
 use crate::clarity_vm::read_witness::{EnvQuery, ReadWitness, StoreQuery};
 use crate::clarity_vm::witness_proof::{
     prove_contracts, prove_store_reads, verify_read_witness, BitcoinChain, BitcoinHeader,
-    BurnBinding, ChainHeader, DeploySource, HeaderChain, MarfProof, NetworkParams, ProvenWitness,
-    Rejection, StoreProof, TrustedState, TxInclusion,
+    ChainHeader, DeploySource, HeaderChain, MarfProof, NetworkParams, ProvenWitness, Rejection,
+    StoreProof, TrustedState, TxInclusion,
 };
+use crate::clarity_vm::witness_serve::burn_binding;
+use crate::clarity_vm::witness_wire::WitnessEnvelope;
+use crate::net::api::blockreplay::{remine_nakamoto_block, ReplayTrace};
 use crate::net::test::{TestEventObserver, TestEventObserverBlock, TestPeer};
 use crate::net::tests::NakamotoBootTenure;
 
@@ -75,44 +77,6 @@ fn block_txs(block: &TestEventObserverBlock) -> Vec<StacksTransaction> {
             TransactionOrigin::Burn(_) => None,
         })
         .collect()
-}
-
-/// A consensus hash's preimage, from the sortition DB (what the
-/// marf-witness `burn` sidecar serves).
-fn burn_binding(sortdb: &SortitionDB, ch: &ConsensusHash) -> BurnBinding {
-    let sn = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), ch)
-        .unwrap()
-        .unwrap_or_else(|| panic!("no snapshot for {ch}"));
-    let handle = sortdb.index_handle(&sn.sortition_id);
-    let first = sortdb.first_block_height;
-    let parent_height = sn.block_height - 1;
-    let mut prev_consensus_hashes = vec![];
-    let mut i = 0;
-    while i < 64 {
-        let Some(height) = parent_height.checked_sub((1u64 << i) - 1) else {
-            break;
-        };
-        if height < first {
-            break;
-        }
-        prev_consensus_hashes.push(
-            handle
-                .get_consensus_at(height)
-                .unwrap()
-                .unwrap_or(ConsensusHash::empty()),
-        );
-        i += 1;
-    }
-    let binding = BurnBinding {
-        burn_header_hash: sn.burn_header_hash.clone(),
-        ops_hash: sn.ops_hash.clone(),
-        total_burn: sn.total_burn,
-        pox_id: handle.get_pox_id().unwrap(),
-        prev_consensus_hashes,
-    };
-    assert_eq!(&binding.consensus_hash(), ch, "preimage reproduces {ch}");
-    assert_eq!(binding.sortition_id(), sn.sortition_id);
-    binding
 }
 
 /// Gather what a client trusts and what a node proves for `block`.
@@ -269,7 +233,10 @@ fn serve(
     }
     let mut seen = HashSet::new();
     chs.retain(|ch| seen.insert(ch.clone()));
-    let burn = chs.iter().map(|ch| burn_binding(sortdb, ch)).collect();
+    let burn = chs
+        .iter()
+        .map(|ch| burn_binding(sortdb, ch).unwrap())
+        .collect();
 
     // served: MARF proofs and contract evidence
     let find_deploy = |block: &StacksBlockId, contract: &QualifiedContractIdentifier| {
@@ -290,8 +257,9 @@ fn serve(
         .with_marf(|marf| {
             let mut conn = marf.borrow_storage_backend();
             let store = prove_store_reads(&mut conn, &parent, witness).unwrap();
-            let contracts =
-                prove_contracts(&mut conn, &parent, witness, &headers, &net, &find_deploy).unwrap();
+            let (contracts, unproven) =
+                prove_contracts(&mut conn, &parent, witness, &net, &find_deploy).unwrap();
+            assert!(unproven.is_empty(), "{unproven:?}");
             (store, contracts)
         });
 
@@ -670,4 +638,71 @@ fn every_witness_entry_has_its_own_evidence() {
         };
         assert!(ok, "{query:?} has {proof:?}");
     }
+}
+
+/// What a node serves survives JSON: decoding and re-encoding gives the same
+/// envelope, and the decoded witness is the live one, but for metadata values
+/// (left out for the client to re-derive).
+#[test]
+fn served_witness_round_trips_through_json() {
+    let (observer, fx, tenures, balances) = history_block();
+    let mut peer = boot(function_name!(), &observer, tenures, balances);
+    let block = block_with_tx(&observer, &fx.snapshot);
+    let live = LiveBlock::of(&block);
+
+    let sortdb = peer.chain.sortdb.take().unwrap();
+    let mut node = peer.chain.stacks_node.take().unwrap();
+    let trace = ReplayTrace {
+        read_witness: true,
+        ..Default::default()
+    };
+    let replayed = remine_nakamoto_block(
+        &block.metadata.index_block_hash(),
+        &sortdb,
+        &mut node.chainstate,
+        false,
+        trace,
+        |block| block.txs.clone(),
+        |_| Ok(()),
+    )
+    .expect("replay succeeds");
+    peer.chain.sortdb = Some(sortdb);
+    peer.chain.stacks_node = Some(node);
+
+    let envelope = replayed.read_witness.expect("replay served a witness");
+    let text = serde_json::to_string(&envelope).unwrap();
+    let parsed: WitnessEnvelope = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed, envelope);
+    let served = parsed.decode().expect("envelope decodes");
+    assert_eq!(served.to_envelope().unwrap(), envelope);
+
+    let mut expected = live.witness.clone();
+    for (query, answer) in expected.store.iter_mut() {
+        if matches!(query, StoreQuery::Metadata { .. }) {
+            *answer = None;
+        }
+    }
+    assert_eq!(served.proven.witness, expected);
+    assert_eq!(served.proven.store.len(), expected.store.len());
+    assert!(!served.headers.is_empty() && !served.bitcoin.is_empty());
+    assert_eq!(
+        served.writes.len(),
+        live.writes
+            .iter()
+            .map(|w| &w.key)
+            .collect::<HashSet<_>>()
+            .len()
+    );
+
+    let mut future = envelope.clone();
+    future.version += 1;
+    assert!(future.decode().unwrap_err().contains("wire version"));
+
+    eprintln!(
+        "MEASURE-WIRE history-fixture: envelope={} bytes, headers={}, bitcoin headers={}, write proofs={}",
+        text.len(),
+        served.headers.len(),
+        served.bitcoin.len(),
+        served.writes.len()
+    );
 }

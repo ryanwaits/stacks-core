@@ -50,6 +50,7 @@ use clarity::vm::database::{ClarityDeserializable, SqliteConnection};
 use clarity::vm::types::QualifiedContractIdentifier;
 use clarity::vm::{ClarityVersion, ContractName};
 use stacks_common::codec::StacksMessageCodec;
+use stacks_common::consts::SIGNER_SLOTS_PER_USER;
 use stacks_common::types::chainstate::{
     BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, PoxId, SortitionId, StacksBlockId,
     TrieHash, VRFSeed,
@@ -61,13 +62,13 @@ use stacks_common::util::vrf::VRFProof;
 use crate::burnchains::PoxConstants;
 use crate::chainstate::burn::{ConsensusHashExtensions, OpsHash};
 use crate::chainstate::stacks::boot::{
-    BOOT_CODE_BNS, BOOT_CODE_COSTS, BOOT_CODE_COSTS_2, BOOT_CODE_COSTS_2_TESTNET,
-    BOOT_CODE_COSTS_3, BOOT_CODE_COSTS_4, BOOT_CODE_COST_VOTING_MAINNET,
+    make_pox_5_body, make_sip_031_body, BOOT_CODE_BNS, BOOT_CODE_COSTS, BOOT_CODE_COSTS_2,
+    BOOT_CODE_COSTS_2_TESTNET, BOOT_CODE_COSTS_3, BOOT_CODE_COSTS_4, BOOT_CODE_COST_VOTING_MAINNET,
     BOOT_CODE_COST_VOTING_TESTNET, BOOT_CODE_GENESIS, BOOT_CODE_LOCKUP, BOOT_CODE_POX_MAINNET,
     BOOT_CODE_POX_TESTNET, COSTS_1_NAME, COSTS_2_NAME, COSTS_3_NAME, COSTS_4_NAME,
     POX_2_MAINNET_CODE, POX_2_NAME, POX_2_TESTNET_CODE, POX_3_MAINNET_CODE, POX_3_NAME,
-    POX_3_TESTNET_CODE, POX_4_CODE, POX_4_NAME, SIGNERS_BODY, SIGNERS_NAME, SIGNERS_VOTING_BODY,
-    SIGNERS_VOTING_NAME,
+    POX_3_TESTNET_CODE, POX_4_CODE, POX_4_NAME, POX_5_NAME, SIGNERS_BODY, SIGNERS_DB_0_BODY,
+    SIGNERS_DB_1_BODY, SIGNERS_NAME, SIGNERS_VOTING_BODY, SIGNERS_VOTING_NAME, SIP_031_NAME,
 };
 use crate::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksHeaderInfo};
 use crate::chainstate::stacks::index::absence::{AbsenceEnd, TrieAbsenceProof};
@@ -120,27 +121,54 @@ impl ChainHeader {
         self.timestamp.is_some()
     }
 
+    /// A header the client hashed itself: its id is computed from the
+    /// header and consensus hash, never taken on trust. An epoch 2.x header
+    /// names its parent by block hash only, so its `parent` is unknown (zero).
+    pub fn from_header(consensus_hash: &ConsensusHash, header: &StacksBlockHeaderTypes) -> Self {
+        let parent = match header {
+            StacksBlockHeaderTypes::Nakamoto(h) => h.parent_block_id.clone(),
+            StacksBlockHeaderTypes::Epoch2(_) => StacksBlockId([0; 32]),
+        };
+        Self::with_parent(consensus_hash, header, parent)
+    }
+
+    /// A header from the node's own headers DB (tests, and the prover).
     pub fn from_header_info(info: &StacksHeaderInfo, parent: StacksBlockId) -> Self {
-        let (state_index_root, tx_merkle_root, timestamp, vrf_proof) = match &info.anchored_header {
+        ChainHeader {
+            id: info.index_block_hash(),
+            height: info.stacks_block_height as u32,
+            ..Self::with_parent(&info.consensus_hash, &info.anchored_header, parent)
+        }
+    }
+
+    fn with_parent(
+        consensus_hash: &ConsensusHash,
+        header: &StacksBlockHeaderTypes,
+        parent: StacksBlockId,
+    ) -> Self {
+        let (height, state_index_root, tx_merkle_root, timestamp, vrf_proof) = match header {
             StacksBlockHeaderTypes::Epoch2(h) => (
+                h.total_work.work,
                 h.state_index_root,
                 h.tx_merkle_root.clone(),
                 None,
                 Some(h.proof.clone()),
             ),
             StacksBlockHeaderTypes::Nakamoto(h) => (
+                h.chain_length,
                 h.state_index_root,
                 h.tx_merkle_root.clone(),
                 Some(h.timestamp),
                 None,
             ),
         };
+        let block_hash = header.block_hash();
         ChainHeader {
-            id: info.index_block_hash(),
+            id: StacksBlockId::new(consensus_hash, &block_hash),
             parent,
-            block_hash: info.anchored_header.block_hash(),
-            consensus_hash: info.consensus_hash.clone(),
-            height: info.stacks_block_height as u32,
+            block_hash,
+            consensus_hash: consensus_hash.clone(),
+            height: height as u32,
             state_index_root,
             tx_merkle_root,
             timestamp,
@@ -170,24 +198,6 @@ impl HeaderChain {
 
     pub fn get(&self, id: &StacksBlockId) -> Option<&ChainHeader> {
         self.headers.get(id)
-    }
-
-    /// Whether `ancestor` is `block` or one of its ancestors.
-    pub fn is_ancestor(&self, ancestor: &StacksBlockId, block: &StacksBlockId) -> bool {
-        let Some(target) = self.headers.get(ancestor) else {
-            return false;
-        };
-        let mut cursor = self.headers.get(block);
-        while let Some(h) = cursor {
-            if h.id == target.id {
-                return true;
-            }
-            if h.height <= target.height {
-                return false;
-            }
-            cursor = self.headers.get(&h.parent);
-        }
-        false
     }
 }
 
@@ -345,6 +355,33 @@ pub enum MarfProof {
 }
 
 impl MarfProof {
+    /// Blocks whose tries the proof crosses into (the targets of its on-path
+    /// back-pointers). The verifier maps each of their roots back to the
+    /// block, so it needs their headers.
+    pub fn crossed_blocks(&self) -> Vec<StacksBlockId> {
+        let steps = match self {
+            MarfProof::Present(proof) => &proof.0,
+            MarfProof::Absent(proof) => &proof.proof,
+        };
+        let mut out = vec![];
+        for step in steps.iter() {
+            let (chr, ptrs) = match step {
+                TrieMerkleProofType::Node4((chr, node, _))
+                | TrieMerkleProofType::Node16((chr, node, _))
+                | TrieMerkleProofType::Node48((chr, node, _))
+                | TrieMerkleProofType::Node256((chr, node, _)) => (chr, &node.ptrs),
+                TrieMerkleProofType::Leaf(_) | TrieMerkleProofType::Shunt(_) => continue,
+            };
+            if let Some(ptr) = ptrs
+                .iter()
+                .find(|p| p.id != TrieNodeID::Empty as u8 && p.chr == *chr && is_backptr(p.id))
+            {
+                out.push(ptr.back_block.clone());
+            }
+        }
+        out
+    }
+
     /// The leaf value an inclusion proof proves.
     fn present_value(&self) -> Option<MARFValue> {
         match self {
@@ -356,7 +393,9 @@ impl MarfProof {
         }
     }
 
-    fn holds(
+    /// Whether the proof shows `path` holds `value` (`None`: absent) at the
+    /// trie whose root is `root`.
+    pub fn holds(
         &self,
         path: &TrieHash,
         value: Option<&MARFValue>,
@@ -397,6 +436,10 @@ pub enum StoreProof {
     OpenBlock,
     /// Contract metadata: re-derived from [`ProvenWitness::contracts`].
     Rederived,
+    /// Contract metadata served as is: the contract cannot be re-derived from
+    /// its deploy alone (its initialization reads chain state, or it depends
+    /// on such a contract). Not provable yet; the verifier rejects it.
+    Served,
 }
 
 impl StoreProof {
@@ -407,7 +450,7 @@ impl StoreProof {
                 hash_to_height,
                 height_to_hash,
             } => hash_to_height.byte_len() + height_to_hash.byte_len(),
-            StoreProof::OpenBlock | StoreProof::Rederived => 0,
+            StoreProof::OpenBlock | StoreProof::Rederived | StoreProof::Served => 0,
         }
     }
 }
@@ -435,9 +478,22 @@ pub struct ContractEvidence {
     /// `vm-epoch::epoch-version` at the deploying block's root.
     pub epoch_key: Option<String>,
     pub epoch_key_proof: MarfProof,
+    /// The deploying block is an ancestor of the parent: its
+    /// `__MARF_BLOCK_HASH_TO_HEIGHT` and `__MARF_BLOCK_HEIGHT_TO_HASH`
+    /// entries at the parent's root. `None` when it is the parent.
+    pub ancestry: Option<(MarfProof, MarfProof)>,
 }
 
 impl ContractEvidence {
+    /// Every MARF proof this evidence carries.
+    pub fn marf_proofs(&self) -> Vec<&MarfProof> {
+        let mut proofs = vec![&self.commitment_proof, &self.epoch_key_proof];
+        if let Some((a, b)) = &self.ancestry {
+            proofs.extend([a, b]);
+        }
+        proofs
+    }
+
     pub fn byte_len(&self) -> usize {
         let source = match &self.source {
             DeploySource::Tx(inclusion) => inclusion.byte_len(),
@@ -447,9 +503,12 @@ impl ContractEvidence {
             + 32
             + source
             + self.commitment.len()
-            + self.commitment_proof.byte_len()
             + self.epoch_key.as_ref().map_or(0, String::len)
-            + self.epoch_key_proof.byte_len()
+            + self
+                .marf_proofs()
+                .iter()
+                .map(|p| p.byte_len())
+                .sum::<usize>()
     }
 }
 
@@ -574,6 +633,25 @@ impl MarfProof {
 }
 
 impl ProvenWitness {
+    /// Every MARF proof: store entries, then contract evidence.
+    pub fn marf_proofs(&self) -> Vec<&MarfProof> {
+        let mut proofs: Vec<&MarfProof> = vec![];
+        for proof in self.store.iter() {
+            match proof {
+                StoreProof::Marf(p) => proofs.push(p),
+                StoreProof::Ancestor {
+                    hash_to_height,
+                    height_to_hash,
+                } => proofs.extend([hash_to_height, height_to_hash]),
+                StoreProof::OpenBlock | StoreProof::Rederived | StoreProof::Served => {}
+            }
+        }
+        for c in self.contracts.iter() {
+            proofs.extend(c.marf_proofs());
+        }
+        proofs
+    }
+
     pub fn proof_size(&self) -> ProofSize {
         let mut size = ProofSize::default();
         for proof in self.store.iter() {
@@ -586,22 +664,10 @@ impl ProvenWitness {
             }
         }
         size.contracts = self.contracts.iter().map(ContractEvidence::byte_len).sum();
-        let mut proofs: Vec<&MarfProof> = vec![];
-        for proof in self.store.iter() {
-            match proof {
-                StoreProof::Marf(p) => proofs.push(p),
-                StoreProof::Ancestor {
-                    hash_to_height,
-                    height_to_hash,
-                } => proofs.extend([hash_to_height, height_to_hash]),
-                _ => {}
-            }
-        }
-        for c in self.contracts.iter() {
-            proofs.extend([&c.commitment_proof, &c.epoch_key_proof]);
-        }
         let mut seen = HashSet::new();
-        for (identity, full, compact) in proofs.iter().flat_map(|p| p.multiproof_items()) {
+        for (identity, full, compact) in
+            self.marf_proofs().iter().flat_map(|p| p.multiproof_items())
+        {
             if seen.insert(identity) {
                 size.marf_multiproof += full;
                 size.marf_multiproof_compact += compact;
@@ -768,6 +834,26 @@ fn prove_current(
     prove_key(conn, block, path, value.as_ref())
 }
 
+/// Whether `target` is an ancestor of `parent`, as `parent`'s MARF records
+/// it: `__MARF_BLOCK_HASH_TO_HEIGHT::target` and, if present, the block at
+/// that height (`check_ancestor_block_hash`).
+fn prove_ancestry(
+    conn: &mut TrieStorageConnection<StacksBlockId>,
+    parent: &StacksBlockId,
+    target: &StacksBlockId,
+) -> Result<(MarfProof, MarfProof), MarfError> {
+    let path = TrieHash::from_key(&hash_to_height_key(target));
+    let hash_to_height = prove_current(conn, parent, &path)?;
+    let height_to_hash = match hash_to_height.present_value() {
+        Some(height) => {
+            let path = TrieHash::from_key(&height_to_hash_key(u32::from(height)));
+            prove_current(conn, parent, &path)?
+        }
+        None => hash_to_height.clone(),
+    };
+    Ok((hash_to_height, height_to_hash))
+}
+
 /// MARF evidence for every store entry of a witness recorded for the block
 /// whose parent is `parent` (metadata entries are re-derived instead).
 pub fn prove_store_reads(
@@ -788,17 +874,8 @@ pub fn prove_store_reads(
                     .map_err(|e| format!("{query:?}: {e:?}"))?,
             ),
             Claim::Ancestor { target, .. } => {
-                let path = TrieHash::from_key(&hash_to_height_key(&target));
-                let hash_to_height =
-                    prove_current(conn, parent, &path).map_err(|e| format!("{query:?}: {e:?}"))?;
-                let height_to_hash = match hash_to_height.present_value() {
-                    Some(height) => {
-                        let path = TrieHash::from_key(&height_to_hash_key(u32::from(height)));
-                        prove_current(conn, parent, &path)
-                            .map_err(|e| format!("{query:?}: {e:?}"))?
-                    }
-                    None => hash_to_height.clone(),
-                };
+                let (hash_to_height, height_to_hash) = prove_ancestry(conn, parent, &target)
+                    .map_err(|e| format!("{query:?}: {e:?}"))?;
                 StoreProof::Ancestor {
                     hash_to_height,
                     height_to_hash,
@@ -810,6 +887,28 @@ pub fn prove_store_reads(
         proofs.push(proof);
     }
     Ok(proofs)
+}
+
+/// Inclusion proofs of each `(key, value)` at `block`'s root: a block's final
+/// writes, proven against its own header.
+pub fn prove_writes(
+    conn: &mut TrieStorageConnection<StacksBlockId>,
+    block: &StacksBlockId,
+    writes: &[(String, String)],
+) -> Result<Vec<(String, MarfProof)>, String> {
+    writes
+        .iter()
+        .map(|(key, value)| {
+            let proof = prove_key(
+                conn,
+                block,
+                &TrieHash::from_key(key),
+                Some(&MARFValue::from_value(value)),
+            )
+            .map_err(|e| format!("write {key}: {e:?}"))?;
+            Ok((key.clone(), proof))
+        })
+        .collect()
 }
 
 /// Evidence for re-deriving `contract`, deployed in `block` (found through
@@ -860,6 +959,11 @@ pub fn prove_contract(
         epoch_key.as_deref().map(MARFValue::from_value).as_ref(),
     )
     .map_err(|e| format!("{contract}: {e:?}"))?;
+    let ancestry = if &block == parent {
+        None
+    } else {
+        Some(prove_ancestry(conn, parent, &block).map_err(|e| format!("{contract}: {e:?}"))?)
+    };
     Ok(ContractEvidence {
         contract: contract.clone(),
         block,
@@ -868,6 +972,7 @@ pub fn prove_contract(
         commitment_proof,
         epoch_key,
         epoch_key_proof,
+        ancestry,
     })
 }
 
@@ -886,36 +991,48 @@ pub fn metadata_contracts(witness: &ReadWitness) -> Vec<QualifiedContractIdentif
         .collect()
 }
 
+/// Contracts that cannot be re-derived from their deploy alone, and why.
+pub type UnprovenContracts = Vec<(QualifiedContractIdentifier, String)>;
+
 /// Contract evidence for every contract whose metadata `witness` read, plus
 /// whatever their analysis depends on, ordered so each contract's
-/// dependencies come first. Dependencies are found by re-deriving.
+/// dependencies come first. Dependencies are found by re-deriving. Contracts
+/// that cannot be re-derived from their deploy alone come back separately,
+/// with the reason (their metadata can only be served as is).
 pub fn prove_contracts(
     conn: &mut TrieStorageConnection<StacksBlockId>,
     parent: &StacksBlockId,
     witness: &ReadWitness,
-    headers: &HeaderChain,
     net: &NetworkParams,
     find_deploy: &dyn Fn(&StacksBlockId, &QualifiedContractIdentifier) -> Option<TxInclusion>,
-) -> Result<Vec<ContractEvidence>, String> {
+) -> Result<(Vec<ContractEvidence>, UnprovenContracts), String> {
     let mut ordered: Vec<ContractEvidence> = vec![];
     let mut pending = metadata_contracts(witness);
     let mut derived = HashMap::new();
+    let mut failed: BTreeMap<QualifiedContractIdentifier, String> = BTreeMap::new();
     let mut attempts = 0;
     while let Some(contract) = pending.last().cloned() {
         attempts += 1;
         if attempts > 1000 {
             return Err("contract dependencies do not resolve".into());
         }
-        if derived.contains_key(&contract) {
+        if derived.contains_key(&contract) || failed.contains_key(&contract) {
             pending.pop();
             continue;
         }
-        let evidence = prove_contract(conn, parent, &contract, find_deploy, net.mainnet)?;
-        match rederive(&evidence, headers, net, &derived) {
+        let evidence = match prove_contract(conn, parent, &contract, find_deploy, net.mainnet) {
+            Ok(evidence) => evidence,
+            Err(e) => {
+                failed.insert(contract, e);
+                pending.pop();
+                continue;
+            }
+        };
+        let failure = match rederive_unchecked(&evidence, net, &derived) {
             Ok((hash, rows)) => {
                 derived.insert(contract.clone(), (hash, rows));
                 ordered.push(evidence);
-                pending.pop();
+                None
             }
             Err(Rederive::Missing(missing)) => {
                 let deps: Vec<_> = missing
@@ -925,15 +1042,39 @@ pub fn prove_contracts(
                     .filter_map(|id| QualifiedContractIdentifier::parse(id).ok())
                     .filter(|id| !derived.contains_key(id) && id != &contract)
                     .collect();
-                if deps.is_empty() {
-                    return Err(format!("{contract} cannot be re-derived: {missing:?}"));
+                if let Some(dep) = deps.iter().find(|d| failed.contains_key(d)) {
+                    Some(format!("depends on {dep}, which is not re-derivable"))
+                } else if deps.is_empty() {
+                    Some(format!("its deploy reads chain state: {missing:?}"))
+                } else {
+                    pending.extend(deps);
+                    continue;
                 }
-                pending.extend(deps);
             }
-            Err(Rederive::Invalid(e)) => return Err(format!("{contract}: {e}")),
+            Err(Rederive::Invalid(e)) => Some(e),
+        };
+        if let Some(reason) = failure {
+            failed.insert(contract, reason);
+        }
+        pending.pop();
+    }
+    Ok((ordered, failed.into_iter().collect()))
+}
+
+/// Mark the metadata entries of contracts without evidence as served as is.
+pub fn mark_served_metadata(proven: &mut ProvenWitness) {
+    let derivable: HashSet<String> = proven
+        .contracts
+        .iter()
+        .map(|c| c.contract.to_string())
+        .collect();
+    for ((query, _), proof) in proven.witness.store.iter().zip(proven.store.iter_mut()) {
+        if let StoreQuery::Metadata { contract, .. } = query {
+            if !derivable.contains(contract) {
+                *proof = StoreProof::Served;
+            }
         }
     }
-    Ok(ordered)
 }
 
 // ---------------------------------------------------------------------------
@@ -943,20 +1084,23 @@ pub fn prove_contracts(
 /// The client's bundled source for a boot contract, and the Clarity version
 /// its epoch transition pins (`None`: the epoch default). Mirrors
 /// `StacksChainState::instantiate_boot_code` and the
-/// `ClarityBlockConnection::initialize_epoch_*` transitions.
-fn boot_contract_source(
+/// `ClarityBlockConnection::initialize_epoch_*` transitions. `sip-031` and
+/// `pox-5` bodies are generated per network (on testnet from node config, so
+/// a testnet client must match the node's settings).
+pub fn boot_contract_source(
     contract: &QualifiedContractIdentifier,
     mainnet: bool,
-) -> Option<(&'static str, Option<ClarityVersion>)> {
+) -> Option<(String, Option<ClarityVersion>)> {
     if contract.issuer != boot_code_addr(mainnet).into() {
         return None;
     }
-    let pick = |main: &'static str, test: &'static str| if mainnet { main } else { test };
+    let pick = |main: &str, test: &str| if mainnet { main } else { test }.to_string();
     let v2 = Some(ClarityVersion::Clarity2);
-    Some(match contract.name.as_str() {
+    let name = contract.name.as_str();
+    Some(match name {
         "pox" => (pick(&BOOT_CODE_POX_MAINNET, &BOOT_CODE_POX_TESTNET), None),
-        "lockup" => (BOOT_CODE_LOCKUP, None),
-        COSTS_1_NAME => (BOOT_CODE_COSTS, None),
+        "lockup" => (BOOT_CODE_LOCKUP.into(), None),
+        COSTS_1_NAME => (BOOT_CODE_COSTS.into(), None),
         "cost-voting" => (
             pick(
                 BOOT_CODE_COST_VOTING_MAINNET,
@@ -964,18 +1108,36 @@ fn boot_contract_source(
             ),
             None,
         ),
-        "bns" => (BOOT_CODE_BNS, None),
-        "genesis" => (BOOT_CODE_GENESIS, None),
+        "bns" => (BOOT_CODE_BNS.into(), None),
+        "genesis" => (BOOT_CODE_GENESIS.into(), None),
         COSTS_2_NAME => (pick(BOOT_CODE_COSTS_2, BOOT_CODE_COSTS_2_TESTNET), None),
         POX_2_NAME => (pick(&POX_2_MAINNET_CODE, &POX_2_TESTNET_CODE), v2),
-        COSTS_3_NAME => (BOOT_CODE_COSTS_3, None),
+        COSTS_3_NAME => (BOOT_CODE_COSTS_3.into(), None),
         POX_3_NAME => (pick(&POX_3_MAINNET_CODE, &POX_3_TESTNET_CODE), v2),
-        POX_4_NAME => (&POX_4_CODE, v2),
-        SIGNERS_NAME => (SIGNERS_BODY, v2),
-        SIGNERS_VOTING_NAME => (SIGNERS_VOTING_BODY, v2),
-        COSTS_4_NAME => (BOOT_CODE_COSTS_4, None),
-        _ => return None,
+        POX_4_NAME => (POX_4_CODE.to_string(), v2),
+        SIGNERS_NAME => (SIGNERS_BODY.into(), v2),
+        SIGNERS_VOTING_NAME => (SIGNERS_VOTING_BODY.into(), v2),
+        SIP_031_NAME => (make_sip_031_body(mainnet), Some(ClarityVersion::Clarity3)),
+        COSTS_4_NAME => (BOOT_CODE_COSTS_4.into(), None),
+        POX_5_NAME => (make_pox_5_body(mainnet), Some(ClarityVersion::Clarity6)),
+        _ => (signers_db_body(name)?.into(), v2),
     })
+}
+
+/// `signers-<0|1>-<message id>`: the signer StackerDB contracts epoch 2.5
+/// deploys (`NakamotoSigners::make_signers_db_name`).
+fn signers_db_body(name: &str) -> Option<&'static str> {
+    let rest = name.strip_prefix(SIGNERS_NAME)?.strip_prefix('-')?;
+    let (set, message_id) = rest.split_once('-')?;
+    let message_id: u32 = message_id.parse().ok()?;
+    if message_id >= SIGNER_SLOTS_PER_USER || message_id.to_string() != rest[2..] {
+        return None;
+    }
+    match set {
+        "0" => Some(SIGNERS_DB_0_BODY),
+        "1" => Some(SIGNERS_DB_1_BODY),
+        _ => None,
+    }
 }
 
 /// The synthetic transaction a boot contract is deployed with.
@@ -992,7 +1154,7 @@ fn boot_deploy_tx(
     let payload = TransactionPayload::SmartContract(
         TransactionSmartContract {
             name: ContractName::try_from(contract.name.to_string()).ok()?,
-            code_body: StacksString::from_str(code)?,
+            code_body: StacksString::from_str(&code)?,
         },
         clarity_version,
     );
@@ -1010,7 +1172,8 @@ enum Rederive {
     Invalid(String),
 }
 
-/// Check one contract's evidence and re-derive its metadata.
+/// Check one contract's evidence against the header chain and re-derive its
+/// metadata.
 fn rederive(
     evidence: &ContractEvidence,
     headers: &HeaderChain,
@@ -1033,15 +1196,6 @@ fn rederive(
     ) {
         return Err(invalid("commitment proof fails".into()));
     }
-    let commitment = ContractCommitment::deserialize(&evidence.commitment)
-        .map_err(|e| invalid(format!("bad commitment: {e:?}")))?;
-    if commitment.block_height != header.height {
-        return Err(invalid(format!(
-            "commitment height {} is not the deploy block's {}",
-            commitment.block_height, header.height
-        )));
-    }
-
     // the epoch the deploy ran in
     if !evidence.epoch_key_proof.holds(
         &TrieHash::from_key(EPOCH_VERSION_KEY),
@@ -1055,44 +1209,95 @@ fn rederive(
     ) {
         return Err(invalid("epoch proof fails".into()));
     }
-    let epoch = match evidence.epoch_key.as_deref() {
-        None => StacksEpochId::Epoch20,
-        Some(v) => {
-            let id = u32::deserialize(v).map_err(|e| invalid(format!("bad epoch: {e:?}")))?;
-            StacksEpochId::try_from(id).map_err(|_| invalid(format!("bad epoch {id}")))?
+    if let DeploySource::Tx(inclusion) = &evidence.source {
+        if !inclusion.holds(headers) {
+            return Err(invalid("deploy tx is not in the deploy block".into()));
         }
-    };
+    }
+    let deploy = Deploy::of(evidence, net)?;
+    if deploy.commitment.block_height != header.height {
+        return Err(invalid(format!(
+            "commitment height {} is not the deploy block's {}",
+            deploy.commitment.block_height, header.height
+        )));
+    }
+    deploy.derive(evidence, net, known)
+}
 
-    // the source
-    let tx = match &evidence.source {
-        DeploySource::Tx(inclusion) => {
-            if inclusion.block != evidence.block || !inclusion.holds(headers) {
-                return Err(invalid("deploy tx is not in the deploy block".into()));
+/// Re-derive a contract's metadata from evidence the caller produced itself
+/// (the prover: no proofs checked).
+fn rederive_unchecked(
+    evidence: &ContractEvidence,
+    net: &NetworkParams,
+    known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
+) -> Result<(Sha512Trunc256Sum, ContractMetadata), Rederive> {
+    Deploy::of(evidence, net)?.derive(evidence, net, known)
+}
+
+/// The deploy a contract's evidence describes.
+struct Deploy {
+    tx: StacksTransaction,
+    commitment: ContractCommitment,
+    epoch: StacksEpochId,
+}
+
+impl Deploy {
+    /// Parse the evidence and require the source to hash to the commitment.
+    fn of(evidence: &ContractEvidence, net: &NetworkParams) -> Result<Self, Rederive> {
+        let invalid = |s: String| Rederive::Invalid(s);
+        let commitment = ContractCommitment::deserialize(&evidence.commitment)
+            .map_err(|e| invalid(format!("bad commitment: {e:?}")))?;
+        let epoch = match evidence.epoch_key.as_deref() {
+            None => StacksEpochId::Epoch20,
+            Some(v) => {
+                let id = u32::deserialize(v).map_err(|e| invalid(format!("bad epoch: {e:?}")))?;
+                StacksEpochId::try_from(id).map_err(|_| invalid(format!("bad epoch {id}")))?
             }
-            inclusion.tx.clone()
+        };
+        let tx = match &evidence.source {
+            DeploySource::Tx(inclusion) => {
+                if inclusion.block != evidence.block {
+                    return Err(invalid("deploy tx is not in the deploy block".into()));
+                }
+                inclusion.tx.clone()
+            }
+            DeploySource::Boot => boot_deploy_tx(&evidence.contract, net)
+                .ok_or_else(|| invalid("no bundled source for this boot contract".into()))?,
+        };
+        let TransactionPayload::SmartContract(ref payload, _) = tx.payload else {
+            return Err(invalid("deploy tx is not a contract deploy".into()));
+        };
+        let hash = Sha512Trunc256Sum::from_data(payload.code_body.to_string().as_bytes());
+        if hash != commitment.hash {
+            return Err(invalid("source does not hash to the commitment".into()));
         }
-        DeploySource::Boot => boot_deploy_tx(&evidence.contract, net)
-            .ok_or_else(|| invalid("no bundled source for this boot contract".into()))?,
-    };
-    let TransactionPayload::SmartContract(ref payload, _) = tx.payload else {
-        return Err(invalid("deploy tx is not a contract deploy".into()));
-    };
-    let hash = Sha512Trunc256Sum::from_data(payload.code_body.to_string().as_bytes());
-    if hash != commitment.hash {
-        return Err(invalid("source does not hash to the commitment".into()));
+        Ok(Deploy {
+            tx,
+            commitment,
+            epoch,
+        })
     }
 
-    let deploy = ContractDeployment {
-        tx: &tx,
-        height: header.height,
-        epoch,
-        epoch_key: evidence.epoch_key.clone(),
-    };
-    match derive_contract_metadata(&deploy, known, net.mainnet, net.chain_id) {
-        Ok((id, rows)) if id == evidence.contract => Ok((hash, rows)),
-        Ok((id, _)) => Err(invalid(format!("deploy tx deploys {id}"))),
-        Err(StatelessError::WitnessIncomplete(missing)) => Err(Rederive::Missing(missing)),
-        Err(StatelessError::Block(e)) => Err(invalid(format!("deploy failed: {e:?}"))),
+    fn derive(
+        &self,
+        evidence: &ContractEvidence,
+        net: &NetworkParams,
+        known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
+    ) -> Result<(Sha512Trunc256Sum, ContractMetadata), Rederive> {
+        let deploy = ContractDeployment {
+            tx: &self.tx,
+            height: self.commitment.block_height,
+            epoch: self.epoch,
+            epoch_key: evidence.epoch_key.clone(),
+        };
+        match derive_contract_metadata(&deploy, known, net.mainnet, net.chain_id) {
+            Ok((id, rows)) if id == evidence.contract => Ok((self.commitment.hash.clone(), rows)),
+            Ok((id, _)) => Err(Rederive::Invalid(format!("deploy tx deploys {id}"))),
+            Err(StatelessError::WitnessIncomplete(missing)) => Err(Rederive::Missing(missing)),
+            Err(StatelessError::Block(e)) => {
+                Err(Rederive::Invalid(format!("deploy failed: {e:?}")))
+            }
+        }
     }
 }
 
@@ -1227,6 +1432,35 @@ pub fn verify_read_witness(
     trusted: &TrustedState,
     proven: &ProvenWitness,
 ) -> Result<(), Rejection> {
+    match check_read_witness(block, txs, trusted, proven)
+        .into_iter()
+        .next()
+    {
+        Some(rejection) => Err(rejection),
+        None => Ok(()),
+    }
+}
+
+/// [`verify_read_witness`], reporting every entry that fails rather than the
+/// first (a block, its parent, burn view or epoch that fails stops it).
+pub fn check_read_witness(
+    block: &StacksBlockId,
+    txs: &[StacksTransaction],
+    trusted: &TrustedState,
+    proven: &ProvenWitness,
+) -> Vec<Rejection> {
+    match check_block_context(block, txs, trusted, proven) {
+        Ok(rejections) => rejections,
+        Err(rejection) => vec![rejection],
+    }
+}
+
+fn check_block_context(
+    block: &StacksBlockId,
+    txs: &[StacksTransaction],
+    trusted: &TrustedState,
+    proven: &ProvenWitness,
+) -> Result<Vec<Rejection>, Rejection> {
     let TrustedState {
         headers,
         bitcoin,
@@ -1271,18 +1505,20 @@ pub fn verify_read_witness(
             "not the epoch of the parent's burn block",
         ));
     }
-
-    // store entries
     if proven.store.len() != witness.store.len() {
         return Err(reject("store", "one proof per store entry"));
     }
+
+    let mut rejections = vec![];
+    // store entries
     for ((query, answer), proof) in witness.store.iter().zip(proven.store.iter()) {
-        verify_store_entry(query, answer, proof, witness, &parent.id, headers)
-            .map_err(|e| reject(query, e))?;
+        if let Err(e) = verify_store_entry(query, answer, proof, witness, &parent.id, headers) {
+            rejections.push(reject(query, e));
+        }
     }
 
     // contract metadata
-    verify_metadata(witness, proven, &parent.id, headers, net)?;
+    rejections.extend(verify_metadata(witness, proven, &parent.id, headers, net));
 
     // environment lookups
     let ctx = EnvContext {
@@ -1294,9 +1530,11 @@ pub fn verify_read_witness(
         view_height: view_block.height,
     };
     for read in witness.env.iter() {
-        verify_env(read, &ctx).map_err(|e| reject(read, e))?;
+        if let Err(e) = verify_env(read, &ctx) {
+            rejections.push(reject(read, e));
+        }
     }
-    Ok(())
+    Ok(rejections)
 }
 
 fn verify_store_entry(
@@ -1331,24 +1569,13 @@ fn verify_store_entry(
                 height_to_hash,
             },
         ) => {
-            let root = root_of(parent)?;
-            let height = hash_to_height.present_value();
-            let path = TrieHash::from_key(&hash_to_height_key(&target));
-            if !hash_to_height.holds(&path, height.as_ref(), &root, headers) {
-                return Err("height proof fails".into());
-            }
-            let at_height = match height {
-                Some(height) => {
-                    let path = TrieHash::from_key(&height_to_hash_key(u32::from(height)));
-                    let block = height_to_hash.present_value();
-                    if !height_to_hash.holds(&path, block.as_ref(), &root, headers) {
-                        return Err("block-at-height proof fails".into());
-                    }
-                    block
-                }
-                None => None,
-            };
-            let proven = at_height == Some(MARFValue::from(target.clone()));
+            let proven = ancestry_of(
+                &target,
+                hash_to_height,
+                height_to_hash,
+                &root_of(parent)?,
+                headers,
+            )?;
             if proven == is {
                 Ok(())
             } else {
@@ -1363,74 +1590,181 @@ fn verify_store_entry(
             }
         }
         (Claim::Metadata, StoreProof::Rederived) => Ok(()),
+        (Claim::Metadata, StoreProof::Served) => {
+            Err("not provable yet: its contract is not re-derivable from its deploy alone".into())
+        }
         _ => Err("wrong kind of proof".into()),
     }
 }
 
+/// Check [`prove_ancestry`]'s proofs against the parent's root and return
+/// whether they show `target` is an ancestor.
+fn ancestry_of(
+    target: &StacksBlockId,
+    hash_to_height: &MarfProof,
+    height_to_hash: &MarfProof,
+    parent_root: &TrieHash,
+    headers: &HeaderChain,
+) -> Result<bool, String> {
+    let height = hash_to_height.present_value();
+    let path = TrieHash::from_key(&hash_to_height_key(target));
+    if !hash_to_height.holds(&path, height.as_ref(), parent_root, headers) {
+        return Err("height proof fails".into());
+    }
+    let Some(height) = height else {
+        return Ok(false);
+    };
+    let path = TrieHash::from_key(&height_to_hash_key(u32::from(height)));
+    let block = height_to_hash.present_value();
+    if !height_to_hash.holds(&path, block.as_ref(), parent_root, headers) {
+        return Err("block-at-height proof fails".into());
+    }
+    Ok(block == Some(MARFValue::from(target.clone())))
+}
+
+/// Contract metadata re-derived from evidence: rows by contract, and the
+/// block each contract was deployed in.
+struct Rederived {
+    rows: HashMap<String, ContractMetadata>,
+    deployed_in: HashMap<String, StacksBlockId>,
+}
+
+/// Check every contract's evidence (deploy block an ancestor of the parent,
+/// commitment, epoch, source) and re-derive its metadata, dependencies first.
+/// A contract that fails is rejected and left out (so are contracts that
+/// depend on it).
+fn rederive_contracts(
+    proven: &ProvenWitness,
+    parent: &StacksBlockId,
+    headers: &HeaderChain,
+    net: &NetworkParams,
+) -> (Rederived, Vec<Rejection>) {
+    let mut known = HashMap::new();
+    let mut deployed_in = HashMap::new();
+    let mut rejections = vec![];
+    let parent_root = headers.get(parent).map(|h| h.state_index_root);
+    for evidence in proven.contracts.iter() {
+        let checked = (|| {
+            let parent_root = parent_root.ok_or("unknown parent")?;
+            let is_ancestor = match &evidence.ancestry {
+                None => &evidence.block == parent,
+                Some((hash_to_height, height_to_hash)) => ancestry_of(
+                    &evidence.block,
+                    hash_to_height,
+                    height_to_hash,
+                    &parent_root,
+                    headers,
+                )?,
+            };
+            if !is_ancestor {
+                return Err("deploy block is not an ancestor".to_string());
+            }
+            match rederive(evidence, headers, net, &known) {
+                Ok(derived) => Ok(derived),
+                Err(Rederive::Missing(missing)) => Err(format!(
+                    "not re-derivable from its deploy alone: {missing:?}"
+                )),
+                Err(Rederive::Invalid(e)) => Err(e),
+            }
+        })();
+        match checked {
+            Ok(derived) => {
+                known.insert(evidence.contract.clone(), derived);
+                deployed_in.insert(evidence.contract.to_string(), evidence.block.clone());
+            }
+            Err(e) => rejections.push(reject(&evidence.contract, e)),
+        }
+    }
+    let rows = known
+        .into_iter()
+        .map(|(id, (_, rows))| (id.to_string(), rows))
+        .collect();
+    (Rederived { rows, deployed_in }, rejections)
+}
+
+/// The re-derived answer to a metadata entry.
+fn rederived_answer(
+    query: &StoreQuery,
+    rederived: &Rederived,
+) -> Result<Option<String>, Rejection> {
+    let StoreQuery::Metadata {
+        block,
+        contract,
+        key,
+    } = query
+    else {
+        return Err(reject(query, "not a metadata entry"));
+    };
+    let (Some(rows), Some(deployed)) = (
+        rederived.rows.get(contract),
+        rederived.deployed_in.get(contract),
+    ) else {
+        return Err(reject(query, "contract not re-derived"));
+    };
+    if deployed != block {
+        return Err(reject(
+            query,
+            format!("contract was deployed in {deployed}"),
+        ));
+    }
+    Ok(rows.get(key).cloned())
+}
+
 /// Re-derive every contract in `proven.contracts` and require each metadata
-/// read to match its re-derivation.
+/// read proven by re-derivation to match it.
 fn verify_metadata(
     witness: &ReadWitness,
     proven: &ProvenWitness,
     parent: &StacksBlockId,
     headers: &HeaderChain,
     net: &NetworkParams,
-) -> Result<(), Rejection> {
-    let mut known = HashMap::new();
-    let mut deployed_in = HashMap::new();
-    for evidence in proven.contracts.iter() {
-        if !headers.is_ancestor(&evidence.block, parent) {
-            return Err(reject(
-                &evidence.contract,
-                "deploy block is not an ancestor",
-            ));
-        }
-        match rederive(evidence, headers, net, &known) {
-            Ok(derived) => {
-                known.insert(evidence.contract.clone(), derived);
-                deployed_in.insert(evidence.contract.to_string(), evidence.block.clone());
-            }
-            Err(Rederive::Missing(missing)) => {
-                return Err(reject(
-                    &evidence.contract,
-                    format!("not re-derivable from its deploy alone: {missing:?}"),
-                ))
-            }
-            Err(Rederive::Invalid(e)) => return Err(reject(&evidence.contract, e)),
-        }
-    }
-    let rows: HashMap<String, &ContractMetadata> = known
-        .iter()
-        .map(|(id, (_, rows))| (id.to_string(), rows))
-        .collect();
-    for (query, answer) in witness.store.iter() {
-        let StoreQuery::Metadata {
-            block,
-            contract,
-            key,
-        } = query
-        else {
+) -> Vec<Rejection> {
+    let (rederived, mut rejections) = rederive_contracts(proven, parent, headers, net);
+    for ((query, answer), proof) in witness.store.iter().zip(proven.store.iter()) {
+        if !matches!(query, StoreQuery::Metadata { .. }) || !matches!(proof, StoreProof::Rederived)
+        {
             continue;
-        };
-        let (Some(rows), Some(deployed)) = (rows.get(contract), deployed_in.get(contract)) else {
-            return Err(reject(query, "contract not re-derived"));
-        };
-        if deployed != block {
-            return Err(reject(
-                query,
-                format!("contract was deployed in {deployed}"),
-            ));
         }
-        let ok = match (answer, rows.get(key)) {
-            (Some(read), Some(derived)) => same_metadata(read, derived),
-            (None, None) => true,
-            _ => false,
+        let ok = match rederived_answer(query, &rederived) {
+            Ok(derived) => match (answer, derived) {
+                (Some(read), Some(derived)) => same_metadata(read, &derived),
+                (None, None) => true,
+                _ => false,
+            },
+            Err(rejection) => {
+                rejections.push(rejection);
+                continue;
+            }
         };
         if !ok {
-            return Err(reject(query, "metadata differs from its re-derivation"));
+            rejections.push(reject(query, "metadata differs from its re-derivation"));
         }
     }
-    Ok(())
+    rejections
+}
+
+/// Fill every re-derivable metadata entry's answer from its re-derivation. A
+/// served witness leaves those values out (they are ~95% of a plain
+/// witness), so a client calls this before [`verify_read_witness`] (which
+/// checks the contract evidence and reports what did not re-derive) and
+/// re-execution.
+pub fn fill_rederived_metadata(
+    proven: &mut ProvenWitness,
+    block: &StacksBlockId,
+    headers: &HeaderChain,
+    net: &NetworkParams,
+) {
+    let Some(parent) = headers.get(block).map(|h| h.parent.clone()) else {
+        return;
+    };
+    let (rederived, _) = rederive_contracts(proven, &parent, headers, net);
+    for ((query, answer), proof) in proven.witness.store.iter_mut().zip(proven.store.iter()) {
+        if matches!(proof, StoreProof::Rederived) {
+            if let Ok(derived) = rederived_answer(query, &rederived) {
+                *answer = derived;
+            }
+        }
+    }
 }
 
 /// The consensus hash of `block`'s burn view: its own tenure change, else the
@@ -1613,4 +1947,100 @@ fn tenure_vrf_proof(ch: &ConsensusHash, ctx: &EnvContext) -> Result<Option<VRFPr
         }
     }
     Err(format!("no coinbase proof for tenure {ch}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use clarity::vm::database::ClaritySerializable;
+    use stacks_common::consts::CHAIN_ID_MAINNET;
+
+    use super::*;
+    use crate::chainstate::nakamoto::signer_set::NakamotoSigners;
+    use crate::clarity_vm::witness_client::ClientParams;
+    use crate::util_lib::boot::boot_code_id;
+
+    /// Every mainnet boot contract re-derives from its bundled source in the
+    /// epoch whose transition deploys it, given the boot contracts before it,
+    /// except two. `signers-voting` stores a constant read from `pox-4` state
+    /// at deploy time (`pox-info`), so it needs the deploy block's own witness
+    /// (`NOTES.md`, gap 4). `pox-5` needs the user-deployed sBTC token first.
+    #[test]
+    fn mainnet_boot_contracts_rederive_from_bundled_sources() {
+        use StacksEpochId::*;
+        let net = ClientParams::mainnet().net;
+        let mut deploys: Vec<(String, StacksEpochId)> = [
+            ("pox", Epoch20),
+            ("lockup", Epoch20),
+            ("costs", Epoch20),
+            ("cost-voting", Epoch20),
+            ("bns", Epoch20),
+            ("genesis", Epoch20),
+            ("costs-2", Epoch2_05),
+            ("pox-2", Epoch21),
+            ("costs-3", Epoch21),
+            ("pox-3", Epoch24),
+            ("pox-4", Epoch25),
+            ("signers", Epoch25),
+        ]
+        .iter()
+        .map(|(name, epoch)| (name.to_string(), *epoch))
+        .collect();
+        for set in 0..2 {
+            for message_id in 0..SIGNER_SLOTS_PER_USER {
+                let name = NakamotoSigners::make_signers_db_name(set, message_id);
+                deploys.push((name, Epoch25));
+            }
+        }
+        deploys.extend([
+            ("sip-031".to_string(), Epoch32),
+            ("costs-4".to_string(), Epoch33),
+        ]);
+
+        let mut known = HashMap::new();
+        let deploy_with = |name: &str, epoch: StacksEpochId, known: &HashMap<_, _>| {
+            let id = boot_code_id(name, true);
+            let tx = boot_deploy_tx(&id, &net).unwrap_or_else(|| panic!("no source for {name}"));
+            let deploy = ContractDeployment {
+                tx: &tx,
+                height: 1,
+                epoch,
+                epoch_key: (epoch != Epoch20).then(|| (epoch as u32).serialize()),
+            };
+            let TransactionPayload::SmartContract(ref payload, _) = tx.payload else {
+                unreachable!()
+            };
+            let hash = Sha512Trunc256Sum::from_data(payload.code_body.to_string().as_bytes());
+            (
+                id,
+                hash,
+                derive_contract_metadata(&deploy, known, true, CHAIN_ID_MAINNET),
+            )
+        };
+        for (name, epoch) in deploys.iter() {
+            let (id, hash, derived) = deploy_with(name, *epoch, &known);
+            match derived {
+                Ok((derived_id, rows)) => {
+                    assert_eq!(derived_id, id);
+                    assert!(rows.contains_key("vm-metadata::9::contract"), "{name}");
+                    known.insert(id, (hash, rows));
+                }
+                Err(StatelessError::WitnessIncomplete(missing)) => {
+                    panic!("{name} needs {missing:?}")
+                }
+                Err(StatelessError::Block(e)) => panic!("{name} fails to deploy: {e:?}"),
+            }
+        }
+
+        for (name, epoch, needs) in [
+            ("signers-voting", Epoch25, "ustx_liquid_supply"),
+            ("pox-5", Epoch40, "sbtc-token"),
+        ] {
+            match deploy_with(name, epoch, &known).2 {
+                Err(StatelessError::WitnessIncomplete(missing)) => {
+                    assert!(missing.iter().any(|m| m.contains(needs)), "{missing:?}")
+                }
+                other => panic!("{name} re-derived alone: {other:?}"),
+            }
+        }
+    }
 }

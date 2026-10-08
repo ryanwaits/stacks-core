@@ -40,7 +40,9 @@
 //! decodes to none), so "absent" means "never written on this fork".
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 
+use stacks_common::codec::{read_next, write_next, Error as CodecError, StacksMessageCodec};
 use stacks_common::types::chainstate::TrieHash;
 
 use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
@@ -303,26 +305,50 @@ impl<T: MarfTrieId> TrieAbsenceProof<T> {
         TrieMerkleProof::verify_proof_chain(&self.proof, end_hash, root_hash, root_to_block)
     }
 
-    /// Encoded size in bytes (consensus encoding of every step).
+    /// Encoded size in bytes.
     pub fn byte_len(&self) -> usize {
-        use stacks_common::codec::StacksMessageCodec;
-        let mut bytes = vec![];
-        for step in self.proof.iter() {
-            step.consensus_serialize(&mut bytes)
-                .expect("write to memory");
-        }
-        let end = match &self.end {
+        self.serialize_to_vec().len()
+    }
+}
+
+const ABSENCE_END_LEAF: u8 = 0;
+const ABSENCE_END_NODE: u8 = 1;
+
+/// Wire form: an end tag (0 = leaf, 1 = node), the leaf or the node followed
+/// by its child hashes, then the walk's steps as an inclusion proof encodes
+/// them.
+impl<T: MarfTrieId> StacksMessageCodec for TrieAbsenceProof<T> {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), CodecError> {
+        match &self.end {
             AbsenceEnd::Leaf(leaf) => {
-                leaf.consensus_serialize(&mut bytes)
-                    .expect("write to memory");
-                0
+                write_next(fd, &ABSENCE_END_LEAF)?;
+                write_next(fd, leaf)?;
             }
             AbsenceEnd::Node { node, hashes } => {
-                node.consensus_serialize(&mut bytes)
-                    .expect("write to memory");
-                hashes.len() * 32
+                write_next(fd, &ABSENCE_END_NODE)?;
+                write_next(fd, node)?;
+                write_next(fd, hashes)?;
+            }
+        }
+        write_next(fd, &self.proof)
+    }
+
+    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<Self, CodecError> {
+        let end = match read_next::<u8, _>(fd)? {
+            ABSENCE_END_LEAF => AbsenceEnd::Leaf(read_next(fd)?),
+            ABSENCE_END_NODE => AbsenceEnd::Node {
+                node: read_next(fd)?,
+                hashes: read_next(fd)?,
+            },
+            tag => {
+                return Err(CodecError::DeserializeError(format!(
+                    "unknown absence end tag {tag}"
+                )))
             }
         };
-        bytes.len() + end
+        Ok(TrieAbsenceProof {
+            end,
+            proof: read_next(fd)?,
+        })
     }
 }

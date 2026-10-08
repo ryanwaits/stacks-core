@@ -97,14 +97,14 @@ const RELAY_SRC: &str = "
 /// with nested reads, prints, moves FT and STX, calls across contracts, and
 /// reads `at-block` and block info two blocks back, where `counter` was 5
 /// (it is 15 at its parent).
-pub(super) struct HistoryFixture {
-    pub(super) ledger: QualifiedContractIdentifier,
-    pub(super) snapshot: Txid,
-    pub(super) note_time: Txid,
+pub(crate) struct HistoryFixture {
+    pub(crate) ledger: QualifiedContractIdentifier,
+    pub(crate) snapshot: Txid,
+    pub(crate) note_time: Txid,
 }
 
 impl HistoryFixture {
-    pub(super) fn new() -> (Self, Vec<NakamotoBootTenure>, Vec<(PrincipalData, u64)>) {
+    pub(crate) fn new() -> (Self, Vec<NakamotoBootTenure>, Vec<(PrincipalData, u64)>) {
         let privk = StacksPrivateKey::from_seed(b"stateless-reexec");
         let sender = to_addr(&privk);
         let recipient: PrincipalData =
@@ -185,12 +185,12 @@ impl HistoryFixture {
         (fixture, tenures, vec![(sender.into(), 10_000_000)])
     }
 
-    pub(super) fn var_key(&self, var: &str) -> String {
+    pub(crate) fn var_key(&self, var: &str) -> String {
         format!("vm::{}::1::{var}", self.ledger)
     }
 }
 
-pub(super) fn boot<'a>(
+pub(crate) fn boot<'a>(
     test_name: &str,
     observer: &'a TestEventObserver,
     tenures: Vec<NakamotoBootTenure>,
@@ -206,7 +206,7 @@ pub(super) fn boot<'a>(
     peer
 }
 
-pub(super) fn block_with_tx(observer: &TestEventObserver, txid: &Txid) -> TestEventObserverBlock {
+pub(crate) fn block_with_tx(observer: &TestEventObserver, txid: &Txid) -> TestEventObserverBlock {
     observer
         .get_blocks()
         .into_iter()
@@ -221,16 +221,16 @@ pub(super) fn block_with_tx(observer: &TestEventObserver, txid: &Txid) -> TestEv
 
 /// What a client gets for a block: its transactions, its read witness, and
 /// its block-level writes.
-pub(super) struct LiveBlock {
-    pub(super) txs: Vec<StacksTransaction>,
-    pub(super) receipts: Vec<StacksTransactionReceipt>,
-    pub(super) witness: ReadWitness,
-    pub(super) writes: Vec<StateWrite>,
-    pub(super) block_level: BlockLevelWrites,
+pub(crate) struct LiveBlock {
+    pub(crate) txs: Vec<StacksTransaction>,
+    pub(crate) receipts: Vec<StacksTransactionReceipt>,
+    pub(crate) witness: ReadWitness,
+    pub(crate) writes: Vec<StateWrite>,
+    pub(crate) block_level: BlockLevelWrites,
 }
 
 impl LiveBlock {
-    pub(super) fn of(block: &TestEventObserverBlock) -> Self {
+    pub(crate) fn of(block: &TestEventObserverBlock) -> Self {
         let receipts: Vec<StacksTransactionReceipt> = block
             .receipts
             .iter()
@@ -255,7 +255,10 @@ impl LiveBlock {
         }
     }
 
-    pub(super) fn reexecute(&self, witness: &ReadWitness) -> Result<StatelessBlock, StatelessError> {
+    pub(crate) fn reexecute(
+        &self,
+        witness: &ReadWitness,
+    ) -> Result<StatelessBlock, StatelessError> {
         execute_statelessly(
             witness,
             &self.block_level,
@@ -265,7 +268,7 @@ impl LiveBlock {
         )
     }
 
-    pub(super) fn receipt(&self, txid: &Txid) -> &StacksTransactionReceipt {
+    pub(crate) fn receipt(&self, txid: &Txid) -> &StacksTransactionReceipt {
         self.receipts
             .iter()
             .find(|r| &r.transaction.txid() == txid)
@@ -273,7 +276,7 @@ impl LiveBlock {
     }
 }
 
-pub(super) fn receipt_of<'r>(
+pub(crate) fn receipt_of<'r>(
     receipts: &'r [StacksTransactionReceipt],
     txid: &Txid,
 ) -> &'r StacksTransactionReceipt {
@@ -291,7 +294,7 @@ fn last_values(writes: &[StateWrite]) -> HashMap<String, String> {
         .collect()
 }
 
-pub(super) fn tamper_store(witness: &mut ReadWitness, query: &StoreQuery, value: Option<String>) {
+pub(crate) fn tamper_store(witness: &mut ReadWitness, query: &StoreQuery, value: Option<String>) {
     let entry = witness
         .store
         .iter_mut()
@@ -300,7 +303,7 @@ pub(super) fn tamper_store(witness: &mut ReadWitness, query: &StoreQuery, value:
     entry.1 = value;
 }
 
-pub(super) fn uint_hex(n: u128) -> String {
+pub(crate) fn uint_hex(n: u128) -> String {
     Value::UInt(n).serialize_to_hex().unwrap()
 }
 
@@ -658,7 +661,9 @@ fn block_replay_records_the_live_read_witness() {
     peer.chain.sortdb = Some(sortdb);
     peer.chain.stacks_node = Some(node);
 
-    let replayed = replayed.read_witness.expect("replay recorded a witness");
+    let replayed = replayed
+        .recorded_witness
+        .expect("replay recorded a witness");
     assert_eq!(replayed, live.witness);
 
     let out = live
