@@ -44,6 +44,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::time::Instant;
 
 use clarity::vm::database::clarity_store::{make_contract_hash_key, ContractCommitment};
 use clarity::vm::database::{ClarityDeserializable, SqliteConnection};
@@ -862,7 +863,15 @@ pub fn prove_store_reads(
     witness: &ReadWitness,
 ) -> Result<Vec<StoreProof>, String> {
     let mut proofs = vec![];
-    for (query, answer) in witness.store.iter() {
+    let started = Instant::now();
+    for (i, (query, answer)) in witness.store.iter().enumerate() {
+        if i > 0 && i % 1000 == 0 {
+            info!(
+                "Witness: proved {i} of {} store entries in {:?}",
+                witness.store.len(),
+                started.elapsed()
+            );
+        }
         let claim = claim_of(query, answer, witness, parent, |at| {
             MARF::get_block_height_miner_tip(conn, at, at)
                 .ok()

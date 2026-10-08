@@ -34,7 +34,7 @@ use stackslib::burnchains::PoxConstants;
 use stackslib::chainstate::burn::db::sortdb::SortitionDB;
 use stackslib::chainstate::nakamoto::NakamotoBlock;
 use stackslib::chainstate::stacks::db::StacksChainState;
-use stackslib::clarity_vm::witness_client::{ClientParams, check_replayed_block};
+use stackslib::clarity_vm::witness_client::{ClientParams, check_replayed_block, event_rows};
 use stackslib::net::api::blockreplay::{
     RPCNakamotoBlockReplayRequestHandler, RPCReplayedBlock, ReplayTrace,
 };
@@ -59,6 +59,10 @@ struct Args {
     /// replay response still round-trips through its JSON.
     #[arg(long)]
     chainstate: Option<PathBuf>,
+    /// Write the re-executed events here, one JSON object per line (txid,
+    /// event_index, type, contract_id, topic, value_hex, value_repr, event)
+    #[arg(long)]
+    events_out: Option<PathBuf>,
 }
 
 fn get(
@@ -131,9 +135,15 @@ fn fetch_local(dir: &Path, block_id: &StacksBlockId) -> Result<(Vec<u8>, Vec<u8>
         state_writes: false,
         read_witness: true,
     };
+    eprintln!(
+        "replay: {} txs in process, then prove the read witness",
+        block.txs().count()
+    );
+    let started = Instant::now();
     let replay = handler
         .block_replay(&sortdb, &mut chainstate)
         .map_err(|e| format!("replay: {e}"))?;
+    eprintln!("replay: replayed and proved in {:?}", started.elapsed());
     let replay = serde_json::to_vec(&replay).map_err(|e| e.to_string())?;
     Ok((block.serialize_to_vec(), replay))
 }
@@ -145,10 +155,17 @@ fn run(args: &Args) -> Result<bool, String> {
     let started = Instant::now();
     let (block_bytes, replay_bytes) = match (&args.node, &args.chainstate) {
         (_, Some(dir)) => fetch_local(dir, &block_id)?,
-        (Some(node), None) => fetch_rpc(node, args.auth.as_deref(), &block_id)?,
+        (Some(node), None) => {
+            eprintln!("fetch: block and replay with read witness from {node}");
+            fetch_rpc(node, args.auth.as_deref(), &block_id)?
+        }
         (None, None) => return Err("--node or --chainstate".into()),
     };
     let fetched = started.elapsed();
+    eprintln!(
+        "fetch: {} bytes in {fetched:?}; verify, re-execute, compare",
+        block_bytes.len() + replay_bytes.len()
+    );
     let block = NakamotoBlock::consensus_deserialize(&mut &block_bytes[..])
         .map_err(|e| format!("block does not decode: {e:?}"))?;
     let replay: RPCReplayedBlock = serde_json::from_slice(&replay_bytes)
@@ -157,6 +174,21 @@ fn run(args: &Args) -> Result<bool, String> {
     let started = Instant::now();
     let report = check_replayed_block(&block_id, &block, &replay, &ClientParams::mainnet());
     println!("{report}");
+    if let Some(path) = &args.events_out {
+        let rows = event_rows(&report.receipts);
+        let mut out = String::new();
+        for row in rows.iter() {
+            out.push_str(&row.to_string());
+            out.push('\n');
+        }
+        std::fs::write(path, out).map_err(|e| format!("{}: {e}", path.display()))?;
+        eprintln!(
+            "events: {} from {} re-executed receipts written to {}",
+            rows.len(),
+            report.receipts.len(),
+            path.display()
+        );
+    }
     println!(
         "block {} bytes + replay {} bytes, fetched in {:?}; verified and re-executed in {:?}",
         block_bytes.len(),

@@ -25,7 +25,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::time::Instant;
 
+use clarity::vm::events::{FTEventType, NFTEventType, StacksTransactionEvent};
 use stacks_common::consts::CHAIN_ID_MAINNET;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash, Txid};
 use stacks_common::util::hash::{hex_bytes, Sha512Trunc256Sum};
@@ -33,6 +35,7 @@ use stacks_common::util::hash::{hex_bytes, Sha512Trunc256Sum};
 use crate::burnchains::PoxConstants;
 use crate::chainstate::nakamoto::NakamotoBlock;
 use crate::chainstate::stacks::db::StacksBlockHeaderTypes;
+use crate::chainstate::stacks::events::StacksTransactionReceipt;
 use crate::chainstate::stacks::index::MARFValue;
 use crate::clarity_vm::read_witness::{EnvQuery, StoreQuery};
 use crate::clarity_vm::state_writes::StateWrite;
@@ -102,6 +105,8 @@ pub struct Report {
     pub checks: Vec<Check>,
     /// Verified witness entries by kind.
     pub entries: BTreeMap<&'static str, usize>,
+    /// The re-executed receipts, if re-execution ran.
+    pub receipts: Vec<StacksTransactionReceipt>,
 }
 
 impl Report {
@@ -249,6 +254,58 @@ fn block_level(writes: &[StateWrite], txids: &HashSet<Txid>) -> Result<BlockLeve
     Ok(BlockLevelWrites::split(writes, txids))
 }
 
+/// One row per event of `receipts` (committed ones only, as `/new_block`
+/// emits them), for diffing against an indexer's events: txid, event index,
+/// type, contract id (the emitting contract, or the asset's for FT/NFT
+/// events), topic, Clarity value as consensus hex and as repr, and the event
+/// as `/new_block` serializes it.
+pub fn event_rows(receipts: &[StacksTransactionReceipt]) -> Vec<serde_json::Value> {
+    let mut rows = vec![];
+    for receipt in receipts.iter() {
+        let txid = receipt.transaction.txid();
+        for (event_index, event) in receipt_events(receipt).into_iter().enumerate() {
+            let typed = &receipt.events[event_index];
+            let (contract_id, topic, value) = match typed {
+                StacksTransactionEvent::SmartContractEvent(e) => (
+                    Some(e.key.0.to_string()),
+                    Some(e.key.1.clone()),
+                    Some(&e.value),
+                ),
+                StacksTransactionEvent::NFTEvent(NFTEventType::NFTTransferEvent(e)) => {
+                    (Some(e.asset_identifier.to_string()), None, Some(&e.value))
+                }
+                StacksTransactionEvent::NFTEvent(NFTEventType::NFTMintEvent(e)) => {
+                    (Some(e.asset_identifier.to_string()), None, Some(&e.value))
+                }
+                StacksTransactionEvent::NFTEvent(NFTEventType::NFTBurnEvent(e)) => {
+                    (Some(e.asset_identifier.to_string()), None, Some(&e.value))
+                }
+                StacksTransactionEvent::FTEvent(FTEventType::FTTransferEvent(e)) => {
+                    (Some(e.asset_identifier.to_string()), None, None)
+                }
+                StacksTransactionEvent::FTEvent(FTEventType::FTMintEvent(e)) => {
+                    (Some(e.asset_identifier.to_string()), None, None)
+                }
+                StacksTransactionEvent::FTEvent(FTEventType::FTBurnEvent(e)) => {
+                    (Some(e.asset_identifier.to_string()), None, None)
+                }
+                StacksTransactionEvent::STXEvent(_) => (None, None, None),
+            };
+            rows.push(serde_json::json!({
+                "txid": format!("0x{txid}"),
+                "event_index": event_index,
+                "type": event["type"],
+                "contract_id": contract_id,
+                "topic": topic,
+                "value_hex": value.map(|v| v.serialize_to_hex().map(|h| format!("0x{h}")).ok()),
+                "value_repr": value.map(|v| v.to_string()),
+                "event": event,
+            }));
+        }
+    }
+    rows
+}
+
 /// Count of `print` events in a transaction's serialized events.
 fn prints(events: &[serde_json::Value]) -> usize {
     events
@@ -340,8 +397,20 @@ pub fn check_replayed_block(
         bitcoin: &bitcoin,
         net,
     };
+    let started = Instant::now();
+    info!(
+        "Client: verifying {} store entries, {} lookups, {} contracts",
+        proven.witness.store.len(),
+        proven.witness.env.len(),
+        proven.contracts.len()
+    );
     fill_rederived_metadata(&mut proven, &block_id, &headers, net);
     let rejections = check_read_witness(&block_id, &block.txs, &trusted, &proven);
+    info!(
+        "Client: verified in {:?}, {} rejected",
+        started.elapsed(),
+        rejections.len()
+    );
     let witness = &proven.witness;
     for ((query, _), proof) in witness.store.iter().zip(proven.store.iter()) {
         *report.entries.entry(store_kind(query, proof)).or_default() += 1;
@@ -389,6 +458,11 @@ pub fn check_replayed_block(
         Ok(levels) => levels,
         Err(e) => return report.fail("re-execute", e),
     };
+    let started = Instant::now();
+    info!(
+        "Client: re-executing {} txs from the witness",
+        block.txs.len()
+    );
     let out = match execute_statelessly(witness, &levels, block.txs(), net.mainnet, net.chain_id) {
         Ok(out) => out,
         Err(StatelessError::WitnessIncomplete(missing)) => {
@@ -398,6 +472,8 @@ pub fn check_replayed_block(
             return report.fail("re-execute", format!("block fails: {e:?}"))
         }
     };
+    info!("Client: re-executed in {:?}", started.elapsed());
+    report.receipts = out.receipts.clone();
     report.pass(
         "re-execute",
         format!(
@@ -405,6 +481,13 @@ pub fn check_replayed_block(
             out.receipts.len(),
             out.writes.len()
         ),
+    );
+    let started = Instant::now();
+    info!(
+        "Client: comparing {} writes and {} receipts, checking {} write proofs",
+        out.writes.len(),
+        out.receipts.len(),
+        served.writes.len()
     );
 
     // writes: the transactions' own, against the replay's
@@ -521,5 +604,6 @@ pub fn check_replayed_block(
         }
         report.pass("vm_events", format!("{} = replay vm_events", ours.len()));
     }
+    info!("Client: compared in {:?}", started.elapsed());
     report
 }

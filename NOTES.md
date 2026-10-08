@@ -408,6 +408,29 @@ Plus all phase 1/2a tests (40 witness, replay and absence tests pass). Fix found
 
 Size: the history fixture's envelope is 2.4 MB of JSON (35 entries, 10 write proofs, per-entry proofs, hex). Per-entry MARF proofs dominate (phase 2a: ~26 KB each, 5.5x smaller as a multiproof). A mainnet block with hundreds of entries and deeper tries will likely be tens of MB. Fine for a scratch run; the multiproof is the fix.
 
+## Proving cost (lookup memo)
+
+First mainnet run (block 1,113,075, `sbtc-yield-rewards-v3`, 1,239 store entries, 408 write proofs): VERIFIED, but replay plus proving took 1,413 s. Replay itself is ~50 s; the rest was proving.
+
+- **Why.** Every back-pointer a proof's walk crosses gets a shunt proof. Each hop of a shunt recomputes that trie's skip-list ancestor hashes: ~20 `block at height` lookups, each 2 MARF walks on disk. Nothing was reused across keys.
+- **Fix.** An opt-in `LookupMemo` on the trie storage (`index/storage.rs`). It memoizes ancestor hashes per trie, block heights, and blocks at a height. All of these are pure functions of committed tries. It is consulted only while no trie is being extended, so the node's own processing never sees it. `serve_witness` turns it on for one call and drops it afterwards.
+- **Anchor.** With an anchor tip (`serve_witness` anchors at the block), a block B on the anchor's chain answers "block at height h < height(B)" with the anchor's answer. Both tries map h to the same ancestor. Lookups from different tries then share one entry per height. Whether B is on the chain is itself a MARF lookup at the anchor; blocks off it take the plain path.
+- **Proof bytes are unchanged.** Same proofs, same wire format, same verifier. The response is the same size.
+
+| Proving (`index/test/proof_memo.rs`, `proven_witness.rs`) | Node reads: plain / memo / anchored | Time: plain / memo / anchored |
+|---|---|---|
+| History fixture: 35 store entries + 10 write proofs | 1,147 / 369 / 309 | 8.8 / 4.4 / 3.9 ms |
+| Synthetic 300 blocks, 500 proofs | 159,368 / 12,305 / 8,573 | 395 / 121 / 114 ms |
+| Synthetic 32,768 blocks, 3,500 proofs (file-backed) | 5,474,102 / 817,751 / 263,406 | 25.4 / 5.9 / 3.4 s |
+
+Both tests assert that every proof is byte-identical with the memo off, on, and anchored. The 32k case is `--ignored` (it takes ~4 min to build its chain).
+
+**Still to expect on mainnet.** Lookups now scale with distinct tries and distinct heights, not with keys times hops. A 1.1M-block chain has longer shunts (~20-bit distances), so expect more distinct heights per proof than the 32k test. The response size is unchanged: per-entry proofs, 427 MB of JSON for 1,113,075. The multiproof is the next fix, for size and for the time spent hashing and serializing.
+
+**Progress.** `serve_witness` logs each phase on stderr (`Witness: ...`): store entries (every 1,000), contracts, final writes, and the memo's size. The client logs verify, re-execute and compare (`Client: ...`), and `reexec-verify` brackets replay and fetch.
+
+**`--events-out <file.jsonl>`.** Writes one line per re-executed, committed event: `txid`, `event_index`, `type`, `contract_id` (the emitter, or the asset's contract for FT/NFT), `topic`, `value_hex` (consensus, `0x`), `value_repr` (Clarity), and `event` as `/new_block` serializes it. Use it to diff against an indexer's events. The HTTP test checks that the rows match the replay's events and that each print's hex equals its `raw_value`.
+
 ## Scratch node: build and run
 
 Build (linux x86_64). The repo's `Dockerfile` builds the workspace in release (fat LTO) on `rust:bookworm`; `rust-toolchain.toml` pins 1.98.0, which rustup installs inside the build. The fork's CI (`.github/workflows/docker-image.yml`) runs `cargo build --features monitoring_prom,slog_json --profile release --workspace`. Build natively on an x86_64 box (QEMU emulation from Apple silicon is very slow):

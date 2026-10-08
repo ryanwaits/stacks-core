@@ -1367,6 +1367,25 @@ impl<T: MarfTrieId> MARF<T> {
             }
         }
 
+        let memo_key = (block_hash.clone(), current_block_hash.clone());
+        if let Some(height) = storage
+            .lookup_memo()
+            .and_then(|memo| memo.block_heights.get(&memo_key).copied())
+        {
+            return Ok(height);
+        }
+        let height = MARF::lookup_block_height(storage, block_hash, current_block_hash)?;
+        if let Some(memo) = storage.lookup_memo() {
+            memo.block_heights.insert(memo_key, height);
+        }
+        Ok(height)
+    }
+
+    fn lookup_block_height(
+        storage: &mut TrieStorageConnection<T>,
+        block_hash: &T,
+        current_block_hash: &T,
+    ) -> Result<Option<u32>, Error> {
         if block_hash == current_block_hash {
             return MARF::get_own_block_height(storage, current_block_hash);
         }
@@ -1408,6 +1427,57 @@ impl<T: MarfTrieId> MARF<T> {
             }
         }
 
+        let memo_key = (height, current_block_hash.clone());
+        if let Some(block) = storage
+            .lookup_memo()
+            .and_then(|memo| memo.blocks_at_height.get(&memo_key).cloned())
+        {
+            return Ok(block);
+        }
+        let block = match MARF::anchored_block_at_height(storage, height, current_block_hash)? {
+            Some(block) => Some(block),
+            None => MARF::lookup_block_at_height(storage, height, current_block_hash)?,
+        };
+        if let Some(memo) = storage.lookup_memo() {
+            memo.blocks_at_height.insert(memo_key, block.clone());
+        }
+        Ok(block)
+    }
+
+    /// The block at `height` seen from `current_block_hash`, through the
+    /// lookup memo's anchor, if `current_block_hash` is on the anchor's chain
+    /// above `height` (see `LookupMemo`). `None`: ask the MARF at
+    /// `current_block_hash` instead.
+    fn anchored_block_at_height(
+        storage: &mut TrieStorageConnection<T>,
+        height: u32,
+        current_block_hash: &T,
+    ) -> Result<Option<T>, Error> {
+        let Some(anchor) = storage.lookup_memo().and_then(|memo| memo.anchor.clone()) else {
+            return Ok(None);
+        };
+        if &anchor == current_block_hash {
+            return Ok(None);
+        }
+        let Some(current_height) =
+            MARF::get_block_height_miner_tip(storage, current_block_hash, current_block_hash)?
+        else {
+            return Ok(None);
+        };
+        if height >= current_height
+            || MARF::get_block_at_height(storage, current_height, &anchor)?.as_ref()
+                != Some(current_block_hash)
+        {
+            return Ok(None);
+        }
+        MARF::get_block_at_height(storage, height, &anchor)
+    }
+
+    fn lookup_block_at_height(
+        storage: &mut TrieStorageConnection<T>,
+        height: u32,
+        current_block_hash: &T,
+    ) -> Result<Option<T>, Error> {
         let current_block_height =
             match MARF::get_block_height(storage, current_block_hash, current_block_hash)? {
                 Some(x) => x,

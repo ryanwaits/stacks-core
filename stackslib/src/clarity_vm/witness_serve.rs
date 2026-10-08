@@ -18,6 +18,7 @@
 //! node's MARF, headers DB, block stores and sortition DB.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::time::Instant;
 
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId};
@@ -336,19 +337,53 @@ pub fn serve_witness(
     let (store, (contracts, unproven), write_proofs) =
         chainstate.clarity_state.with_marf(|marf| {
             marf.with_conn(|conn| {
-                let store = prove_store_reads(conn, &parent, witness)?;
-                let find_deploy =
-                    |deploy_block: &StacksBlockId, contract: &QualifiedContractIdentifier| {
-                        blocks
-                            .include(deploy_block, deploys(contract))
-                            .ok()
-                            .flatten()
-                    };
-                let (contracts, unproven) =
-                    prove_contracts(conn, &parent, witness, &net, &find_deploy)?;
-                let writes: Vec<(String, String)> = last.into_iter().collect();
-                let write_proofs = prove_writes(conn, &block_id, &writes)?;
-                Ok::<_, String>((store, (contracts, unproven), write_proofs))
+                // proofs re-derive the same skip-list ancestors over and over;
+                // memoize those lookups for this call only. Every root proven
+                // here is on the block's own chain.
+                conn.enable_lookup_memo(Some(block_id.clone()));
+                let proven = (|| {
+                    let started = Instant::now();
+                    info!("Witness: proving {} store entries", witness.store.len());
+                    let store = prove_store_reads(conn, &parent, witness)?;
+                    info!(
+                        "Witness: proved {} store entries in {:?}",
+                        store.len(),
+                        started.elapsed()
+                    );
+                    let started = Instant::now();
+                    let find_deploy =
+                        |deploy_block: &StacksBlockId, contract: &QualifiedContractIdentifier| {
+                            blocks
+                                .include(deploy_block, deploys(contract))
+                                .ok()
+                                .flatten()
+                        };
+                    let (contracts, unproven) =
+                        prove_contracts(conn, &parent, witness, &net, &find_deploy)?;
+                    info!(
+                        "Witness: proved {} contracts ({} unprovable) in {:?}",
+                        contracts.len(),
+                        unproven.len(),
+                        started.elapsed()
+                    );
+                    let started = Instant::now();
+                    let writes: Vec<(String, String)> = last.into_iter().collect();
+                    let write_proofs = prove_writes(conn, &block_id, &writes)?;
+                    info!(
+                        "Witness: proved {} final writes in {:?}",
+                        write_proofs.len(),
+                        started.elapsed()
+                    );
+                    Ok::<_, String>((store, (contracts, unproven), write_proofs))
+                })();
+                if let Some((tries, heights, blocks)) = conn.lookup_memo_len() {
+                    info!(
+                        "Witness: lookup memo held {tries} tries' ancestor hashes, \
+                         {heights} block heights, {blocks} blocks at a height"
+                    );
+                }
+                conn.disable_lookup_memo();
+                proven
             })
         })?;
 

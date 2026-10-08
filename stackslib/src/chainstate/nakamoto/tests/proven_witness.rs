@@ -36,9 +36,9 @@ use crate::chainstate::stacks::index::Error as MarfError;
 use crate::chainstate::stacks::{StacksTransaction, TransactionPayload};
 use crate::clarity_vm::read_witness::{EnvQuery, ReadWitness, StoreQuery};
 use crate::clarity_vm::witness_proof::{
-    prove_contracts, prove_store_reads, verify_read_witness, BitcoinChain, BitcoinHeader,
-    ChainHeader, DeploySource, HeaderChain, MarfProof, NetworkParams, ProvenWitness, Rejection,
-    StoreProof, TrustedState, TxInclusion,
+    prove_contracts, prove_store_reads, prove_writes, verify_read_witness, BitcoinChain,
+    BitcoinHeader, ChainHeader, DeploySource, HeaderChain, MarfProof, NetworkParams, ProvenWitness,
+    Rejection, StoreProof, TrustedState, TxInclusion,
 };
 use crate::clarity_vm::witness_serve::burn_binding;
 use crate::clarity_vm::witness_wire::WitnessEnvelope;
@@ -430,6 +430,60 @@ fn honest_proof_carrying_witness_verifies_for_the_state_writes_fixture() {
     assert_eq!(out.writes, served.live.writes);
     assert_eq!(out.receipts, served.live.receipts);
     measure("state-writes-fixture", &served);
+}
+
+/// The served witness's MARF proofs (store entries and the block's final
+/// writes) come out byte-identical with the lookup memo on, for fewer reads.
+#[test]
+fn lookup_memo_proves_the_fixture_witness_byte_identically() {
+    let (observer, fx, tenures, balances) = history_block();
+    let mut peer = boot(function_name!(), &observer, tenures, balances);
+    let block = block_with_tx(&observer, &fx.snapshot);
+    let served = serve(&mut peer, &observer, &block);
+    let parent = block.parent.clone();
+    let writes: Vec<(String, String)> = served
+        .live
+        .writes
+        .iter()
+        .map(|w| (w.key.clone(), w.value.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    let witness = &served.proven.witness;
+    let mut prove = |anchor: Option<Option<StacksBlockId>>| {
+        peer.chain
+            .coord
+            .chain_state_db
+            .clarity_state
+            .with_marf(|marf| {
+                let mut conn = marf.borrow_storage_backend();
+                if let Some(anchor) = anchor {
+                    conn.enable_lookup_memo(anchor);
+                }
+                conn.stats();
+                let started = Instant::now();
+                let store = prove_store_reads(&mut conn, &parent, witness).unwrap();
+                let writes = prove_writes(&mut conn, &served.block, &writes).unwrap();
+                let elapsed = started.elapsed();
+                let (reads, _) = conn.stats();
+                conn.disable_lookup_memo();
+                (format!("{store:?}{writes:?}"), reads, elapsed)
+            })
+    };
+    let (plain, plain_reads, plain_time) = prove(None);
+    let (memo, memo_reads, memo_time) = prove(Some(None));
+    let (anchored, anchored_reads, anchored_time) = prove(Some(Some(served.block.clone())));
+    eprintln!(
+        "history fixture: {} store entries + {} writes: {plain_reads} node reads in {plain_time:?} \
+         without the memo, {memo_reads} in {memo_time:?} with it, {anchored_reads} in \
+         {anchored_time:?} anchored at the block",
+        witness.store.len(),
+        writes.len()
+    );
+    assert_eq!(plain, memo);
+    assert_eq!(plain, anchored);
+    assert!(memo_reads < plain_reads);
+    assert!(anchored_reads <= memo_reads);
 }
 
 /// Phase 1 showed a read that only feeds a print changes no write, so the

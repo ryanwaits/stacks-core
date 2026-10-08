@@ -839,10 +839,19 @@ impl Trie {
             storage.check_cached_ancestor_hashes_bytes(&cur_block_header)
         {
             Ok(cached_ancestor_hashes_bytes)
+        } else if let Some(memoized) = storage
+            .lookup_memo()
+            .and_then(|memo| memo.ancestor_hashes.get(&cur_block_header).cloned())
+        {
+            Ok(memoized)
         } else {
             let result = Trie::inner_get_trie_ancestor_hashes_bytes(storage);
             if let Ok(ref result) = result {
                 storage.set_cached_ancestor_hashes_bytes(&cur_block_header, result.clone());
+                if let Some(memo) = storage.lookup_memo() {
+                    memo.ancestor_hashes
+                        .insert(cur_block_header.clone(), result.clone());
+                }
             }
 
             // restore

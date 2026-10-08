@@ -1493,6 +1493,41 @@ pub struct TrieStorageTransientData<T: MarfTrieId> {
 
     /// Snapshot metadata if this MARF is squashed.
     squash_info: Option<SquashInfo>,
+
+    /// Opt-in memo of lookups over committed tries (off unless a caller turns
+    /// it on with `TrieStorageConnection::set_lookup_memo`).
+    lookup_memo: Option<LookupMemo<T>>,
+}
+
+/// Memo of lookups that are pure functions of committed tries: a trie's
+/// ancestor root hashes, a block's height seen from a tip, and the block at a
+/// height seen from a tip. Off by default. Callers that build many proofs at
+/// once (each backptr shunt recomputes ancestor hashes, ~2 MARF walks per
+/// ancestor) turn it on. Consulted only while no trie is being extended and
+/// the storage is not unconfirmed, so mutable state never lands in it.
+///
+/// With an `anchor` tip, a block B on the anchor's chain answers "block at
+/// height h < height(B)" with the anchor's answer for h: both tries map h to
+/// the same ancestor, since block h + 1 (which writes that entry) is an
+/// ancestor of both. Lookups from different blocks then share one entry per
+/// height. Membership is itself a MARF lookup at the anchor (block at
+/// height(B) is B); blocks off its chain take the plain path.
+pub struct LookupMemo<T: MarfTrieId> {
+    pub(crate) anchor: Option<T>,
+    pub(crate) ancestor_hashes: HashMap<T, Vec<TrieHash>>,
+    pub(crate) block_heights: HashMap<(T, T), Option<u32>>,
+    pub(crate) blocks_at_height: HashMap<(u32, T), Option<T>>,
+}
+
+impl<T: MarfTrieId> LookupMemo<T> {
+    fn new(anchor: Option<T>) -> Self {
+        LookupMemo {
+            anchor,
+            ancestor_hashes: HashMap::new(),
+            block_heights: HashMap::new(),
+            blocks_at_height: HashMap::new(),
+        }
+    }
 }
 
 /// Snapshot metadata cached at open time for squashed MARFs.
@@ -1649,6 +1684,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
             write_leaf_count: 0,
 
             trie_ancestor_hash_bytes_cache: None,
+            lookup_memo: None,
 
             readonly: true,
             unconfirmed: self.unconfirmed(),
@@ -1816,6 +1852,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
                 write_leaf_count: 0,
 
                 trie_ancestor_hash_bytes_cache: None,
+                lookup_memo: None,
 
                 readonly,
                 unconfirmed,
@@ -1906,6 +1943,7 @@ impl<T: MarfTrieId> TrieFileStorage<T> {
                 write_leaf_count: 0,
 
                 trie_ancestor_hash_bytes_cache: None,
+                lookup_memo: None,
 
                 readonly: true,
                 unconfirmed: self.unconfirmed(),
@@ -1966,6 +2004,7 @@ impl<'a, T: MarfTrieId> TrieStorageTransaction<'a, T> {
                 write_leaf_count: 0,
 
                 trie_ancestor_hash_bytes_cache: None,
+                lookup_memo: None,
 
                 readonly: true,
                 unconfirmed: self.unconfirmed(),
@@ -2314,6 +2353,39 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
 
     pub fn unconfirmed(&self) -> bool {
         self.data.unconfirmed
+    }
+
+    /// Turn the [`LookupMemo`] on, empty, optionally anchored at a tip whose
+    /// chain the lookups will mostly walk. It lives in the storage's transient
+    /// data, so it outlasts this connection until turned off.
+    pub fn enable_lookup_memo(&mut self, anchor: Option<T>) {
+        self.data.lookup_memo = Some(LookupMemo::new(anchor));
+    }
+
+    /// Turn the [`LookupMemo`] off and drop what it held.
+    pub fn disable_lookup_memo(&mut self) {
+        self.data.lookup_memo = None;
+    }
+
+    /// Entries in the [`LookupMemo`], if it is on: tries whose ancestor hashes
+    /// it holds, block heights, and blocks at a height.
+    pub fn lookup_memo_len(&self) -> Option<(usize, usize, usize)> {
+        self.data.lookup_memo.as_ref().map(|memo| {
+            (
+                memo.ancestor_hashes.len(),
+                memo.block_heights.len(),
+                memo.blocks_at_height.len(),
+            )
+        })
+    }
+
+    /// The [`LookupMemo`], if it is on and only committed tries are open to
+    /// this connection.
+    pub(crate) fn lookup_memo(&mut self) -> Option<&mut LookupMemo<T>> {
+        if self.data.uncommitted_writes.is_some() || self.data.unconfirmed {
+            return None;
+        }
+        self.data.lookup_memo.as_mut()
     }
 
     /// Returns true when this storage represents a squashed MARF.

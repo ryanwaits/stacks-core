@@ -32,7 +32,7 @@ use crate::chainstate::nakamoto::tests::stateless_reexec::{
 };
 use crate::chainstate::nakamoto::NakamotoBlock;
 use crate::chainstate::stacks::events::TransactionOrigin;
-use crate::clarity_vm::witness_client::{check_replayed_block, ClientParams, Report};
+use crate::clarity_vm::witness_client::{check_replayed_block, event_rows, ClientParams, Report};
 use crate::clarity_vm::witness_serve::node_network_params;
 use crate::core::test_util::{make_contract_call_tx, make_contract_publish_tx, to_addr};
 use crate::core::FIRST_STACKS_BLOCK_ID;
@@ -185,6 +185,35 @@ fn served_witness_verifies_and_reexecutes_over_http() {
     for (receipt, tx) in live.iter().zip(replay.transactions.iter()) {
         assert_eq!(receipt_events(receipt), tx.events);
         assert_eq!(receipt.result, tx.result_hex);
+    }
+
+    // `--events-out` rows: one per replay event, each print with its value
+    // as the event's raw hex and as Clarity repr
+    let rows = event_rows(&report.receipts);
+    let events: Vec<&serde_json::Value> = replay
+        .transactions
+        .iter()
+        .flat_map(|t| t.events.iter())
+        .collect();
+    assert_eq!(rows.len(), events.len());
+    for (row, event) in rows.iter().zip(events.iter()) {
+        assert_eq!(&&row["event"], event);
+        assert_eq!(row["txid"], event["txid"]);
+        assert_eq!(row["event_index"], event["event_index"]);
+        assert_eq!(row["type"], event["type"]);
+    }
+    let prints: Vec<_> = rows.iter().filter(|r| r["topic"] == "print").collect();
+    assert!(!prints.is_empty());
+    for print in prints {
+        assert_eq!(
+            print["value_hex"],
+            print["event"]["contract_event"]["raw_value"]
+        );
+        assert_eq!(
+            print["contract_id"],
+            print["event"]["contract_event"]["contract_identifier"]
+        );
+        assert!(!print["value_repr"].as_str().unwrap().is_empty());
     }
 }
 
