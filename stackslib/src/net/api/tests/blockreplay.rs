@@ -434,6 +434,7 @@ fn replay_reports_the_same_state_writes_and_vm_events_as_live_processing() {
     let trace = blockreplay::ReplayTrace {
         vm_events: true,
         state_writes: true,
+        ..Default::default()
     };
     let mut traced =
         StacksHttpRequest::new_block_replay_with_trace(addr.into(), &rpc_test.canonical_tip, trace);
@@ -480,6 +481,7 @@ fn replay_request_parses_trace_flags() {
     let trace = blockreplay::ReplayTrace {
         vm_events: true,
         state_writes: true,
+        ..Default::default()
     };
     let mut request = StacksHttpRequest::new_block_replay_with_trace(
         addr.into(),

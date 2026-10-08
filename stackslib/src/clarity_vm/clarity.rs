@@ -58,6 +58,7 @@ use crate::chainstate::stacks::{
 use crate::clarity_vm::database::marf::{
     BoxedClarityMarfStoreTransaction, MarfedKV, ReadOnlyMarfStore,
 };
+use crate::clarity_vm::read_witness::{EnvTap, ReadWitness, RecordingStore, StoreReads};
 use crate::clarity_vm::state_writes::{StateWrite, StateWriteLog};
 use crate::core::{StacksEpoch, StacksEpochId, FIRST_STACKS_BLOCK_ID, GENESIS_EPOCH};
 use crate::util_lib::boot::{boot_code_acc, boot_code_addr, boot_code_id, boot_code_tx_auth};
@@ -98,6 +99,9 @@ pub struct ClarityInstance {
     /// Record every MARF write of each block begun with `begin_block` /
     /// `begin_ephemeral` (see [`StateWriteLog`]).
     collect_state_writes: bool,
+    /// Record every read each block begun with `begin_block` /
+    /// `begin_ephemeral` needs from outside itself (see [`ReadWitness`]).
+    collect_read_witness: bool,
 }
 
 ///
@@ -129,6 +133,9 @@ pub struct ClarityBlockConnection<'a, 'b> {
     epoch: StacksEpochId,
     emit_vm_trace: bool,
     vm_trace_max_bytes: u64,
+    /// Records (or, for stateless re-execution, answers) `HeadersDB` and
+    /// `BurnStateDB` lookups in place of `header_db` / `burn_state_db`.
+    env_tap: Option<EnvTap<'b>>,
 }
 
 ///
@@ -197,6 +204,12 @@ pub trait WritableMarfStore:
 
     /// The write log, if recording was enabled.
     fn state_write_log(&mut self) -> Option<&mut StateWriteLog> {
+        None
+    }
+
+    /// Take the reads recorded so far, if this store records them (see
+    /// [`RecordingStore`]).
+    fn take_store_reads(&mut self) -> Option<StoreReads> {
         None
     }
 }
@@ -362,6 +375,7 @@ impl ClarityBlockConnection<'_, '_> {
             epoch,
             emit_vm_trace: false,
             vm_trace_max_bytes: 0,
+            env_tap: None,
         }
     }
 
@@ -419,6 +433,7 @@ impl ClarityBlockConnection<'_, '_> {
             epoch: epoch.epoch_id,
             emit_vm_trace: false,
             vm_trace_max_bytes: 0,
+            env_tap: None,
         }
     }
 
@@ -444,6 +459,7 @@ impl ClarityBlockConnection<'_, '_> {
             epoch: GENESIS_EPOCH,
             emit_vm_trace: false,
             vm_trace_max_bytes: 0,
+            env_tap: None,
         }
     }
 
@@ -513,6 +529,7 @@ impl ClarityInstance {
             emit_vm_trace: false,
             vm_trace_max_bytes: 0,
             collect_state_writes: false,
+            collect_read_witness: false,
             mainnet,
             chain_id,
         }
@@ -532,6 +549,14 @@ impl ClarityInstance {
 
     pub fn collect_state_writes(&self) -> bool {
         self.collect_state_writes
+    }
+
+    pub fn set_collect_read_witness(&mut self, on: bool) {
+        self.collect_read_witness = on;
+    }
+
+    pub fn collect_read_witness(&self) -> bool {
+        self.collect_read_witness
     }
 
     pub fn set_vm_trace_max_bytes(&mut self, max_bytes: u64) {
@@ -582,8 +607,16 @@ impl ClarityInstance {
         // funnels through the same generic injection point external backends use.
         let datastore = self.datastore.begin(current, next);
         let epoch = Self::get_epoch_of(current, header_db, burn_state_db);
+        let datastore: Box<dyn WritableMarfStore + 'a> = if self.collect_read_witness {
+            Box::new(RecordingStore::new(Box::new(datastore)))
+        } else {
+            Box::new(datastore)
+        };
+        let env_tap = self
+            .collect_read_witness
+            .then(|| EnvTap::recording(header_db, burn_state_db, epoch.clone()));
         let mut conn = ClarityBlockConnection::from_writable_store(
-            Box::new(datastore),
+            datastore,
             header_db,
             burn_state_db,
             self.mainnet,
@@ -592,6 +625,7 @@ impl ClarityInstance {
         );
         conn.emit_vm_trace = self.emit_vm_trace;
         conn.vm_trace_max_bytes = self.vm_trace_max_bytes;
+        conn.env_tap = env_tap;
         if self.collect_state_writes {
             conn.datastore.enable_state_write_log();
         }
@@ -643,6 +677,7 @@ impl ClarityInstance {
             epoch,
             emit_vm_trace: self.emit_vm_trace,
             vm_trace_max_bytes: self.vm_trace_max_bytes,
+            env_tap: None,
         };
 
         let use_mainnet = self.mainnet;
@@ -744,6 +779,7 @@ impl ClarityInstance {
             epoch,
             emit_vm_trace: self.emit_vm_trace,
             vm_trace_max_bytes: self.vm_trace_max_bytes,
+            env_tap: None,
         };
 
         let use_mainnet = self.mainnet;
@@ -857,6 +893,7 @@ impl ClarityInstance {
             epoch: epoch.epoch_id,
             emit_vm_trace: self.emit_vm_trace,
             vm_trace_max_bytes: self.vm_trace_max_bytes,
+            env_tap: None,
         }
     }
 
@@ -869,12 +906,20 @@ impl ClarityInstance {
         header_db: &'b dyn HeadersDB,
         burn_state_db: &'b dyn BurnStateDB,
     ) -> ClarityBlockConnection<'a, 'b> {
-        let mut datastore = self
+        let datastore = self
             .datastore
             .begin_ephemeral(base_tip, ephemeral_next)
             .expect("FATAL: failed to begin ephemeral block connection");
+        let mut datastore: Box<dyn WritableMarfStore + 'a> = if self.collect_read_witness {
+            Box::new(RecordingStore::new(Box::new(datastore)))
+        } else {
+            Box::new(datastore)
+        };
 
         let epoch = Self::get_epoch_of(base_tip, header_db, burn_state_db);
+        let env_tap = self
+            .collect_read_witness
+            .then(|| EnvTap::recording(header_db, burn_state_db, epoch.clone()));
         let cost_track = {
             let mut clarity_db = datastore.as_clarity_db(&NULL_HEADER_DB, &NULL_BURN_STATE_DB);
             Some(
@@ -894,7 +939,7 @@ impl ClarityInstance {
         }
 
         ClarityBlockConnection {
-            datastore: Box::new(datastore),
+            datastore,
             header_db,
             burn_state_db,
             cost_track,
@@ -903,6 +948,7 @@ impl ClarityInstance {
             epoch: epoch.epoch_id,
             emit_vm_trace: self.emit_vm_trace,
             vm_trace_max_bytes: self.vm_trace_max_bytes,
+            env_tap,
         }
     }
 
@@ -981,6 +1027,19 @@ impl ClarityInstance {
     }
 }
 
+/// The `HeadersDB` / `BurnStateDB` a block connection hands to Clarity: its
+/// tap when it has one, else the node's databases.
+fn env_dbs<'s>(
+    env_tap: &'s Option<EnvTap<'_>>,
+    header_db: &'s dyn HeadersDB,
+    burn_state_db: &'s dyn BurnStateDB,
+) -> (&'s dyn HeadersDB, &'s dyn BurnStateDB) {
+    match env_tap {
+        Some(tap) => (tap, tap),
+        None => (header_db, burn_state_db),
+    }
+}
+
 impl ClarityConnection for ClarityBlockConnection<'_, '_> {
     /// Do something with ownership of the underlying DB that involves only reading.
     fn with_clarity_db_readonly_owned<F, R>(&mut self, to_do: F) -> R
@@ -988,7 +1047,8 @@ impl ClarityConnection for ClarityBlockConnection<'_, '_> {
         F: FnOnce(ClarityDatabase) -> (R, ClarityDatabase),
     {
         let mut cache = ClarityExecutionCache::default();
-        let mut db = ClarityDatabase::new(&mut self.datastore, self.header_db, self.burn_state_db)
+        let (header_db, burn_state_db) = env_dbs(&self.env_tap, self.header_db, self.burn_state_db);
+        let mut db = ClarityDatabase::new(&mut self.datastore, header_db, burn_state_db)
             .with_cache(&mut cache);
         db.begin();
         let (result, mut db) = to_do(db);
@@ -2304,10 +2364,11 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
     }
 
     pub fn start_transaction_processing(&mut self) -> ClarityTransactionConnection<'_, '_> {
+        let (header_db, burn_state_db) = env_dbs(&self.env_tap, self.header_db, self.burn_state_db);
         let mut tx = ClarityTransactionConnection::new(
             &mut self.datastore,
-            self.header_db,
-            self.burn_state_db,
+            header_db,
+            burn_state_db,
             &mut self.cost_track,
             self.mainnet,
             self.chain_id,
@@ -2380,6 +2441,24 @@ impl<'a, 'b> ClarityBlockConnection<'a, 'b> {
     /// if writes are not being recorded.
     pub fn take_state_writes(&mut self) -> Option<Vec<StateWrite>> {
         self.datastore.state_write_log().map(StateWriteLog::take)
+    }
+
+    /// Everything this block has read from outside itself so far, or `None`
+    /// if reads are not being recorded.
+    pub fn take_read_witness(&mut self) -> Option<ReadWitness> {
+        let (epoch, env) = self.env_tap.as_ref()?.take_recorded()?;
+        let reads = self.datastore.take_store_reads()?;
+        Some(ReadWitness {
+            open_tip: reads.open_tip,
+            open_height: reads.open_height,
+            epoch,
+            store: reads.reads,
+            env,
+        })
+    }
+
+    pub fn set_emit_vm_trace(&mut self, on: bool) {
+        self.emit_vm_trace = on;
     }
 
     pub fn destruct(self) -> Box<dyn WritableMarfStore + 'a> {

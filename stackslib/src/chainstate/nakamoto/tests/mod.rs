@@ -141,6 +141,7 @@ fn test_path(name: &str) -> String {
 pub mod node;
 pub mod signer_set;
 pub mod state_writes;
+pub mod stateless_reexec;
 pub mod transactions;
 
 #[test]

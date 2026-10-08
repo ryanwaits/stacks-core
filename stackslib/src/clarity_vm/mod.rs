@@ -9,5 +9,11 @@ pub mod database;
 /// Storage-layer record of a block's Clarity MARF writes
 pub mod state_writes;
 
+/// Record of every value a block's execution read from outside itself
+pub mod read_witness;
+
+/// Re-execute a block from its read witness alone
+pub mod stateless;
+
 #[cfg(test)]
 mod tests;

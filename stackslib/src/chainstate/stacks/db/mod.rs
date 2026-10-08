@@ -76,6 +76,7 @@ use crate::clarity_vm::clarity::{
 };
 use crate::clarity_vm::database::marf::MarfedKV;
 use crate::clarity_vm::database::HeadersDBConn;
+use crate::clarity_vm::read_witness::ReadWitness;
 use crate::clarity_vm::state_writes::StateWrite;
 use crate::core::*;
 use crate::monitoring;
@@ -230,6 +231,9 @@ pub struct StacksEpochReceipt {
     /// Every Clarity MARF write the block made, in write order, when the
     /// `ClarityInstance` was collecting them; `None` otherwise.
     pub state_writes: Option<Vec<StateWrite>>,
+    /// Every value the block read from outside itself, when the
+    /// `ClarityInstance` was collecting them; `None` otherwise.
+    pub read_witness: Option<ReadWitness>,
 }
 
 /// Headers we serve over the network

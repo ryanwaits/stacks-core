@@ -39,6 +39,7 @@ use crate::chainstate::stacks::miner::{
     BlockBuilder, BlockLimitFunction, TransactionResourceBudgets, TransactionResult,
 };
 use crate::chainstate::stacks::{Error as ChainError, StacksTransaction, TransactionPayload};
+use crate::clarity_vm::read_witness::ReadWitness;
 use crate::clarity_vm::state_writes::{state_write_entries, tx_index_map, StateWriteEntry};
 use crate::config::DEFAULT_MAX_TENURE_BYTES;
 use crate::net::http::{
@@ -168,6 +169,8 @@ pub struct ReplayTrace {
     pub vm_events: bool,
     /// Storage-layer MARF writes (`?state_writes=1`), as `/new_block.state_writes`.
     pub state_writes: bool,
+    /// Read witness (in-process only: no query flag or wire format yet).
+    pub read_witness: bool,
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
@@ -209,10 +212,14 @@ where
     // Turn on the requested collectors for this replay only, then put the
     // instance back the way the node configured it.
     let clarity = &mut chainstate.clarity_state;
-    let (emit_vm_trace, collect_state_writes) =
-        (clarity.emit_vm_trace(), clarity.collect_state_writes());
+    let (emit_vm_trace, collect_state_writes, collect_read_witness) = (
+        clarity.emit_vm_trace(),
+        clarity.collect_state_writes(),
+        clarity.collect_read_witness(),
+    );
     clarity.set_emit_vm_trace(trace.vm_events);
     clarity.set_collect_state_writes(trace.state_writes);
+    clarity.set_collect_read_witness(trace.read_witness);
 
     let result = remine_nakamoto_block_inner(
         block_id,
@@ -227,6 +234,7 @@ where
     let clarity = &mut chainstate.clarity_state;
     clarity.set_emit_vm_trace(emit_vm_trace);
     clarity.set_collect_state_writes(collect_state_writes);
+    clarity.set_collect_read_witness(collect_read_witness);
     result
 }
 
@@ -398,6 +406,7 @@ where
 
     let mut replayed_block = builder.mine_nakamoto_block(&mut tenure_tx, burn_chain_height);
     let state_writes = tenure_tx.connection().take_state_writes();
+    let read_witness = tenure_tx.connection().take_read_witness();
 
     // copy values that will contribute to the block_hash that cannot be the same in the new replayed block
     replayed_block.header.timestamp = block.header.timestamp;
@@ -445,6 +454,7 @@ where
         rpc_replayed_block.state_writes =
             state_writes.map(|writes| state_write_entries(&writes, &tx_index_of));
     }
+    rpc_replayed_block.read_witness = read_witness;
 
     Ok(rpc_replayed_block)
 }
@@ -617,6 +627,10 @@ pub struct RPCReplayedBlock {
     /// Present only when requested with `?state_writes=1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_writes: Option<Vec<StateWriteEntry>>,
+    /// Everything the replay read from outside the block, when requested.
+    /// In-process only: it has no wire format yet.
+    #[serde(skip)]
+    pub read_witness: Option<ReadWitness>,
 }
 
 impl RPCReplayedBlock {
@@ -645,6 +659,7 @@ impl RPCReplayedBlock {
             valid_merkle_root: false,
             vm_events: None,
             state_writes: None,
+            read_witness: None,
         }
     }
 }

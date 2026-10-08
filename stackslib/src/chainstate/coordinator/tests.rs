@@ -61,6 +61,7 @@ use crate::chainstate::stacks::db::{
 use crate::chainstate::stacks::miner::{BlockBuilder, TransactionResourceBudgets};
 use crate::chainstate::stacks::*;
 use crate::clarity_vm::clarity::ClarityConnection;
+use crate::clarity_vm::read_witness::ReadWitness;
 use crate::clarity_vm::state_writes::StateWrite;
 use crate::core::*;
 use crate::util_lib::boot::{boot_code_addr, boot_code_id};
@@ -405,6 +406,7 @@ impl BlockEventDispatcher for NullEventDispatcher {
         _block_timestamp: Option<u64>,
         _coinbase_height: u64,
         _state_writes: Option<&[StateWrite]>,
+        _read_witness: Option<&ReadWitness>,
     ) {
         error!("We should never try to announce to the null dispatcher");
         panic!();

@@ -45,6 +45,7 @@ use stacks::chainstate::stacks::events::{
 };
 use stacks::chainstate::stacks::miner::TransactionEvent;
 use stacks::chainstate::stacks::{StacksBlock, StacksMicroblock, StacksTransaction};
+use stacks::clarity_vm::read_witness::ReadWitness;
 use stacks::clarity_vm::state_writes::{state_write_entries, tx_index_map, StateWrite};
 use stacks::config::{Config, EventKeyType, EventObserverConfig};
 use stacks::core::mempool::{MemPoolDropReason, MemPoolEventDispatcher, ProposalCallbackReceiver};
@@ -422,6 +423,7 @@ impl BlockEventDispatcher for EventDispatcher {
         block_timestamp: Option<u64>,
         coinbase_height: u64,
         state_writes: Option<&[StateWrite]>,
+        _read_witness: Option<&ReadWitness>,
     ) {
         self.process_chain_tip(
             block,

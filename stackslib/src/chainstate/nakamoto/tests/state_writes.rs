@@ -495,7 +495,7 @@ fn state_writes_omit_everything_a_failed_transaction_rolled_back() {
 
 /// Every leaf stored in `block`'s own trie (not reached through a
 /// back-pointer into an ancestor), by path.
-fn block_trie_leaves(
+pub fn block_trie_leaves(
     marf: &mut MARF<StacksBlockId>,
     block: &StacksBlockId,
 ) -> HashMap<TrieHash, MARFValue> {

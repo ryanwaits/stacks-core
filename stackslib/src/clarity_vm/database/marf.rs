@@ -39,6 +39,7 @@ use crate::clarity_vm::clarity::{
     ClarityMarfStore, ClarityMarfStoreTransaction, WritableMarfStore,
 };
 use crate::clarity_vm::database::ephemeral::EphemeralMarfStore;
+use crate::clarity_vm::read_witness::StoreReads;
 use crate::clarity_vm::special::handle_contract_call_special_cases;
 use crate::clarity_vm::state_writes::StateWriteLog;
 use crate::core::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
@@ -1270,5 +1271,9 @@ impl<'a> WritableMarfStore for Box<dyn WritableMarfStore + 'a> {
 
     fn state_write_log(&mut self) -> Option<&mut StateWriteLog> {
         WritableMarfStore::state_write_log(self.deref_mut())
+    }
+
+    fn take_store_reads(&mut self) -> Option<StoreReads> {
+        WritableMarfStore::take_store_reads(self.deref_mut())
     }
 }

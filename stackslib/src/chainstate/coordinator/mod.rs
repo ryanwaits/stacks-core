@@ -58,6 +58,7 @@ use crate::chainstate::stacks::index::marf::MARFOpenOpts;
 use crate::chainstate::stacks::index::Error as IndexError;
 use crate::chainstate::stacks::miner::{signal_mining_blocked, signal_mining_ready, MinerStatus};
 use crate::chainstate::stacks::{Error as ChainstateError, StacksBlockHeader, TransactionPayload};
+use crate::clarity_vm::read_witness::ReadWitness;
 use crate::clarity_vm::state_writes::StateWrite;
 use crate::core::{StacksEpoch, StacksEpochId};
 use crate::cost_estimates::{CostEstimator, FeeEstimator};
@@ -168,6 +169,7 @@ pub trait BlockEventDispatcher {
         block_timestamp: Option<u64>,
         coinbase_height: u64,
         state_writes: Option<&[StateWrite]>,
+        read_witness: Option<&ReadWitness>,
     );
 
     /// called whenever a burn block is about to be

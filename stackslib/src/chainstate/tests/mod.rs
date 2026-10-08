@@ -205,7 +205,7 @@ pub struct TestChainstateConfig {
     pub txindex: bool,
     /// Record each processed block's eval-hook `vm_events` and Clarity MARF
     /// writes, as a node with `"storage"`/`"contract_calls"`/`"state_writes"`
-    /// observers does
+    /// observers does, and its read witness
     pub block_traces: bool,
 }
 
@@ -668,6 +668,7 @@ impl<'a> TestChainstate<'a> {
         let clarity_state = &mut coord.chain_state_db.clarity_state;
         clarity_state.set_emit_vm_trace(config.block_traces);
         clarity_state.set_collect_state_writes(config.block_traces);
+        clarity_state.set_collect_read_witness(config.block_traces);
         coord.handle_new_burnchain_block().unwrap();
 
         let mut stacks_node = TestStacksNode::from_chainstate(chainstate);

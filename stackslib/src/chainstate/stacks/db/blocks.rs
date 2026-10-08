@@ -60,6 +60,7 @@ use crate::chainstate::stacks::{
 };
 use crate::clarity_vm::clarity::{ClarityConnection, ClarityInstance};
 use crate::clarity_vm::database::SortitionDBRef;
+use crate::clarity_vm::read_witness::ReadWitness;
 use crate::clarity_vm::state_writes::StateWrite;
 use crate::core::mempool::MAXIMUM_MEMPOOL_TX_CHAINING;
 use crate::cost_estimates::EstimatorError;
@@ -191,6 +192,7 @@ impl BlockEventDispatcher for DummyEventDispatcher {
         _block_timestamp: Option<u64>,
         _coinbase_height: u64,
         _state_writes: Option<&[StateWrite]>,
+        _read_witness: Option<&ReadWitness>,
     ) {
         error!("We should never try to announce to the dummy dispatcher");
         panic!();
@@ -5538,6 +5540,7 @@ impl StacksChainState {
             parent_burn_block_timestamp,
             clarity_commit,
             state_writes,
+            read_witness,
         ) = {
             // get previous burn block stats
             let (parent_burn_block_hash, parent_burn_block_height, parent_burn_block_timestamp) =
@@ -5713,6 +5716,7 @@ impl StacksChainState {
 
             // good to go!
             let state_writes = clarity_tx.connection().take_state_writes();
+            let read_witness = clarity_tx.connection().take_read_witness();
             let clarity_commit =
                 clarity_tx.precommit_to_block(chain_tip_consensus_hash, &block.block_hash());
 
@@ -5768,6 +5772,7 @@ impl StacksChainState {
                 parent_burn_block_timestamp,
                 clarity_commit,
                 state_writes,
+                read_witness,
             )
         };
 
@@ -5795,6 +5800,7 @@ impl StacksChainState {
                 signers_updated: false,
                 coinbase_height,
                 state_writes,
+                read_witness,
             };
 
             return Ok((epoch_receipt, clarity_commit, None));
@@ -5888,6 +5894,7 @@ impl StacksChainState {
             signers_updated,
             coinbase_height,
             state_writes,
+            read_witness,
         };
 
         Ok((epoch_receipt, clarity_commit, reward_set_data))
@@ -6364,6 +6371,7 @@ impl StacksChainState {
                 None,
                 next_staging_block.height,
                 epoch_receipt.state_writes.as_deref(),
+                epoch_receipt.read_witness.as_ref(),
             );
         }
 
