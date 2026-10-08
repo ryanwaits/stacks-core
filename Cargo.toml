@@ -20,6 +20,7 @@ members = [
     "contrib/clarity-cli",
     "contrib/stacks-cli",
     "contrib/marf-squash",
+    "contrib/reexec-verify",
 ]
 
 exclude = ["contrib/tools/config-docs-generator"]

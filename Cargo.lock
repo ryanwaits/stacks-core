@@ -3518,6 +3518,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "reexec-verify"
+version = "4.0.3"
+dependencies = [
+ "clap",
+ "reqwest",
+ "serde_json",
+ "stacks-common 4.0.3",
+ "stackslib 0.0.1",
+]
+
+[[package]]
 name = "ref-cast"
 version = "1.0.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
