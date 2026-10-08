@@ -449,6 +449,26 @@ impl ClarityBlockConnection<'_, '_> {
         mainnet: bool,
         chain_id: u32,
     ) -> ClarityBlockConnection<'a, 'b> {
+        Self::from_writable_store_unmetered(
+            datastore,
+            header_db,
+            burn_state_db,
+            mainnet,
+            chain_id,
+            GENESIS_EPOCH,
+        )
+    }
+
+    /// [`Self::from_writable_store`] with a free (unmetered) cost tracker, which
+    /// reads no cost contract.
+    pub fn from_writable_store_unmetered<'a, 'b>(
+        datastore: Box<dyn WritableMarfStore + 'a>,
+        header_db: &'b dyn HeadersDB,
+        burn_state_db: &'b dyn BurnStateDB,
+        mainnet: bool,
+        chain_id: u32,
+        epoch: StacksEpochId,
+    ) -> ClarityBlockConnection<'a, 'b> {
         ClarityBlockConnection {
             datastore,
             header_db,
@@ -456,7 +476,7 @@ impl ClarityBlockConnection<'_, '_> {
             cost_track: Some(LimitedCostTracker::new_free()),
             mainnet,
             chain_id,
-            epoch: GENESIS_EPOCH,
+            epoch,
             emit_vm_trace: false,
             vm_trace_max_bytes: 0,
             env_tap: None,

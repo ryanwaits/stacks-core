@@ -15,5 +15,8 @@ pub mod read_witness;
 /// Re-execute a block from its read witness alone
 pub mod stateless;
 
+/// Evidence for every read-witness entry, and the client-side verifier
+pub mod witness_proof;
+
 #[cfg(test)]
 mod tests;

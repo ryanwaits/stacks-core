@@ -28,17 +28,24 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use clarity::util::hash::Sha512Trunc256Sum;
+use clarity::vm::database::clarity_store::{make_contract_hash_key, ContractCommitment};
 use clarity::vm::database::sqlite::sqlite_get_contract_hash;
 use clarity::vm::database::{ClarityBackingStore, SpecialCaseHandler, SqliteConnection};
+use clarity::vm::database::{ClaritySerializable, STXBalance};
 use clarity::vm::errors::{RuntimeError, VmExecutionError, VmInternalError};
-use clarity::vm::types::QualifiedContractIdentifier;
+use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use rusqlite::Connection;
 use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash, Txid};
+use stacks_common::types::StacksEpochId;
 
 use crate::chainstate::nakamoto::TxToProcess;
-use crate::chainstate::stacks::db::{ClarityTx, StacksChainState};
+use crate::chainstate::stacks::db::{ClarityTx, StacksAccount, StacksChainState};
 use crate::chainstate::stacks::events::StacksTransactionReceipt;
+use crate::chainstate::stacks::miner::TransactionResourceBudgets;
 use crate::chainstate::stacks::Error as ChainstateError;
+use crate::chainstate::stacks::{
+    StacksTransaction, TransactionPayload, MINER_BLOCK_CONSENSUS_HASH, MINER_BLOCK_HEADER_HASH,
+};
 use crate::clarity_vm::clarity::{
     ClarityBlockConnection, ClarityMarfStore, ClarityMarfStoreTransaction, WritableMarfStore,
 };
@@ -101,7 +108,17 @@ pub fn execute_statelessly<'t>(
     chain_id: u32,
 ) -> Result<StatelessBlock, StatelessError> {
     let missing = Rc::new(RefCell::new(vec![]));
-    let store = WitnessStore::new(witness, &block_level.setup, missing.clone());
+    let store = WitnessStore::new(
+        witness.open_tip.clone(),
+        witness.open_height,
+        &witness.store,
+        block_level
+            .setup
+            .iter()
+            .map(|w| (w.key.clone(), w.value.clone())),
+        missing.clone(),
+        Rc::new(RefCell::new(HashMap::new())),
+    );
     let env = EnvTap::from_witness(&witness.env);
 
     let mut conn = ClarityBlockConnection::from_writable_store(
@@ -134,6 +151,133 @@ pub fn execute_statelessly<'t>(
     Ok(StatelessBlock { receipts, writes })
 }
 
+/// MARF key holding the Clarity epoch (`ClarityDatabase::get_clarity_epoch_version`).
+pub const EPOCH_VERSION_KEY: &str = "vm-epoch::epoch-version";
+
+/// Contract metadata (side-table rows) by key, e.g. `vm-metadata::9::contract`.
+pub type ContractMetadata = HashMap<String, String>;
+
+/// A contract deployment to re-derive metadata from.
+pub struct ContractDeployment<'a> {
+    /// The deploy transaction (for a boot contract, the synthetic boot-code
+    /// transaction its epoch transition processes).
+    pub tx: &'a StacksTransaction,
+    /// Height of the deploying block (the contract commitment's height).
+    pub height: u32,
+    /// Epoch the deploying block ran in.
+    pub epoch: StacksEpochId,
+    /// `vm-epoch::epoch-version` as the deploy saw it (`None`: never set).
+    pub epoch_key: Option<String>,
+}
+
+/// Re-derive the metadata a contract deployment stored (AST, analysis,
+/// contract context, sizes, data-map/var/token types) by running the deploy
+/// through the real transaction path against a store that holds only
+/// `known` contracts (already re-derived; source hash and metadata).
+///
+/// Re-derivation is exact when analysis and initialization read nothing but
+/// those contracts and the deploy context (sender, sponsor, height, epoch):
+/// any other read fails with [`StatelessError::WitnessIncomplete`]. Contracts
+/// whose top-level code reads chain state need the deploy block's own read
+/// witness (see `NOTES.md`).
+pub fn derive_contract_metadata(
+    deploy: &ContractDeployment,
+    known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
+    mainnet: bool,
+    chain_id: u32,
+) -> Result<(QualifiedContractIdentifier, ContractMetadata), StatelessError> {
+    let TransactionPayload::SmartContract(ref contract, _) = deploy.tx.payload else {
+        return Err(StatelessError::Block(
+            ChainstateError::InvalidStacksTransaction("not a contract deploy".into(), false),
+        ));
+    };
+    let issuer = PrincipalData::from(deploy.tx.origin_address());
+    let PrincipalData::Standard(ref issuer_std) = issuer else {
+        unreachable!("origin addresses are standard principals");
+    };
+    let contract_id = QualifiedContractIdentifier::new(issuer_std.clone(), contract.name.clone());
+
+    let open_tip = StacksBlockId::new(&MINER_BLOCK_CONSENSUS_HASH, &MINER_BLOCK_HEADER_HASH);
+    let entries = vec![
+        (
+            StoreQuery::Data {
+                at: None,
+                key: make_contract_hash_key(&contract_id),
+            },
+            None,
+        ),
+        (
+            StoreQuery::BlockAtHeight {
+                at: None,
+                height: deploy.height,
+            },
+            Some(open_tip.to_hex()),
+        ),
+    ];
+    let mut setup = vec![];
+    if let Some(epoch_key) = deploy.epoch_key.as_ref() {
+        setup.push((EPOCH_VERSION_KEY.to_string(), epoch_key.clone()));
+    }
+    let mut metadata = HashMap::new();
+    for (known_id, (hash, rows)) in known.iter() {
+        let commitment = ContractCommitment {
+            hash: hash.clone(),
+            block_height: deploy.height,
+        };
+        setup.push((make_contract_hash_key(known_id), commitment.serialize()));
+        for (key, value) in rows.iter() {
+            metadata.insert((known_id.to_string(), key.clone()), value.clone());
+        }
+    }
+    let metadata = Rc::new(RefCell::new(metadata));
+    let missing = Rc::new(RefCell::new(vec![]));
+    let store = WitnessStore::new(
+        open_tip,
+        deploy.height,
+        &entries,
+        setup.into_iter(),
+        missing.clone(),
+        metadata.clone(),
+    );
+    let env = EnvTap::from_witness(&[]);
+    let mut conn = ClarityBlockConnection::from_writable_store_unmetered(
+        Box::new(store),
+        &env,
+        &env,
+        mainnet,
+        chain_id,
+        deploy.epoch,
+    );
+    let origin = StacksAccount {
+        principal: issuer.clone(),
+        nonce: deploy.tx.get_origin_nonce(),
+        stx_balance: STXBalance::zero(),
+    };
+    let receipt = conn.as_transaction(|tx_conn| {
+        StacksChainState::process_transaction_payload(
+            tx_conn,
+            deploy.tx,
+            &origin,
+            &TransactionResourceBudgets::unlimited(),
+        )
+    });
+    conn.rollback_block();
+
+    let mut missing = missing.take();
+    missing.extend(env.missing());
+    if !missing.is_empty() {
+        return Err(StatelessError::WitnessIncomplete(missing));
+    }
+    receipt.map_err(StatelessError::Block)?;
+    let wanted = contract_id.to_string();
+    let rows = metadata
+        .take()
+        .into_iter()
+        .filter_map(|((contract, key), value)| (contract == wanted).then_some((key, value)))
+        .collect();
+    Ok((contract_id, rows))
+}
+
 /// A writable Clarity store with no state of its own: reads come from the
 /// block's earlier writes or the witness, writes go to memory.
 struct WitnessStore {
@@ -142,10 +286,10 @@ struct WitnessStore {
     open_height: u32,
     at: Option<StacksBlockId>,
     /// This block's writes so far (key and path), and contract metadata it
-    /// inserted (contracts deployed in this block).
+    /// inserted (contracts deployed in this block), by contract and key.
     overlay: HashMap<String, String>,
     path_overlay: HashMap<TrieHash, String>,
-    metadata: HashMap<(String, String), String>,
+    metadata: Rc<RefCell<HashMap<(String, String), String>>>,
     missing: Rc<RefCell<Vec<String>>>,
     write_log: StateWriteLog,
     /// Unused; the trait requires a side store.
@@ -153,27 +297,36 @@ struct WitnessStore {
 }
 
 impl WitnessStore {
-    fn new(witness: &ReadWitness, setup: &[StateWrite], missing: Rc<RefCell<Vec<String>>>) -> Self {
+    /// A store for a block at `open_tip` / `open_height` that answers from
+    /// `entries`, starting from the `setup` writes and `metadata`.
+    fn new(
+        open_tip: StacksBlockId,
+        open_height: u32,
+        entries: &[(StoreQuery, Option<String>)],
+        setup: impl Iterator<Item = (String, String)>,
+        missing: Rc<RefCell<Vec<String>>>,
+        metadata: Rc<RefCell<HashMap<(String, String), String>>>,
+    ) -> Self {
         let mut answers = HashMap::new();
-        for (query, answer) in witness.store.iter() {
+        for (query, answer) in entries.iter() {
             answers
                 .entry(query.clone())
                 .or_insert_with(|| answer.clone());
         }
         let mut store = WitnessStore {
             answers,
-            open_tip: witness.open_tip.clone(),
-            open_height: witness.open_height,
+            open_tip,
+            open_height,
             at: None,
             overlay: HashMap::new(),
             path_overlay: HashMap::new(),
-            metadata: HashMap::new(),
+            metadata,
             missing,
             write_log: StateWriteLog::default(),
             side_store: SqliteConnection::memory().expect("in-memory sqlite"),
         };
-        for write in setup.iter() {
-            store.apply(write.key.clone(), write.value.clone());
+        for (key, value) in setup {
+            store.apply(key, value);
         }
         store
     }
@@ -314,6 +467,7 @@ impl ClarityBackingStore for WitnessStore {
         value: &str,
     ) -> Result<(), VmExecutionError> {
         self.metadata
+            .borrow_mut()
             .insert((contract.to_string(), key.to_string()), value.to_string());
         Ok(())
     }
@@ -350,6 +504,7 @@ impl WitnessStore {
         if block == self.open_tip {
             return Ok(self
                 .metadata
+                .borrow()
                 .get(&(contract.to_string(), key.to_string()))
                 .cloned());
         }
