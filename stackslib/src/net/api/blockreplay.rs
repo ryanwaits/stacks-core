@@ -296,10 +296,14 @@ where
         ));
     };
 
-    let burn_dbconn = match sortdb.index_handle_at_block(chainstate, &parent_block_id) {
-        Ok(burn_dbconn) => burn_dbconn,
-        Err(_) => return Err(ChainError::NoSuchBlockError),
+    // the burn view live processing gives the block: its own tenure change's,
+    // else its parent's
+    let burn_view = NakamotoChainState::get_block_burn_view(sortdb, &block, &parent_stacks_header)?;
+    let Some(burn_view_sn) = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), &burn_view)?
+    else {
+        return Err(ChainError::NoSuchBlockError);
     };
+    let burn_dbconn = sortdb.index_handle(&burn_view_sn.sortition_id);
 
     let tenure_change = block
         .txs

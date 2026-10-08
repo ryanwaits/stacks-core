@@ -27,7 +27,9 @@ use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::chainstate::StacksBlockId;
 
 use crate::burnchains::Txid;
-use crate::chainstate::nakamoto::tests::stateless_reexec::{block_with_tx, HistoryFixture};
+use crate::chainstate::nakamoto::tests::stateless_reexec::{
+    block_with_tx, BurnViewFixture, HistoryFixture,
+};
 use crate::chainstate::nakamoto::NakamotoBlock;
 use crate::chainstate::stacks::events::TransactionOrigin;
 use crate::clarity_vm::witness_client::{check_replayed_block, ClientParams, Report};
@@ -184,6 +186,16 @@ fn served_witness_verifies_and_reexecutes_over_http() {
         assert_eq!(receipt_events(receipt), tx.events);
         assert_eq!(receipt.result, tx.result_hex);
     }
+}
+
+/// A tenure-start block: the burn view comes from its own tenure change.
+#[test]
+fn served_witness_verifies_a_tenure_start_block_over_http() {
+    let (fx, tenures, balances) = BurnViewFixture::new();
+    let fetched = fetch(function_name!(), tenures, balances, &fx.call);
+    let report = fetched.check(&fetched.replay_body);
+    eprintln!("{report}");
+    assert!(report.ok(), "{report}");
 }
 
 /// One byte of a witness value changed in transit: the entry's own proof

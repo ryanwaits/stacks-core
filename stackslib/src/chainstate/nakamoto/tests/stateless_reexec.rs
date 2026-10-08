@@ -31,7 +31,7 @@ use crate::chainstate::nakamoto::TxToProcess;
 use crate::chainstate::stacks::events::{StacksTransactionReceipt, TransactionOrigin};
 use crate::chainstate::stacks::index::marf::MarfConnection;
 use crate::chainstate::stacks::index::MARFValue;
-use crate::chainstate::stacks::StacksTransaction;
+use crate::chainstate::stacks::{StacksTransaction, TransactionPayload};
 use crate::clarity_vm::read_witness::{EnvQuery, ReadWitness, StoreQuery};
 use crate::clarity_vm::state_writes::StateWrite;
 use crate::clarity_vm::stateless::{
@@ -40,7 +40,7 @@ use crate::clarity_vm::stateless::{
 use crate::core::test_util::{
     make_contract_call_tx, make_contract_publish_tx, make_stacks_transfer_tx, to_addr,
 };
-use crate::net::api::blockreplay::{remine_nakamoto_block, ReplayTrace};
+use crate::net::api::blockreplay::{receipt_events, remine_nakamoto_block, ReplayTrace};
 use crate::net::test::{TestEventObserver, TestEventObserverBlock, TestPeer};
 use crate::net::tests::{NakamotoBootPlan, NakamotoBootStep, NakamotoBootTenure};
 
@@ -187,6 +187,53 @@ impl HistoryFixture {
 
     pub(crate) fn var_key(&self, var: &str) -> String {
         format!("vm::{}::1::{var}", self.ledger)
+    }
+}
+
+const BURN_VIEW_SRC: &str = "
+(define-public (where-am-i)
+  (begin
+    (print {event: \"where\", burn: burn-block-height, tenure: tenure-height,
+            prev-burn-hash: (get-burn-block-info? header-hash (- burn-block-height u1))})
+    (ok burn-block-height)))
+";
+
+/// Two tenures. The second tenure's first block (a tenure-start block, whose
+/// burn view is newer than its parent's) reads `burn-block-height` and the
+/// burn header below it.
+pub(crate) struct BurnViewFixture {
+    pub(crate) call: Txid,
+}
+
+impl BurnViewFixture {
+    pub(crate) fn new() -> (Self, Vec<NakamotoBootTenure>, Vec<(PrincipalData, u64)>) {
+        let privk = StacksPrivateKey::from_seed(b"burn-view");
+        let sender = to_addr(&privk);
+        let deploy = make_contract_publish_tx(
+            &privk,
+            0,
+            1000,
+            CHAIN_ID_TESTNET,
+            "where",
+            BURN_VIEW_SRC,
+            Some(ClarityVersion::Clarity3),
+        );
+        let call = make_contract_call_tx(
+            &privk,
+            1,
+            1000,
+            CHAIN_ID_TESTNET,
+            &sender,
+            ContractName::from_literal("where"),
+            ClarityName::from_literal("where-am-i"),
+            &[],
+        );
+        let fixture = BurnViewFixture { call: call.txid() };
+        let tenures = vec![
+            NakamotoBootTenure::Sortition(vec![NakamotoBootStep::Block(vec![deploy])]),
+            NakamotoBootTenure::Sortition(vec![NakamotoBootStep::Block(vec![call])]),
+        ];
+        (fixture, tenures, vec![(sender.into(), 10_000_000)])
     }
 }
 
@@ -629,6 +676,45 @@ fn block_replay_reads_at_block_values_at_the_named_block() {
         live.receipt(&fx.snapshot).result,
         "replay read at-block state somewhere other than the named block"
     );
+}
+
+/// A tenure-start block's burn view is its own tenure change's, newer than
+/// its parent's. Replay must use it, as live processing does.
+#[test]
+fn block_replay_uses_the_tenure_change_burn_view() {
+    let observer = TestEventObserver::new();
+    let (fx, tenures, balances) = BurnViewFixture::new();
+    let mut peer = boot(function_name!(), &observer, tenures, balances);
+    let block = block_with_tx(&observer, &fx.call);
+    let live = LiveBlock::of(&block);
+    assert!(live
+        .txs
+        .iter()
+        .any(|tx| matches!(tx.payload, TransactionPayload::TenureChange(_))));
+
+    let sortdb = peer.chain.sortdb.take().unwrap();
+    let mut node = peer.chain.stacks_node.take().unwrap();
+    let replayed = remine_nakamoto_block(
+        &block.metadata.index_block_hash(),
+        &sortdb,
+        &mut node.chainstate,
+        false,
+        ReplayTrace::default(),
+        |block| block.txs.clone(),
+        |_| Ok(()),
+    )
+    .expect("replay succeeds");
+    peer.chain.sortdb = Some(sortdb);
+    peer.chain.stacks_node = Some(node);
+
+    let replayed_call = replayed
+        .transactions
+        .iter()
+        .find(|tx| tx.txid == fx.call)
+        .unwrap();
+    let live_call = live.receipt(&fx.call);
+    assert_eq!(replayed_call.result_hex, live_call.result);
+    assert_eq!(replayed_call.events, receipt_events(live_call));
 }
 
 /// Replay (the route a deployed node offers) records the read witness live
