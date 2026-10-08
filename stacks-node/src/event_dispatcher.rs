@@ -133,16 +133,24 @@ pub const PATH_BLOCK_PROCESSED: &str = "new_block";
 pub const PATH_ATTACHMENT_PROCESSED: &str = "attachments/new";
 pub const PATH_PROPOSAL_RESPONSE: &str = "proposal_response";
 
-/// Block-order `vm_events` for one observer. Order in the array is the index.
+/// Execution-order `vm_events` for one observer. Order in the array is the index.
 /// Aborted / problematic-skipped receipts contribute nothing. Type filter is
 /// applied first, so a storage-only observer's array is dense in storage writes.
+///
+/// An epoch 2.x block runs the parent's confirmed microblock transactions before
+/// its own burn operations and anchored transactions, but its receipts list
+/// them last. Emitting in receipt order would let an earlier write to a key
+/// follow a later one, so microblock receipts go first.
 fn serialize_block_vm_events(
     receipts: &[StacksTransactionReceipt],
     include_storage: bool,
     include_contract_calls: bool,
 ) -> serde_json::Value {
+    let (microblock, anchored): (Vec<_>, Vec<_>) = receipts
+        .iter()
+        .partition(|receipt| receipt.microblock_header.is_some());
     let mut out = Vec::new();
-    for receipt in receipts {
+    for receipt in microblock.into_iter().chain(anchored) {
         if receipt.post_condition_aborted || receipt.problematic_skipped.is_some() {
             continue;
         }

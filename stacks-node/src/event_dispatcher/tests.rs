@@ -1483,3 +1483,81 @@ fn state_writes_payload_uses_transaction_positions() {
         ])
     );
 }
+
+#[test]
+/// A block's confirmed microblock transactions run before its anchored ones,
+/// though its receipts list them last. `vm_events` follow execution, so a key
+/// written in a microblock and again in the anchored block ends on the anchored
+/// write.
+fn vm_events_put_microblock_writes_before_anchored_writes() {
+    use clarity::vm::events::{StorageEvent, VarSetEventData, VmTraceEvent};
+    use clarity::vm::types::QualifiedContractIdentifier;
+    use stacks::chainstate::stacks::StacksMicroblock;
+
+    let var_set = |raw_value: &str| {
+        VmTraceEvent::Storage(StorageEvent::VarSet(VarSetEventData {
+            contract_identifier: QualifiedContractIdentifier::local("counter").unwrap(),
+            var_name: "n".into(),
+            raw_value: raw_value.into(),
+        }))
+    };
+    let microblock_header =
+        StacksMicroblock::first_unsigned(&BlockHeaderHash([7u8; 32]), vec![]).header;
+    let receipt = |txid: u8, microblock: bool, raw_value: &str| StacksTransactionReceipt {
+        transaction: TransactionOrigin::Burn(BlockstackOperationType::PreStx(PreStxOp {
+            output: StacksAddress::new(0, Hash160([1; 20])).unwrap(),
+            txid: Txid([txid; 32]),
+            vtxindex: 0,
+            block_height: 1,
+            burn_header_hash: BurnchainHeaderHash([5u8; 32]),
+        })),
+        events: vec![],
+        post_condition_aborted: false,
+        result: Value::okay_true(),
+        contract_analysis: None,
+        execution_cost: ExecutionCost::ZERO,
+        microblock_header: microblock.then(|| microblock_header.clone()),
+        vm_error: None,
+        problematic_skipped: None,
+        vm_events: vec![var_set(raw_value)],
+        stx_burned: 0u128,
+        tx_index: 0,
+    };
+    // Receipt order as `append_block` builds it: anchored first, microblocks last.
+    let receipts = vec![
+        receipt(1, false, "0x0102"),
+        receipt(2, true, "0x0100"),
+        receipt(3, true, "0x0101"),
+    ];
+
+    let events = serialize_block_vm_events(&receipts, true, false);
+    let values: Vec<_> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| {
+            event["var_set_event"]["raw_value"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(values, vec!["0x0100", "0x0101", "0x0102"]);
+
+    // `state_writes` keep pointing into the payload's `transactions` array
+    // (receipt order), whatever order `vm_events` use.
+    let write = |txid: u8| StateWrite {
+        txid: Some(Txid([txid; 32])),
+        key: format!("k{txid}"),
+        value: "01".into(),
+    };
+    let writes = serialize_block_state_writes(&[write(2), write(3), write(1)], &receipts);
+    for entry in writes.as_array().unwrap() {
+        let tx_index = entry["tx_index"].as_u64().unwrap() as usize;
+        let owner = entry["key"].as_str().unwrap().trim_start_matches('k');
+        assert_eq!(
+            receipts[tx_index].transaction.txid(),
+            Txid([owner.parse().unwrap(); 32])
+        );
+    }
+}
