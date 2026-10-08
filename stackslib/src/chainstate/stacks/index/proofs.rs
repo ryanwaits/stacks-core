@@ -81,7 +81,7 @@ impl<T: MarfTrieId> ProofTrieNode<T> {
         &self.ptrs
     }
 
-    fn try_from_trie_node<N: TrieNode, M: BlockMap>(
+    pub(super) fn try_from_trie_node<N: TrieNode, M: BlockMap>(
         other: &N,
         block_map: &mut M,
     ) -> Result<ProofTrieNode<T>, Error> {
@@ -479,7 +479,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     /// Make the initial shunt proof in a MARF merkle proof, for a node that isn't a backptr.
     /// This is a one-item list of a TrieMerkleProofType::Shunt proof entry.
     /// The storage handle must be opened to the block we care about.
-    fn make_initial_shunt_proof(
+    pub(super) fn make_initial_shunt_proof(
         storage: &mut TrieStorageConnection<T>,
     ) -> Result<Vec<TrieMerkleProofType<T>>, Error> {
         let backptr_ancestor_hashes = Trie::get_trie_ancestor_hashes_bytes(storage)?;
@@ -509,7 +509,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     ///
     /// All intermediate shunt proofs will contain all ancestor hashes for each node in-between the
     /// backptr and the non-backptr node.  The intermediate root hashes will be calculated by the verifier.
-    fn make_backptr_shunt_proof(
+    pub(super) fn make_backptr_shunt_proof(
         storage: &mut TrieStorageConnection<T>,
         backptr: &TriePtr,
     ) -> Result<Vec<TrieMerkleProofType<T>>, Error> {
@@ -839,7 +839,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     }
 
     /// Given a list of non-backptr ptrs and a root block header hash, calculate a Merkle proof.
-    fn make_segment_proof(
+    pub(super) fn make_segment_proof(
         storage: &mut TrieStorageConnection<T>,
         ptrs: &[TriePtr],
         starting_chr: u8,
@@ -954,7 +954,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
     }
 
     /// Given a segment proof, extract the path prefix it encodes
-    fn get_segment_proof_path_prefix(segment_proof: &[TrieMerkleProofType<T>]) -> Option<Vec<u8>> {
+    pub(super) fn get_segment_proof_path_prefix(segment_proof: &[TrieMerkleProofType<T>]) -> Option<Vec<u8>> {
         let mut path_parts = vec![];
         for proof_node in segment_proof {
             match proof_node {
@@ -1112,7 +1112,7 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             return false;
         }
 
-        let (mut node_hash, node_data) = match proof.first() {
+        let (node_hash, node_data) = match proof.first() {
             Some(TrieMerkleProofType::Leaf((_, ref node))) => {
                 (get_leaf_hash(node), node.data.clone())
             }
@@ -1128,10 +1128,41 @@ impl<T: MarfTrieId> TrieMerkleProof<T> {
             return false;
         }
 
+        TrieMerkleProof::verify_proof_chain(proof, node_hash, root_hash, root_to_block)
+    }
+
+    /// Every intermediate node in `proof` carries as many child pointers as
+    /// its node type has, so hashing it cannot panic.
+    fn is_proof_well_shaped(proof: &[TrieMerkleProofType<T>]) -> bool {
+        proof.iter().all(|step| match step {
+            TrieMerkleProofType::Node4((_, node, _)) => node.ptrs.len() == 4,
+            TrieMerkleProofType::Node16((_, node, _)) => node.ptrs.len() == 16,
+            TrieMerkleProofType::Node48((_, node, _)) => node.ptrs.len() == 48,
+            TrieMerkleProofType::Node256((_, node, _)) => node.ptrs.len() == 256,
+            TrieMerkleProofType::Leaf(_) | TrieMerkleProofType::Shunt(_) => true,
+        })
+    }
+
+    /// Hash `proof` up from the hash of its deepest node (`node_hash`):
+    /// segment proofs within each trie, shunt proofs across tries (resolving
+    /// each trie root to its block through `root_to_block`), and require the
+    /// result to be `root_hash`. The first segment may be empty, when the
+    /// deepest node is itself a trie root.
+    pub(super) fn verify_proof_chain(
+        proof: &[TrieMerkleProofType<T>],
+        mut node_hash: TrieHash,
+        root_hash: &TrieHash,
+        root_to_block: &HashMap<TrieHash, T>,
+    ) -> bool {
+        if !TrieMerkleProof::is_proof_well_shaped(proof) {
+            test_debug!("Invalid proof -- a node has the wrong number of children");
+            return false;
+        }
+
         let mut i = 0;
 
         // verify the very first segment proof
-        let mut j = i + 1;
+        let mut j = i;
         while let Some(proof_step) = proof.get(j) {
             if let TrieMerkleProofType::Shunt(_) = proof_step {
                 break;

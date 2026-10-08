@@ -30,6 +30,7 @@ use crate::chainstate::stacks::index::trie::*;
 use crate::chainstate::stacks::index::{MARFValue, MarfTrieId, TrieLeaf, TrieMerkleProof};
 use crate::chainstate::stacks::{BlockHeaderHash, TrieHash};
 
+pub mod absence;
 pub mod file;
 pub mod marf;
 pub mod marf_perfs;

@@ -26,6 +26,7 @@ use stacks_common::types::chainstate::{
 
 use crate::util_lib::db::Error as db_error;
 
+pub mod absence;
 pub mod bits;
 pub mod blob_layout;
 pub mod cache;
@@ -43,7 +44,7 @@ pub mod test;
 
 use crate::chainstate::stacks::index::node::TrieNodePatch;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TrieMerkleProof<T: MarfTrieId>(pub Vec<TrieMerkleProofType<T>>);
 
 pub trait ClarityMarfTrieId:
