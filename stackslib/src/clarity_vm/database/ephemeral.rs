@@ -21,11 +21,11 @@ use clarity::vm::database::sqlite::{
     sqlite_insert_metadata,
 };
 use clarity::vm::database::{ClarityBackingStore, SpecialCaseHandler, SqliteConnection};
-use clarity::vm::errors::{RuntimeError, VmExecutionError, VmInternalError};
+use clarity::vm::errors::{VmExecutionError, VmInternalError};
 use clarity::vm::types::QualifiedContractIdentifier;
 use rusqlite::{self, Connection};
 use stacks_common::codec::StacksMessageCodec;
-use stacks_common::types::chainstate::{BlockHeaderHash, StacksBlockId, TrieHash};
+use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::types::sqlite::NO_PARAMS;
 
 use crate::chainstate::stacks::index::marf::{MarfConnection, MarfTransaction, MARF};
@@ -394,25 +394,10 @@ impl ClarityBackingStore for EphemeralMarfStore<'_> {
             return Ok(old_tip);
         }
 
-        // this bhh is not ephemeral, so it might be disk-backed.
-        self.read_only_marf
-            .check_ancestor_block_hash(&bhh)
-            .map_err(|e| match e {
-                Error::NotFoundError => {
-                    test_debug!("No such block {:?} (NotFoundError)", &bhh);
-                    RuntimeError::UnknownBlockHeaderHash(BlockHeaderHash(bhh.0))
-                }
-                Error::NonMatchingForks(_bh1, _bh2) => {
-                    test_debug!(
-                        "No such block {:?} (NonMatchingForks({}, {}))",
-                        &bhh,
-                        BlockHeaderHash(_bh1),
-                        BlockHeaderHash(_bh2)
-                    );
-                    RuntimeError::UnknownBlockHeaderHash(BlockHeaderHash(bhh.0))
-                }
-                _ => panic!("ERROR: Unexpected MARF failure: {}", e),
-            })?;
+        // this bhh is not ephemeral, so it might be disk-backed: point the
+        // disk-backed MARF at it, so reads (e.g. inside `at-block`) see that
+        // block's state rather than the base tip's.
+        self.read_only_marf.set_block_hash(bhh.clone())?;
 
         let old_tip = mem::replace(&mut self.open_tip, EphemeralTip::Disk(bhh));
         Ok(old_tip.into_block_id())
