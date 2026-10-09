@@ -4,9 +4,11 @@ Phase 1 (below, through "Why replay diverged"): re-execute a block from a
 read witness. Phase 2a (after it): make every witness entry provable and
 verify it. Phase 2b prep: serve the proof-carrying witness from
 `/v3/blocks/replay`, a wire format, and a client that verifies and
-re-executes a mainnet block. Phase 2c (last): deploy witnesses for
+re-executes a mainnet block. Phase 2c: deploy witnesses for
 contracts whose deploy reads chain state, and one shared MARF proof per
-served witness instead of one proof per read (wire format v2).
+served witness instead of one proof per read (wire format v2). Phase 2d
+(last): a deploy's own environment lookups (burn heights, burn header
+hashes, older blocks' info) and tenure-height lookups made provable.
 
 # Phase 1: re-execute from a read witness
 
@@ -249,7 +251,7 @@ The verifier:
 | `BurnHeaderHash(h, sortition)` | `get-burn-block-info? header-hash` | b | Bitcoin header at h, if first burn height ≤ h ≤ burn view. Only the burn view's sortition is accepted |
 | `BurnBlockHeight(sortition)`, `SortitionIdFromConsensusHash` | internal | b | Preimage of a sortition's consensus hash |
 | `StacksEpoch`, `StacksEpochById`, unlock heights, PoX activation heights, `BurnStartHeight`, prepare and cycle lengths, rejection fraction | epoch gates, PoX, lockup | const | Network constants |
-| `StacksHeightForTenureHeight` | `get-block-info?` and `block-height` in Clarity 1/2 contracts on Nakamoto | c | Provable with MARF proofs of `_stx-data::tenure_height` at two adjacent headers. Not implemented |
+| `StacksHeightForTenureHeight` | `get-block-info?` in Clarity 1/2 contracts on Nakamoto (not on the testnet chain id) | tenure | Since phase 2d: MARF walks of `_stx-data::tenure_height` at the tenure's first block and its parent (see phase 2d) |
 | `MinerAddress` | `get-block-info? miner-address`, `get-tenure-info? miner-address` | c | Tenure's miner payment address (headers DB `payments`). Likely the coinbase's origin or alt recipient, so provable by coinbase inclusion once that equality is checked. Not implemented |
 | `TokensSpentWinning` | `get-tenure-info? miner-spend-winner` | c | The winning block-commit's burn: an SPV tx proof of the commit in the sortition's Bitcoin block, then parse it |
 | `TokensSpent` | `get-tenure-info? miner-spend-total` | c | Sum over all of the sortition's block-commits: the full Bitcoin block (or a proof of every commit in it) |
@@ -301,10 +303,10 @@ Other environment checks:
 
 ## Remaining gaps
 
-1. **Environment classes (c) and (d)** (table above). A block that reads them is rejected, not accepted.
+1. **Environment classes (c) and (d)** (table above). A block that reads them is rejected, not accepted. Phase 2d moved the tenure-height lookup out of (c) and classified the rest (what evidence each needs).
 2. **Burn view recency.** The verifier checks that the tenure change is in this tenure, not that no later extend happened before the block. A client verifying blocks in order has every tx list and can check it. A one-block client needs every intermediate block's tx list.
 3. **Nested `at-block`.** Ancestry is checked against the parent, not the enclosing `at-block` target.
-4. ~~**Contracts whose initialization reads chain state** need the deploy block's own witness (recursive).~~ Store reads: deploy witness (phase 2c), with the limits listed there. Environment lookups at deploy: still rejected. Boot contracts not in the table are rejected.
+4. ~~**Contracts whose initialization reads chain state** need the deploy block's own witness (recursive).~~ Store reads: deploy witness (phase 2c), with the limits listed there. Environment lookups at deploy: provable since phase 2d except classes (c)/(d) and burn-view lookups in an epoch 2.x deploy. Boot contracts not in the table are rejected.
 5. **Block-level writes** (setup and teardown, coinbase-attached events) are still inputs. Not covered.
 6. **Epoch 2.x and microblocks**: no tests.
 7. **Signer signatures and Bitcoin PoW** are assumed checked by whoever builds `HeaderChain` / `BitcoinChain`.
@@ -540,7 +542,7 @@ What a deploy read proves, and what it cannot:
 - **`_stx-data::ustx_liquid_supply` always lands in "assumed after".** Every block's teardown rewrites it after its transactions (`finish_block` adds unlocks and matured rewards, even 0). So the value at P is what a deploy sees, unless an earlier transaction in D burned STX.
 - **Closing it** needs D's own read witness up to the deploy transaction (re-execute D's prefix). Not done.
 - **Same-block dependencies.** If X was deployed earlier in D and C's deploy reads X's state, P has none of it. The read is flagged "assumed after" and the metadata will not match (rejected). Analysis-only dependencies are fine: `ledger` and `relay` in the history fixture share a block.
-- **Environment lookups at deploy** (`burn-block-height`, `block-height` for Clarity 1/2 on Nakamoto, `get-*-info?`) need D's burn view. Not provable in a deploy yet: the contract is served unproven, naming the lookup (`born` test).
+- **Environment lookups at deploy** (`burn-block-height`, `get-*-info?`) need D's burn view and the same evidence as a block's own lookups. ~~Not provable in a deploy yet.~~ Provable since phase 2d, except classes (c)/(d) (served unproven, naming the lookup) and burn-view lookups in an epoch 2.x deploy.
 - **Epoch 2.x deploys in a microblock** are not in D's anchored tx list: unprovable (deploy tx not found).
 
 ## Shared proofs
@@ -600,7 +602,7 @@ children, and a shared ancestor-hash table.
 | Test | Shows |
 |---|---|
 | `contracts_whose_deploy_reads_chain_state_rederive_from_a_deploy_witness` (HTTP) | `kiki-token` keeps `stx-liquid-supply` in a constant and mints at deploy; `kiki-wrapper` (next block) keeps what it reads from `kiki-token` at deploy. Both carry deploy witnesses (3 reads: 2 settled, `ustx_liquid_supply` "assumed after"), re-derive, and the calling block is VERIFIED. One deploy-read value changed in transit: rejected, `deploy read Data { …ustx_liquid_supply }: MARF proof fails` |
-| `unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs` | Unchanged outcome: a deploy reading `burn-block-height` is served unproven, naming the lookup |
+| `unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs` | Unchanged outcome: a deploy reading `burn-block-height` is served unproven, naming the lookup (phase 2d: that lookup is provable; the test now reads a class (c) lookup) |
 | `tampered_witness_byte_fails_naming_the_entry` | A flipped bit in the shared proof's ancestor table: the trie no longer hashes, every entry read through it is rejected by name (incl. `note`); re-execution is skipped (metadata did not re-derive). A flipped bit in the final-write proof fails `write proofs` |
 | `absent_and_present_reads_verify_from_one_shared_proof` | 300 absent + 320 present keys at the tip, absent walks ending in the tip trie and through back-pointers in older ones; a present key is never absent from it and vice versa |
 | `tampering_with_any_byte_of_a_shared_proof_breaks_it` | Bits 0x01 and 0x80 of every byte of a 5-read, multi-trie proof, plus truncation and a trailing byte: each is caught |
@@ -629,5 +631,119 @@ bytes per back-pointer, 34 per pruned child.
 
 ## Still to expect on mainnet
 
-- **Deploy witnesses.** Both mainnet failures should move: `pox4-pools` reads `ustx_liquid_supply` (shown as "assumed after"), and `kiki-token` reads and writes its own FT keys (settled). Blockers that would still reject them: an environment lookup at deploy (`block-height` in Clarity 1/2 on Nakamoto is class (c)), a deploy in an epoch 2.x microblock, or `token-wkiki` reading `kiki-token` state at deploy when both were deployed in the same block. Never run on mainnet.
+- **Deploy witnesses.** Both mainnet failures should move: `pox4-pools` reads `ustx_liquid_supply` (shown as "assumed after"), and `kiki-token` reads and writes its own FT keys (settled). Blockers that would still reject them: an environment lookup at deploy (since phase 2d only classes (c)/(d), or a burn-view lookup in an epoch 2.x deploy), a deploy in an epoch 2.x microblock, or `token-wkiki` reading `kiki-token` state at deploy when both were deployed in the same block. Run after 2c: 11 of 12 VERIFIED, 1,230,200 among them; 1,170,254 rejected on a deploy lookup (see phase 2d).
 - **Size and time.** Both now scale with distinct tries and nodes. A mainnet block crosses many more tries (1,113,075 had 1,239 entries + 408 writes). Each distinct trie costs its root node (~0.3–1.5 KB in this format), its skip-list references, one skip-list computation (memoized), and a header in the response. Expect single-digit MB and seconds, not 430 MB and 20 minutes. Unmeasured.
+
+# Phase 2d: burn and tenure lookups
+
+Mainnet run after 2c: 11 of 12 DeFi blocks VERIFIED. 1,170,254 failed only
+on `SP001SFSMC2ZY76PD4M68P3WGX154XCH7NE3TYMX.pox4-pools`: its deploy makes
+`burn_block_height_for_block(<older block>)`, and a deploy witness carried
+store reads only.
+
+Burn lookups were already provable for a block's own lookups (class (b):
+consensus-hash preimage plus Bitcoin header). The gap was the deploy: its
+lookups were not recorded, there was no evidence for them, and no burn view
+for the deploying block. Phase 2d closes it with the same evidence.
+
+```
+prover (C deployed in D)
+  re-derive C with a live environment: headers DB + sortition DB at D's burn view
+  (EnvTap::recording), store reads in rounds as in 2c; every lookup recorded
+  ├─ class (c)/(d) lookup      → C unprovable, lookup named
+  ├─ burn-view lookup           → D's burn-view tenure change (in D, else earlier in D's tenure)
+  └─ tenure-height lookup       → MARF walks into the shared proof
+  serve: headers, preimages, Bitcoin headers, coinbases the lookups need (as for the block's)
+client
+  each deploy lookup: verify_env, as the block's own, with D's burn view
+  re-derive C answering exactly those lookups (EnvTap::from_witness); anything else is missing
+```
+
+| Piece | Where |
+|---|---|
+| `EnvClass` (what each lookup is proven by), `tenure_start_facts`, `prove_env_reads`, `DeployEnvSource`, `verify_deploy_env`, `tenure_change_view` | `witness_proof.rs` |
+| `ContractDeployment::env` (the tap a re-derivation answers lookups from) | `stateless.rs` |
+| `NodeDeployEnv`, `EnvNeeds` (evidence a set of lookups needs), `NodeBlocks::burn_view_change` | `witness_serve.rs` |
+| Wire: `contracts[].deploy_env`, `contracts[].burn_view` | `witness_wire.rs` |
+
+## Evidence and trust
+
+| Lookup | Clarity surface | Evidence | Trusted |
+|---|---|---|---|
+| `BurnBlockHeightForBlock(id)` | `burn-block-height` in 2.x (id = parent), epoch of a block for `get-stacks-block-info?` / `get-block-info?` / `get-tenure-info?` | id's header (hashed to id) → consensus hash → preimage → burn header hash → its height in the Bitcoin chain | Bitcoin heights |
+| `BurnHeaderHashForBlock(id)` | `get-tenure-info? burnchain-header-hash`, `get-block-info? burnchain-header-hash` | same, preimage bytes 4..36 | nothing beyond headers |
+| `BurnBlockTime(id)` | `get-tenure-info? time`, `get-block-info? time` | same, Bitcoin header timestamp | Bitcoin headers |
+| `TipBurnBlockHeight`, `TipSortitionId` | `burn-block-height` on 3.x, `get-burn-block-info?` | burn-view tenure change (tx Merkle path) → preimage → height; sortition id = sha512/256(burn hash ‖ pox id) | Bitcoin heights, burn-view recency (gap 2) |
+| `BurnHeaderHash(h, view)` | `get-burn-block-info? header-hash` | Bitcoin header at h, first burn height ≤ h ≤ view height | Bitcoin chain |
+| `BurnBlockHeight(sortition)`, `SortitionIdFromConsensusHash` | internal | preimage | Bitcoin heights |
+| `StacksHeightForTenureHeight(tip, th) = s` | `get-block-info?` in Clarity 1/2 on Nakamoto | at tip's root: `__MARF_BLOCK_HEIGHT_TO_HASH::s` = B (B = tip if s is tip's height); at B's root: `_stx-data::tenure_height` = th and `__MARF_BLOCK_HEIGHT_TO_HASH::(s-1)` = P; at P's root: `tenure_height` = th - 1 | nothing beyond headers |
+
+**Why Bitcoin heights stay trusted input.** Nothing a Stacks header commits
+to carries a burn height:
+
+- Nakamoto headers carry none; the preimage holds the burn hash, ops hash, total burn, PoX id and earlier consensus hashes (their count is only ~log2 of the distance from the first burn block).
+- The Clarity MARF holds no burn height: its bookkeeping keys are `__MARF_BLOCK_HASH_TO_HEIGHT`, `__MARF_BLOCK_HEIGHT_TO_HASH`, `__MARF_BLOCK_HEIGHT_SELF` (Stacks heights) and `_stx-data::{tenure_height, ustx_liquid_supply, clarity_storage::block_time}`; PoX contract state stores reward-cycle data, not a height index.
+- The sortition DB has its own MARF (root in each snapshot's `index_root`), and the headers DB has one for the Nakamoto tenure keys (`index.sqlite`). Neither root is in a header or in the consensus-hash preimage.
+
+So a burn height is the position of a burn hash in a proof-of-work-checked
+Bitcoin header chain from a checkpoint (as `@secondlayer/verify`
+`bitcoin/chain.ts` does). Here the client builds `BitcoinChain` from the
+served `{height, hash, parent, time}` (heights from the node's sortition
+DB): an SPV client replaces it by looking the same hashes up in its own
+chain. A self-contained client would need raw 80-byte headers from its
+checkpoint to the burn block (a year back is ~52k headers, ~4 MB), so an SPV
+client that keeps its chain is the right composition, not shipping headers
+per witness.
+
+**Tenure height** is the coinbase height. Every tenure-start block sets it
+to its parent's plus one; other blocks keep it. So B with `th` whose parent
+has `th - 1` is the first block of tenure `th`, which is what the headers DB
+maps `th` to (`ongoing_tenure_coinbase_height`, in the uncommitted headers
+MARF). Limits: the first Nakamoto tenure (its start block's parent is a 2.x
+block, no tenure height: rejected, "predates epoch 3.0"), and a `None`
+answer (no such tenure on the fork: rejected). Clarity makes this lookup
+only off the testnet chain id, so the test chain cannot reach it from
+Clarity; the test adds it to a witness as the node answers it.
+
+**Epoch 2.x deploys.** `burn-block-height` in 2.x is
+`burn_block_height_for_block(D's parent)` (the block at h(D) - 1, an
+open-block read): provable, needs P's header (epoch-2 headers hash to their
+ids too). Burn-view lookups in a 2.x deploy are not: a 2.x block ran under
+the node's canonical sortition tip at processing time, which no header
+commits to. Prover and client both refuse them.
+
+## Still not provable (classes (c), (d))
+
+| Lookup | Clarity | Evidence it would need |
+|---|---|---|
+| `MinerAddress` | `get-block-info? miner-address`, `get-tenure-info? miner-address` | Headers DB `payments` (not committed). Likely the tenure coinbase's origin or alt recipient: a coinbase inclusion proof (already served for VRF seeds) once that equality is checked in the reward code. Cheapest next |
+| `TokensSpent` | `get-tenure-info? miner-spend-total` | The preimage's `ops_hash` is sha256 over the txids of the burn block's accepted ops. Its preimage (the txid list) plus each block-commit's raw Bitcoin tx (hashes to its txid) gives every commit; parse and sum their burn. No Bitcoin Merkle proofs needed, but the client reimplements commit parsing |
+| `TokensSpentWinning` | `get-tenure-info? miner-spend-winner` | The same, plus which commit won: sortition's `winning_block_txid`, chosen by VRF-weighted sampling over the commits and burn distribution. Reimplementing sortition |
+| `PoxPayoutAddrs` | `get-burn-block-info? pox-addrs` | Reward set (PoX state at the anchor block, MARF-provable) plus the slots this burn block pays (commit outputs) |
+| `TokensEarned` | `get-tenure-info? block-reward`, `get-block-info? block-reward` | Matured coinbase plus fees: reward accounting in the headers DB. Replay reward accounting over the tenure tx lists |
+
+The sortition DB is not committed by Stacks headers (above), so none of
+these is a lookup in a committed index; each needs its own reconstruction.
+
+## Results
+
+| Test | Shows |
+|---|---|
+| `deploys_reading_burn_and_header_lookups_rederive_and_verify` (HTTP) | `clock` (Clarity 3) keeps `burn-block-height`, a burn header hash, and an older block's id, time, tenure burn hash and burn time in constants at deploy; its `tick` reads the same for older heights. `legacy` (Clarity 2) does the same through `get-block-info?`. Three tenures, deploys mid-tenure, call in a tenure-start block: VERIFIED, with deploy lookups (a) 1, (b) 9 (including `burn_block_height_for_block`, `tip_burn_block_height`, `burn_header_hash`), constants 2. Tampered: the deploy's `tip_burn_block_height` +1 (`answered Some(54), proven Some(53)`), an older block's `burn_block_height_for_block` -1, and the deploy's `burn_view` dropped ("no burn view proven"): each rejected, naming the contract and lookup |
+| `tenure_height_lookup_is_proven_by_tenure_height_walks` | Two tenure-height lookups (this tenure, the one before) verify from the shared proof. The tenure's second block as its start, or a tenure height off by one: rejected, naming the lookup. The first Nakamoto tenure: the prover refuses ("predates epoch 3.0"), the client rejects |
+| `unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs` | Now a deploy reading `get-tenure-info? miner-spend-winner` (class (c)): served unproven, naming `burnchain_tokens_spent_for_winning_block` |
+
+All witness, replay, stateless, state-writes, index and `clarity_vm` tests
+pass.
+
+## 1,170,254
+
+Not rerun (no mainnet chainstate copy). Expected to verify if the
+`pox4-pools` deploy makes only class (a)/(b)/constant lookups:
+`burn_block_height_for_block` now is, with its block's header, preimage and
+Bitcoin header served. Before, a missing lookup answered none and
+re-derivation likely failed right after it, so the run may have named only
+the first: a later class (c)/(d) lookup in the same deploy,
+or a burn-view lookup if `pox4-pools` was deployed in epoch 2.x, would still
+reject it, now named. Its `ustx_liquid_supply` read still shows as "assumed
+after".
