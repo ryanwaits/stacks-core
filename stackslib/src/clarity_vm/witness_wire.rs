@@ -13,16 +13,19 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Wire format v1 of a proof-carrying read witness: what a node serves with
+//! Wire format v2 of a proof-carrying read witness: what a node serves with
 //! `/v3/blocks/replay/<id>?read_witness=1` ([`WitnessEnvelope`]), and its
 //! in-memory form ([`ServedWitness`]).
 //!
 //! JSON, with every binary value as lowercase hex without `0x`:
 //!
 //! * hashes and ids: their bytes;
-//! * MARF proofs, transactions, headers, addresses: their consensus encoding
-//!   (`TrieMerkleProof`, `TrieAbsenceProof`, `StacksTransaction`,
-//!   `NakamotoBlockHeader` / `StacksBlockHeader`, `StacksAddress`);
+//! * MARF proofs: two shared proofs ([`crate::chainstate::stacks::index::multiproof`]),
+//!   one for every read (`marf`), one for the block's final writes
+//!   (`writes.proof`). Entries carry no proof bytes of their own;
+//! * transactions, headers, addresses: their consensus encoding
+//!   (`StacksTransaction`, `NakamotoBlockHeader` / `StacksBlockHeader`,
+//!   `StacksAddress`);
 //! * store values: the side-store value string as is (it is already text).
 //!
 //! Metadata values are left out: the client re-derives them
@@ -48,17 +51,15 @@ use stacks_common::util::hash::{
 use crate::chainstate::burn::OpsHash;
 use crate::chainstate::nakamoto::NakamotoBlockHeader;
 use crate::chainstate::stacks::db::StacksBlockHeaderTypes;
-use crate::chainstate::stacks::index::absence::TrieAbsenceProof;
-use crate::chainstate::stacks::index::TrieMerkleProof;
 use crate::chainstate::stacks::{StacksBlockHeader, StacksTransaction};
 use crate::clarity_vm::read_witness::{EnvQuery, EnvRead, ReadWitness, StoreQuery};
 use crate::clarity_vm::witness_proof::{
-    BitcoinHeader, BurnBinding, ContractEvidence, DeploySource, MarfProof, ProvenWitness,
-    StoreProof, TxInclusion,
+    BitcoinHeader, BurnBinding, ContractEvidence, DeploySource, ProvenWitness, StoreProof,
+    TxInclusion,
 };
 use crate::core::StacksEpoch;
 
-pub const WITNESS_WIRE_VERSION: u32 = 1;
+pub const WITNESS_WIRE_VERSION: u32 = 2;
 
 /// A Stacks header as served: the client hashes it to its block id.
 #[derive(Debug, Clone, PartialEq)]
@@ -81,9 +82,9 @@ pub struct ServedWitness {
     /// Bitcoin headers the burn lookups refer to (heights from the node's
     /// sortition DB).
     pub bitcoin: Vec<BitcoinHeader>,
-    /// Every key the block wrote, with an inclusion proof of its final value
+    /// Every key the block wrote, and one shared proof of their final values
     /// at the block's own root.
-    pub writes: Vec<(String, MarfProof)>,
+    pub writes: WriteProof,
     /// Contracts whose metadata is served as is, and why they cannot be
     /// re-derived (diagnostic; their entries fail verification).
     pub unproven_contracts: Vec<(String, String)>,
@@ -100,12 +101,15 @@ pub struct WitnessEnvelope {
     pub network: WireNetwork,
     pub witness: WireWitness,
     pub contracts: Vec<WireContract>,
+    /// The shared MARF proof every `marf` / `ancestor` entry and every
+    /// contract fact is a walk of.
+    pub marf: String,
     pub burn: Vec<WireBurnBinding>,
     pub burn_view: Option<WireTxInclusion>,
     pub coinbases: Vec<WireTxInclusion>,
     pub headers: Vec<WireHeader>,
     pub bitcoin: Vec<WireBitcoinHeader>,
-    pub writes: Vec<WireWriteProof>,
+    pub writes: WireWrites,
     /// `[contract, reason]` for metadata served as is.
     pub unproven_contracts: Vec<(String, String)>,
 }
@@ -134,23 +138,17 @@ pub struct WireStoreEntry {
     pub proof: WireStoreProof,
 }
 
+/// How a store entry is proven. `marf`: a walk of the shared proof at the
+/// root the query names; `ancestor`: walks of `__MARF_BLOCK_HASH_TO_HEIGHT`
+/// and back at the parent's root.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireStoreProof {
-    Marf(WireMarfProof),
-    /// `[hash_to_height, height_to_hash]` at the parent's root.
-    Ancestor(WireMarfProof, WireMarfProof),
+    Marf,
+    Ancestor,
     OpenBlock,
     Rederived,
     Served,
-}
-
-/// A MARF proof's consensus encoding.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WireMarfProof {
-    Present(String),
-    Absent(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -166,10 +164,10 @@ pub struct WireContract {
     /// `"boot"`, or the deploy transaction and its Merkle path.
     pub source: WireSource,
     pub commitment: String,
-    pub commitment_proof: WireMarfProof,
     pub epoch_key: Option<String>,
-    pub epoch_key_proof: WireMarfProof,
-    pub ancestry: Option<(WireMarfProof, WireMarfProof)>,
+    /// The deploy witness: chain state the deploy read, each entry proven
+    /// at the deploying block's parent.
+    pub deploy_reads: Vec<WireStoreEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -219,10 +217,20 @@ pub struct WireBitcoinHeader {
     pub time: u64,
 }
 
+/// Keys the block wrote, and the shared proof of their final values at the
+/// block's own root.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WireWriteProof {
-    pub key: String,
-    pub proof: WireMarfProof,
+pub struct WireWrites {
+    pub keys: Vec<String>,
+    pub proof: String,
+}
+
+/// The block's final writes as served: keys, and one shared proof at the
+/// block's root (values come from re-execution).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WriteProof {
+    pub keys: Vec<String>,
+    pub proof: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,22 +291,8 @@ hex_id!(
     Sha512Trunc256Sum
 );
 
-fn marf_to_wire(proof: &MarfProof) -> WireMarfProof {
-    match proof {
-        MarfProof::Present(p) => WireMarfProof::Present(codec_hex(p)),
-        MarfProof::Absent(p) => WireMarfProof::Absent(codec_hex(p)),
-    }
-}
-
-fn marf_from_wire(proof: &WireMarfProof) -> Result<MarfProof, String> {
-    Ok(match proof {
-        WireMarfProof::Present(hex) => {
-            MarfProof::Present(from_codec_hex::<TrieMerkleProof<StacksBlockId>>(hex)?)
-        }
-        WireMarfProof::Absent(hex) => {
-            MarfProof::Absent(from_codec_hex::<TrieAbsenceProof<StacksBlockId>>(hex)?)
-        }
-    })
+fn bytes_from_hex(hex: &str) -> Result<Vec<u8>, String> {
+    hex_bytes(hex).map_err(|e| format!("bad hex: {e:?}"))
 }
 
 fn inclusion_to_wire(inclusion: &TxInclusion) -> WireTxInclusion {
@@ -542,28 +536,22 @@ fn decode_answer(query: &EnvQuery, answer: &Value) -> Result<EnvRead, String> {
 
 fn store_proof_to_wire(proof: &StoreProof) -> WireStoreProof {
     match proof {
-        StoreProof::Marf(p) => WireStoreProof::Marf(marf_to_wire(p)),
-        StoreProof::Ancestor {
-            hash_to_height,
-            height_to_hash,
-        } => WireStoreProof::Ancestor(marf_to_wire(hash_to_height), marf_to_wire(height_to_hash)),
+        StoreProof::Marf => WireStoreProof::Marf,
+        StoreProof::Ancestor => WireStoreProof::Ancestor,
         StoreProof::OpenBlock => WireStoreProof::OpenBlock,
         StoreProof::Rederived => WireStoreProof::Rederived,
         StoreProof::Served => WireStoreProof::Served,
     }
 }
 
-fn store_proof_from_wire(proof: &WireStoreProof) -> Result<StoreProof, String> {
-    Ok(match proof {
-        WireStoreProof::Marf(p) => StoreProof::Marf(marf_from_wire(p)?),
-        WireStoreProof::Ancestor(a, b) => StoreProof::Ancestor {
-            hash_to_height: marf_from_wire(a)?,
-            height_to_hash: marf_from_wire(b)?,
-        },
+fn store_proof_from_wire(proof: &WireStoreProof) -> StoreProof {
+    match proof {
+        WireStoreProof::Marf => StoreProof::Marf,
+        WireStoreProof::Ancestor => StoreProof::Ancestor,
         WireStoreProof::OpenBlock => StoreProof::OpenBlock,
         WireStoreProof::Rederived => StoreProof::Rederived,
         WireStoreProof::Served => StoreProof::Served,
-    })
+    }
 }
 
 fn header_to_wire(header: &ServedHeader) -> WireHeader {
@@ -644,13 +632,17 @@ impl ServedWitness {
                     DeploySource::Tx(inclusion) => WireSource::Tx(inclusion_to_wire(inclusion)),
                 },
                 commitment: c.commitment.clone(),
-                commitment_proof: marf_to_wire(&c.commitment_proof),
                 epoch_key: c.epoch_key.clone(),
-                epoch_key_proof: marf_to_wire(&c.epoch_key_proof),
-                ancestry: c
-                    .ancestry
-                    .as_ref()
-                    .map(|(a, b)| (marf_to_wire(a), marf_to_wire(b))),
+                deploy_reads: c
+                    .deploy_reads
+                    .iter()
+                    .zip(c.deploy_proofs.iter())
+                    .map(|((query, value), proof)| WireStoreEntry {
+                        query: query.clone(),
+                        value: value.clone(),
+                        proof: store_proof_to_wire(proof),
+                    })
+                    .collect(),
             })
             .collect();
         let burn = proven
@@ -678,6 +670,7 @@ impl ServedWitness {
                 env,
             },
             contracts,
+            marf: to_hex(&proven.marf),
             burn,
             burn_view: proven.burn_view.as_ref().map(inclusion_to_wire),
             coinbases: proven.coinbases.iter().map(inclusion_to_wire).collect(),
@@ -692,14 +685,10 @@ impl ServedWitness {
                     time: h.time,
                 })
                 .collect(),
-            writes: self
-                .writes
-                .iter()
-                .map(|(key, proof)| WireWriteProof {
-                    key: key.clone(),
-                    proof: marf_to_wire(proof),
-                })
-                .collect(),
+            writes: WireWrites {
+                keys: self.writes.keys.clone(),
+                proof: to_hex(&self.writes.proof),
+            },
             unproven_contracts: self.unproven_contracts.clone(),
         })
     }
@@ -718,12 +707,9 @@ impl WitnessEnvelope {
         let w = &self.witness;
         let mut store = vec![];
         let mut store_proofs = vec![];
-        for (i, entry) in w.store.iter().enumerate() {
+        for entry in w.store.iter() {
             store.push((entry.query.clone(), entry.value.clone()));
-            store_proofs.push(
-                store_proof_from_wire(&entry.proof)
-                    .map_err(|e| format!("store[{i}] {:?}: {e}", entry.query))?,
-            );
+            store_proofs.push(store_proof_from_wire(&entry.proof));
         }
         let env = w
             .env
@@ -756,16 +742,17 @@ impl WitnessEnvelope {
                         }
                     },
                     commitment: c.commitment.clone(),
-                    commitment_proof: marf_from_wire(&c.commitment_proof).map_err(named)?,
                     epoch_key: c.epoch_key.clone(),
-                    epoch_key_proof: marf_from_wire(&c.epoch_key_proof).map_err(named)?,
-                    ancestry: match &c.ancestry {
-                        None => None,
-                        Some((a, b)) => Some((
-                            marf_from_wire(a).map_err(named)?,
-                            marf_from_wire(b).map_err(named)?,
-                        )),
-                    },
+                    deploy_reads: c
+                        .deploy_reads
+                        .iter()
+                        .map(|e| (e.query.clone(), e.value.clone()))
+                        .collect(),
+                    deploy_proofs: c
+                        .deploy_reads
+                        .iter()
+                        .map(|e| store_proof_from_wire(&e.proof))
+                        .collect(),
                 })
             })
             .collect::<Result<_, String>>()?;
@@ -791,6 +778,7 @@ impl WitnessEnvelope {
             witness,
             store: store_proofs,
             contracts,
+            marf: bytes_from_hex(&self.marf).map_err(|e| format!("marf: {e}"))?,
             burn,
             burn_view: self
                 .burn_view
@@ -828,12 +816,10 @@ impl WitnessEnvelope {
                 })
                 .collect::<Result<_, String>>()
                 .map_err(|e| format!("bitcoin: {e}"))?,
-            writes: self
-                .writes
-                .iter()
-                .map(|w| Ok((w.key.clone(), marf_from_wire(&w.proof)?)))
-                .collect::<Result<_, String>>()
-                .map_err(|e| format!("writes: {e}"))?,
+            writes: WriteProof {
+                keys: self.writes.keys.clone(),
+                proof: bytes_from_hex(&self.writes.proof).map_err(|e| format!("writes: {e}"))?,
+            },
             unproven_contracts: self.unproven_contracts.clone(),
         })
     }

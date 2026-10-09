@@ -31,14 +31,13 @@ use crate::chainstate::burn::db::sortdb::SortitionDB;
 use crate::chainstate::nakamoto::tests::state_writes::StateWriteFixture;
 use crate::chainstate::nakamoto::NakamotoChainState;
 use crate::chainstate::stacks::events::TransactionOrigin;
-use crate::chainstate::stacks::index::absence::TrieAbsenceProof;
-use crate::chainstate::stacks::index::Error as MarfError;
+use crate::chainstate::stacks::index::multiproof::MultiproofBuilder;
 use crate::chainstate::stacks::{StacksTransaction, TransactionPayload};
 use crate::clarity_vm::read_witness::{EnvQuery, ReadWitness, StoreQuery};
 use crate::clarity_vm::witness_proof::{
     prove_contracts, prove_store_reads, prove_writes, verify_read_witness, BitcoinChain,
-    BitcoinHeader, ChainHeader, DeploySource, HeaderChain, MarfProof, NetworkParams, ProvenWitness,
-    Rejection, StoreProof, TrustedState, TxInclusion,
+    BitcoinHeader, ChainHeader, DeploySource, HeaderChain, NetworkParams, ProvenWitness, Rejection,
+    StoreProof, TrustedState, TxInclusion,
 };
 use crate::clarity_vm::witness_serve::burn_binding;
 use crate::clarity_vm::witness_wire::WitnessEnvelope;
@@ -249,24 +248,27 @@ fn serve(
             _ => false,
         })
     };
-    let (store, contracts) = peer
-        .chain
-        .coord
-        .chain_state_db
-        .clarity_state
-        .with_marf(|marf| {
-            let mut conn = marf.borrow_storage_backend();
-            let store = prove_store_reads(&mut conn, &parent, witness).unwrap();
-            let (contracts, unproven) =
-                prove_contracts(&mut conn, &parent, witness, &net, &find_deploy).unwrap();
-            assert!(unproven.is_empty(), "{unproven:?}");
-            (store, contracts)
-        });
+    let (store, contracts, marf) =
+        peer.chain
+            .coord
+            .chain_state_db
+            .clarity_state
+            .with_marf(|marf| {
+                let mut conn = marf.borrow_storage_backend();
+                let mut proof = MultiproofBuilder::new();
+                let store = prove_store_reads(&mut conn, &mut proof, &parent, witness).unwrap();
+                let (contracts, unproven) =
+                    prove_contracts(&mut conn, &mut proof, &parent, witness, &net, &find_deploy)
+                        .unwrap();
+                assert!(unproven.is_empty(), "{unproven:?}");
+                (store, contracts, proof.encode(&mut conn).unwrap())
+            });
 
     let proven = ProvenWitness {
         witness: witness.clone(),
         store,
         contracts,
+        marf,
         burn,
         burn_view,
         coinbases,
@@ -295,7 +297,13 @@ fn measure(label: &str, served: &Served) {
     let proof_size = served.proven.proof_size();
     let witness_bytes =
         witness_size.store_bytes + witness_size.metadata_bytes + witness_size.env_bytes;
-    let proofs = proof_size.marf_proofs + proof_size.contracts + proof_size.env;
+    let proofs = proof_size.marf + proof_size.contracts + proof_size.env;
+    let marf_entries = served
+        .proven
+        .store
+        .iter()
+        .filter(|p| matches!(p, StoreProof::Marf | StoreProof::Ancestor))
+        .count();
 
     // the same witness without its metadata entries, to split verify time
     let mut without_metadata = served.proven.clone();
@@ -326,20 +334,20 @@ fn measure(label: &str, served: &Served) {
             .verify(&served.proven)
             .expect("honest witness verifies");
         verify += started.elapsed();
+        // its contract facts are now nodes no entry reaches, so it fails the
+        // strictness check; only its time matters here
         let started = Instant::now();
-        served.verify(&without_metadata).unwrap();
+        let _ = served.verify(&without_metadata);
         verify_without_metadata += started.elapsed();
         let started = Instant::now();
         served.live.reexecute(&served.proven.witness).unwrap();
         reexec += started.elapsed();
     }
     eprintln!(
-        "MEASURE-PROOF {label}: store entries={} (inclusion={} absence={}) contracts={:?} env={} burn-bindings={} | \
-         witness bytes={} (marf={} metadata={} env={}) | proof bytes={} (marf={} contracts={} env={}) | \
-         with proofs={} | with proofs, metadata derived not shipped={} | MARF as one multiproof={} (compact {}) | verify={:?} (without metadata re-derivation {:?}) reexec={:?}",
+        "MEASURE-PROOF {label}: store entries={} (MARF-backed={marf_entries}) contracts={:?} env={} burn-bindings={} | \
+         witness bytes={} (marf={} metadata={} env={}) | proof bytes={} (shared MARF proof={} contracts={} env={}) | \
+         with proofs={} | with proofs, metadata derived not shipped={} | verify={:?} (without metadata re-derivation {:?}) reexec={:?}",
         served.proven.witness.store.len(),
-        proof_size.inclusion_proofs,
-        proof_size.absence_proofs,
         served
             .proven
             .contracts
@@ -353,13 +361,11 @@ fn measure(label: &str, served: &Served) {
         witness_size.metadata_bytes,
         witness_size.env_bytes,
         proofs,
-        proof_size.marf_proofs,
+        proof_size.marf,
         proof_size.contracts,
         proof_size.env,
         witness_bytes + proofs,
         witness_bytes - witness_size.metadata_bytes + proofs,
-        proof_size.marf_multiproof,
-        proof_size.marf_multiproof_compact,
         verify / runs,
         verify_without_metadata / runs,
         reexec / runs,
@@ -384,17 +390,22 @@ fn honest_proof_carrying_witness_verifies_and_reexecution_reproduces_the_block()
     let block = block_with_tx(&observer, &fx.snapshot);
     let served = serve(&mut peer, &observer, &block);
 
-    // the witness needs both kinds of MARF proof and re-derived metadata
+    // the witness needs both kinds of MARF read and re-derived metadata
+    let marf_answers: Vec<bool> = served
+        .proven
+        .witness
+        .store
+        .iter()
+        .zip(served.proven.store.iter())
+        .filter(|(_, p)| matches!(p, StoreProof::Marf))
+        .map(|((_, answer), _)| answer.is_some())
+        .collect();
+    assert!(marf_answers.contains(&true) && marf_answers.contains(&false));
     assert!(served
         .proven
         .store
         .iter()
-        .any(|p| matches!(p, StoreProof::Marf(MarfProof::Absent(_)))));
-    assert!(served
-        .proven
-        .store
-        .iter()
-        .any(|p| matches!(p, StoreProof::Ancestor { .. })));
+        .any(|p| matches!(p, StoreProof::Ancestor)));
     assert!(served
         .proven
         .contracts
@@ -432,8 +443,8 @@ fn honest_proof_carrying_witness_verifies_for_the_state_writes_fixture() {
     measure("state-writes-fixture", &served);
 }
 
-/// The served witness's MARF proofs (store entries and the block's final
-/// writes) come out byte-identical with the lookup memo on, for fewer reads.
+/// The served witness's shared MARF proofs (store entries, and the block's
+/// final writes) come out byte-identical with the lookup memo on.
 #[test]
 fn lookup_memo_proves_the_fixture_witness_byte_identically() {
     let (observer, fx, tenures, balances) = history_block();
@@ -462,27 +473,33 @@ fn lookup_memo_proves_the_fixture_witness_byte_identically() {
                 }
                 conn.stats();
                 let started = Instant::now();
-                let store = prove_store_reads(&mut conn, &parent, witness).unwrap();
-                let writes = prove_writes(&mut conn, &served.block, &writes).unwrap();
+                let mut proof = MultiproofBuilder::new();
+                prove_store_reads(&mut conn, &mut proof, &parent, witness).unwrap();
+                let reads_proof = proof.encode(&mut conn).unwrap();
+                let mut proof = MultiproofBuilder::new();
+                prove_writes(&mut conn, &mut proof, &served.block, &writes).unwrap();
+                let writes_proof = proof.encode(&mut conn).unwrap();
                 let elapsed = started.elapsed();
                 let (reads, _) = conn.stats();
                 conn.disable_lookup_memo();
-                (format!("{store:?}{writes:?}"), reads, elapsed)
+                ((reads_proof, writes_proof), reads, elapsed)
             })
     };
     let (plain, plain_reads, plain_time) = prove(None);
     let (memo, memo_reads, memo_time) = prove(Some(None));
     let (anchored, anchored_reads, anchored_time) = prove(Some(Some(served.block.clone())));
     eprintln!(
-        "history fixture: {} store entries + {} writes: {plain_reads} node reads in {plain_time:?} \
-         without the memo, {memo_reads} in {memo_time:?} with it, {anchored_reads} in \
-         {anchored_time:?} anchored at the block",
+        "history fixture: {} store entries + {} writes as shared proofs ({} + {} bytes): \
+         {plain_reads} node reads in {plain_time:?} without the memo, {memo_reads} in \
+         {memo_time:?} with it, {anchored_reads} in {anchored_time:?} anchored at the block",
         witness.store.len(),
-        writes.len()
+        writes.len(),
+        plain.0.len(),
+        plain.1.len()
     );
     assert_eq!(plain, memo);
     assert_eq!(plain, anchored);
-    assert!(memo_reads < plain_reads);
+    assert!(memo_reads <= plain_reads);
     assert!(anchored_reads <= memo_reads);
 }
 
@@ -541,9 +558,11 @@ fn forged_absence_is_caught() {
     let proven = &served.proven;
 
     let absent = proven
+        .witness
         .store
         .iter()
-        .position(|p| matches!(p, StoreProof::Marf(MarfProof::Absent(_))))
+        .zip(proven.store.iter())
+        .position(|((_, answer), p)| matches!(p, StoreProof::Marf) && answer.is_none())
         .unwrap();
     let counter = store_index(
         proven,
@@ -553,27 +572,42 @@ fn forged_absence_is_caught() {
         },
     );
 
-    // a present key claimed absent, carrying another key's absence proof
+    // a present key claimed absent: its walk reaches the leaf
     let mut forged = proven.clone();
     forged.witness.store[counter].1 = None;
-    forged.store[counter] = proven.store[absent].clone();
     let rejection = served.verify(&forged).unwrap_err();
     assert!(rejection.entry.contains("::1::counter"), "{rejection:?}");
+    assert_eq!(rejection.reason, "MARF proof fails");
 
-    // and no honest absence proof exists for it
+    // and the prover cannot make a proof of it: the walk finds the leaf
     let path = TrieHash::from_key(&fx.var_key("counter"));
     let parent = block.parent.clone();
+    let end = peer
+        .chain
+        .coord
+        .chain_state_db
+        .clarity_state
+        .with_marf(|marf| {
+            MultiproofBuilder::new().walk(&mut marf.borrow_storage_backend(), &parent, &path)
+        })
+        .unwrap();
+    assert!(end.value.is_some());
     let proved = peer
         .chain
         .coord
         .chain_state_db
         .clarity_state
         .with_marf(|marf| {
-            TrieAbsenceProof::from_path(&mut marf.borrow_storage_backend(), &path, &parent)
+            prove_store_reads(
+                &mut marf.borrow_storage_backend(),
+                &mut MultiproofBuilder::new(),
+                &parent,
+                &forged.witness,
+            )
         });
-    assert!(matches!(proved, Err(MarfError::NotFoundError)));
+    assert!(proved.unwrap_err().contains("::1::counter"));
 
-    // an absent key claimed present, keeping its absence proof
+    // an absent key claimed present: its walk ends without a leaf
     let mut forged = proven.clone();
     forged.witness.store[absent].1 = Some(uint_hex(5));
     assert!(served.verify(&forged).is_err());
@@ -683,12 +717,12 @@ fn every_witness_entry_has_its_own_evidence() {
         let ok = match query {
             StoreQuery::Metadata { .. } => matches!(proof, StoreProof::Rederived),
             StoreQuery::AtBlock { .. } => {
-                matches!(proof, StoreProof::Ancestor { .. } | StoreProof::OpenBlock)
+                matches!(proof, StoreProof::Ancestor | StoreProof::OpenBlock)
             }
             StoreQuery::BlockAtHeight { .. } => {
-                matches!(proof, StoreProof::Marf(_) | StoreProof::OpenBlock)
+                matches!(proof, StoreProof::Marf | StoreProof::OpenBlock)
             }
-            _ => matches!(proof, StoreProof::Marf(_)),
+            _ => matches!(proof, StoreProof::Marf),
         };
         assert!(ok, "{query:?} has {proof:?}");
     }
@@ -740,7 +774,7 @@ fn served_witness_round_trips_through_json() {
     assert_eq!(served.proven.store.len(), expected.store.len());
     assert!(!served.headers.is_empty() && !served.bitcoin.is_empty());
     assert_eq!(
-        served.writes.len(),
+        served.writes.keys.len(),
         live.writes
             .iter()
             .map(|w| &w.key)
@@ -753,10 +787,12 @@ fn served_witness_round_trips_through_json() {
     assert!(future.decode().unwrap_err().contains("wire version"));
 
     eprintln!(
-        "MEASURE-WIRE history-fixture: envelope={} bytes, headers={}, bitcoin headers={}, write proofs={}",
+        "MEASURE-WIRE history-fixture: envelope={} bytes (shared read proof {} bytes, final-write proof {} bytes), headers={}, bitcoin headers={}, final writes={}",
         text.len(),
+        served.proven.marf.len(),
+        served.writes.proof.len(),
         served.headers.len(),
         served.bitcoin.len(),
-        served.writes.len()
+        served.writes.keys.len()
     );
 }

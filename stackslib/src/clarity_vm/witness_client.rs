@@ -23,7 +23,7 @@
 //! accepted by block-id hash match; a header-chain verifier (e.g.
 //! `@secondlayer/verify`) composes on top by checking the same ids.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::time::Instant;
 
@@ -42,7 +42,7 @@ use crate::clarity_vm::state_writes::StateWrite;
 use crate::clarity_vm::stateless::{execute_statelessly, BlockLevelWrites, StatelessError};
 use crate::clarity_vm::witness_proof::{
     check_read_witness, fill_rederived_metadata, BitcoinChain, ChainHeader, DeploySource,
-    HeaderChain, MarfProof, NetworkParams, StoreProof, TrustedState,
+    HeaderChain, NetworkParams, OpenedProof, StoreProof, TrustedState,
 };
 use crate::core::{
     BITCOIN_MAINNET_FIRST_BLOCK_HEIGHT, FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH,
@@ -163,23 +163,21 @@ impl fmt::Display for Report {
 }
 
 /// What a store entry was proven with, for the report.
-fn store_kind(query: &StoreQuery, proof: &StoreProof) -> &'static str {
+fn store_kind(query: &StoreQuery, answer: &Option<String>, proof: &StoreProof) -> &'static str {
+    let at_block = matches!(
+        query,
+        StoreQuery::Data { at: Some(_), .. } | StoreQuery::Path { at: Some(_), .. }
+    );
     match (query, proof) {
         (StoreQuery::Metadata { .. }, StoreProof::Served) => "metadata (served, unproven)",
         (StoreQuery::Metadata { .. }, _) => "metadata (re-derived)",
-        (_, StoreProof::Marf(MarfProof::Present(_))) => match query {
-            StoreQuery::Data { at: Some(_), .. } | StoreQuery::Path { at: Some(_), .. } => {
-                "at-block inclusion"
-            }
-            _ => "parent inclusion",
+        (_, StoreProof::Marf) => match (at_block, answer.is_some()) {
+            (true, true) => "at-block inclusion",
+            (true, false) => "at-block absence",
+            (false, true) => "parent inclusion",
+            (false, false) => "parent absence",
         },
-        (_, StoreProof::Marf(MarfProof::Absent(_))) => match query {
-            StoreQuery::Data { at: Some(_), .. } | StoreQuery::Path { at: Some(_), .. } => {
-                "at-block absence"
-            }
-            _ => "parent absence",
-        },
-        (_, StoreProof::Ancestor { .. }) => "at-block ancestry",
+        (_, StoreProof::Ancestor) => "at-block ancestry",
         (_, StoreProof::OpenBlock) => "open-block (deterministic)",
         (_, StoreProof::Rederived) => "metadata (re-derived)",
         (_, StoreProof::Served) => "metadata (served, unproven)",
@@ -404,16 +402,30 @@ pub fn check_replayed_block(
         proven.witness.env.len(),
         proven.contracts.len()
     );
-    fill_rederived_metadata(&mut proven, &block_id, &headers, net);
-    let rejections = check_read_witness(&block_id, &block.txs, &trusted, &proven);
-    info!(
-        "Client: verified in {:?}, {} rejected",
-        started.elapsed(),
-        rejections.len()
-    );
+    let unfilled = fill_rederived_metadata(&mut proven, &block_id, &headers, net);
+    let check = check_read_witness(&block_id, &block.txs, &trusted, &proven);
+    let rejections = check.rejections;
+    match check.marf {
+        Some((tries, nodes, bytes)) => info!(
+            "Client: verified in {:?}, {} rejected; shared read proof: {tries} tries, {nodes} nodes, {bytes} bytes",
+            started.elapsed(),
+            rejections.len()
+        ),
+        None => info!(
+            "Client: verified in {:?}, {} rejected",
+            started.elapsed(),
+            rejections.len()
+        ),
+    }
     let witness = &proven.witness;
-    for ((query, _), proof) in witness.store.iter().zip(proven.store.iter()) {
-        *report.entries.entry(store_kind(query, proof)).or_default() += 1;
+    for ((query, answer), proof) in witness.store.iter().zip(proven.store.iter()) {
+        *report
+            .entries
+            .entry(store_kind(query, answer, proof))
+            .or_default() += 1;
+    }
+    for (kind, n) in check.kinds.iter().filter(|(_, n)| **n > 0) {
+        *report.entries.entry(*kind).or_default() += n;
     }
     for read in witness.env.iter() {
         *report.entries.entry(env_kind(&read.query)).or_default() += 1;
@@ -424,6 +436,12 @@ pub fn check_replayed_block(
             DeploySource::Tx(_) => "contract (deploy tx proven)",
         };
         *report.entries.entry(kind).or_default() += 1;
+        if !evidence.deploy_reads.is_empty() {
+            *report
+                .entries
+                .entry("contract (with deploy witness)")
+                .or_default() += 1;
+        }
     }
     let summary = format!(
         "{} store entries, {} lookups, {} contracts, {} burn preimages",
@@ -449,6 +467,15 @@ pub fn check_replayed_block(
     }
 
     // re-execute from the witness alone
+    if !unfilled.is_empty() {
+        return report.fail(
+            "re-execute",
+            format!(
+                "skipped: metadata of {} did not re-derive",
+                unfilled.join(", ")
+            ),
+        );
+    }
     let served_writes = match replay_writes(replay) {
         Ok(writes) => writes,
         Err(e) => return report.fail("re-execute", e),
@@ -484,10 +511,11 @@ pub fn check_replayed_block(
     );
     let started = Instant::now();
     info!(
-        "Client: comparing {} writes and {} receipts, checking {} write proofs",
+        "Client: comparing {} writes and {} receipts, checking {} final writes ({} proof bytes)",
         out.writes.len(),
         out.receipts.len(),
-        served.writes.len()
+        served.writes.keys.len(),
+        served.writes.proof.len()
     );
 
     // writes: the transactions' own, against the replay's
@@ -521,38 +549,41 @@ pub fn check_replayed_block(
         }
     }
 
-    // writes: every final value proven at the block's own root
-    let block_root = headers
-        .get(&block_id)
-        .map(|h| h.state_index_root)
-        .expect("the block's own header is in the chain");
+    // writes: every final value proven at the block's own root, by one
+    // shared proof that holds nothing else
     let mut finals: BTreeMap<&str, &str> = BTreeMap::new();
     for w in out.writes.iter() {
         finals.insert(&w.key, &w.value);
     }
-    let proofs: HashMap<&str, &MarfProof> =
-        served.writes.iter().map(|(k, p)| (k.as_str(), p)).collect();
-    if proofs.len() != finals.len() {
+    let served_keys: HashSet<&str> = served.writes.keys.iter().map(String::as_str).collect();
+    if served_keys.len() != served.writes.keys.len()
+        || finals.keys().any(|key| !served_keys.contains(key))
+        || served_keys.len() != finals.len()
+    {
         return report.fail(
             "write proofs",
-            format!("{} keys written, {} proven", finals.len(), proofs.len()),
+            format!(
+                "{} keys written, {} served",
+                finals.len(),
+                served.writes.keys.len()
+            ),
         );
     }
+    let proof = OpenedProof::open(&served.writes.proof, &headers);
     for (key, value) in finals.iter() {
-        let holds = proofs.get(key).is_some_and(|p| {
-            p.holds(
-                &TrieHash::from_key(key),
-                Some(&MARFValue::from_value(value)),
-                &block_root,
-                &headers,
-            )
-        });
-        if !holds {
+        if let Err(e) = proof.holds(
+            &block_id,
+            &TrieHash::from_key(key),
+            Some(&MARFValue::from_value(value)),
+        ) {
             return report.fail(
                 "write proofs",
-                format!("{key}: re-executed final value is not in the block's trie"),
+                format!("{key}: re-executed final value is not in the block's trie ({e})"),
             );
         }
+    }
+    if let Some(reason) = proof.strictness() {
+        return report.fail("write proofs", format!("the shared proof {reason}"));
     }
     report.pass(
         "write proofs",

@@ -31,18 +31,18 @@
 //!
 //! | Entry | Evidence |
 //! |---|---|
-//! | store read at the open block | MARF inclusion or absence proof against the parent's `state_index_root` |
-//! | store read inside `at-block X` | same, against X's root |
-//! | `at-block` switch | MARF proofs of `__MARF_BLOCK_HASH_TO_HEIGHT::X` and back |
+//! | store read at the open block | a walk of the shared MARF proof from the parent's `state_index_root` (value or absence) |
+//! | store read inside `at-block X` | same, from X's root |
+//! | `at-block` switch | walks of `__MARF_BLOCK_HASH_TO_HEIGHT::X` and back |
 //! | the open block's own bookkeeping | deterministic from the parent id and height |
-//! | contract metadata | re-derived from the deploy (see [`derive_contract_metadata`]) |
+//! | contract metadata | re-derived from the deploy (see [`derive_contract_metadata`]), with the deploy's own reads proven at its parent (deploy witness) |
 //! | header lookups | the header chain |
 //! | burn lookups | consensus-hash preimages ([`BurnBinding`]) plus the Bitcoin chain |
 //! | epochs, PoX parameters | network constants |
 //!
 //! See `NOTES.md` for the lookups that are not provable yet.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::time::Instant;
 
@@ -72,25 +72,19 @@ use crate::chainstate::stacks::boot::{
     SIGNERS_DB_1_BODY, SIGNERS_NAME, SIGNERS_VOTING_BODY, SIGNERS_VOTING_NAME, SIP_031_NAME,
 };
 use crate::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksHeaderInfo};
-use crate::chainstate::stacks::index::absence::{AbsenceEnd, TrieAbsenceProof};
-use crate::chainstate::stacks::index::bits::{get_leaf_hash, get_node_hash};
 use crate::chainstate::stacks::index::marf::{
     BLOCK_HASH_TO_HEIGHT_MAPPING_KEY, BLOCK_HEIGHT_TO_HASH_MAPPING_KEY, MARF, OWN_BLOCK_HEIGHT_KEY,
 };
-use crate::chainstate::stacks::index::node::{is_backptr, TrieNodeID};
+use crate::chainstate::stacks::index::multiproof::{Multiproof, MultiproofBuilder, WalkEnd};
 use crate::chainstate::stacks::index::storage::TrieStorageConnection;
-use crate::chainstate::stacks::index::{
-    ClarityMarfTrieId, Error as MarfError, MARFValue, ProofTriePtr, TrieMerkleProof,
-    TrieMerkleProofType,
-};
+use crate::chainstate::stacks::index::{Error as MarfError, MARFValue};
 use crate::chainstate::stacks::{
     StacksTransaction, TransactionPayload, TransactionSmartContract, TransactionVersion,
     MINER_BLOCK_CONSENSUS_HASH, MINER_BLOCK_HEADER_HASH,
 };
 use crate::clarity_vm::read_witness::{EnvQuery, EnvRead, ReadWitness, StoreQuery};
 use crate::clarity_vm::stateless::{
-    derive_contract_metadata, ContractDeployment, ContractMetadata, StatelessError,
-    EPOCH_VERSION_KEY,
+    derive_contract_metadata, ContractDeployment, ContractMetadata, DeriveError, EPOCH_VERSION_KEY,
 };
 use crate::core::StacksEpoch;
 use crate::util_lib::boot::{boot_code_addr, boot_code_tx_auth};
@@ -178,27 +172,30 @@ impl ChainHeader {
     }
 }
 
-/// Authenticated Stacks headers, by block id and by MARF root.
+/// Authenticated Stacks headers, by block id.
 pub struct HeaderChain {
     headers: HashMap<StacksBlockId, ChainHeader>,
-    root_to_block: HashMap<TrieHash, StacksBlockId>,
 }
 
 impl HeaderChain {
     pub fn new(headers: impl IntoIterator<Item = ChainHeader>) -> Self {
-        let headers: HashMap<_, _> = headers.into_iter().map(|h| (h.id.clone(), h)).collect();
-        let root_to_block = headers
-            .values()
-            .map(|h| (h.state_index_root, h.id.clone()))
-            .collect();
         HeaderChain {
-            headers,
-            root_to_block,
+            headers: headers.into_iter().map(|h| (h.id.clone(), h)).collect(),
         }
     }
 
     pub fn get(&self, id: &StacksBlockId) -> Option<&ChainHeader> {
         self.headers.get(id)
+    }
+
+    /// The MARF root of `id`'s trie (`state_index_root`).
+    pub fn root_of(&self, id: &StacksBlockId) -> Option<TrieHash> {
+        self.get(id).map(|h| h.state_index_root)
+    }
+
+    /// Open a shared MARF proof against these headers' roots.
+    pub fn open_proof(&self, bytes: &[u8]) -> Result<Multiproof<StacksBlockId>, String> {
+        Multiproof::open(bytes, |id| self.root_of(id))
     }
 }
 
@@ -348,116 +345,31 @@ impl TxInclusion {
     }
 }
 
-/// MARF evidence for one key at one block root.
-#[derive(Debug, Clone)]
-pub enum MarfProof {
-    Present(TrieMerkleProof<StacksBlockId>),
-    Absent(TrieAbsenceProof<StacksBlockId>),
-}
-
-impl MarfProof {
-    /// Blocks whose tries the proof crosses into (the targets of its on-path
-    /// back-pointers). The verifier maps each of their roots back to the
-    /// block, so it needs their headers.
-    pub fn crossed_blocks(&self) -> Vec<StacksBlockId> {
-        let steps = match self {
-            MarfProof::Present(proof) => &proof.0,
-            MarfProof::Absent(proof) => &proof.proof,
-        };
-        let mut out = vec![];
-        for step in steps.iter() {
-            let (chr, ptrs) = match step {
-                TrieMerkleProofType::Node4((chr, node, _))
-                | TrieMerkleProofType::Node16((chr, node, _))
-                | TrieMerkleProofType::Node48((chr, node, _))
-                | TrieMerkleProofType::Node256((chr, node, _)) => (chr, &node.ptrs),
-                TrieMerkleProofType::Leaf(_) | TrieMerkleProofType::Shunt(_) => continue,
-            };
-            if let Some(ptr) = ptrs
-                .iter()
-                .find(|p| p.id != TrieNodeID::Empty as u8 && p.chr == *chr && is_backptr(p.id))
-            {
-                out.push(ptr.back_block.clone());
-            }
-        }
-        out
-    }
-
-    /// The leaf value an inclusion proof proves.
-    fn present_value(&self) -> Option<MARFValue> {
-        match self {
-            MarfProof::Present(proof) => match proof.0.first() {
-                Some(TrieMerkleProofType::Leaf((_, leaf))) => Some(leaf.data.clone()),
-                _ => None,
-            },
-            MarfProof::Absent(_) => None,
-        }
-    }
-
-    /// Whether the proof shows `path` holds `value` (`None`: absent) at the
-    /// trie whose root is `root`.
-    pub fn holds(
-        &self,
-        path: &TrieHash,
-        value: Option<&MARFValue>,
-        root: &TrieHash,
-        headers: &HeaderChain,
-    ) -> bool {
-        match (self, value) {
-            (MarfProof::Present(proof), Some(value)) => {
-                proof.verify(path, value, root, &headers.root_to_block)
-            }
-            (MarfProof::Absent(proof), None) => proof.verify(path, root, &headers.root_to_block),
-            _ => false,
-        }
-    }
-
-    pub fn byte_len(&self) -> usize {
-        match self {
-            MarfProof::Present(proof) => proof.serialize_to_vec().len(),
-            MarfProof::Absent(proof) => proof.byte_len(),
-        }
-    }
-}
-
-/// Evidence for one store entry of the witness.
-#[derive(Debug, Clone)]
+/// Evidence for one store entry of the witness. MARF-backed entries carry
+/// no bytes of their own: they are walks of the shared proof
+/// ([`ProvenWitness::marf`]) from the root their query names.
+#[derive(Debug, Clone, PartialEq)]
 pub enum StoreProof {
-    /// The entry's key at the root of the block it was read at.
-    Marf(MarfProof),
-    /// An `at-block` target is an ancestor: its height
+    /// The entry's key at the root of the block it was read at (present or
+    /// absent, as the entry's answer says).
+    Marf,
+    /// An `at-block` target is (or is not) an ancestor: its height
     /// (`__MARF_BLOCK_HASH_TO_HEIGHT`) and that height's block
     /// (`__MARF_BLOCK_HEIGHT_TO_HASH`), both at the parent.
-    Ancestor {
-        hash_to_height: MarfProof,
-        height_to_hash: MarfProof,
-    },
+    Ancestor,
     /// The open block's own bookkeeping: determined by the parent and the
     /// open height.
     OpenBlock,
     /// Contract metadata: re-derived from [`ProvenWitness::contracts`].
     Rederived,
-    /// Contract metadata served as is: the contract cannot be re-derived from
-    /// its deploy alone (its initialization reads chain state, or it depends
-    /// on such a contract). Not provable yet; the verifier rejects it.
+    /// Contract metadata served as is: the contract cannot be re-derived (its
+    /// deploy reads something not provable yet, or it depends on such a
+    /// contract). The verifier rejects it.
     Served,
 }
 
-impl StoreProof {
-    pub fn byte_len(&self) -> usize {
-        match self {
-            StoreProof::Marf(p) => p.byte_len(),
-            StoreProof::Ancestor {
-                hash_to_height,
-                height_to_hash,
-            } => hash_to_height.byte_len() + height_to_hash.byte_len(),
-            StoreProof::OpenBlock | StoreProof::Rederived | StoreProof::Served => 0,
-        }
-    }
-}
-
 /// Where a contract's source comes from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DeploySource {
     /// A user contract: its deploy transaction in the deploying block.
     Tx(TxInclusion),
@@ -465,8 +377,12 @@ pub enum DeploySource {
     Boot,
 }
 
-/// What re-deriving one contract's metadata needs.
-#[derive(Debug, Clone)]
+/// What re-deriving one contract's metadata needs. Its MARF facts are walks
+/// of the shared proof: the commitment and epoch key at the deploying
+/// block's root, the deploying block's ancestry at the parent's root, and
+/// for a deploy witness, the deploying block's parent at its root and each
+/// deploy read at that parent's root.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContractEvidence {
     pub contract: QualifiedContractIdentifier,
     /// The deploying block.
@@ -475,26 +391,18 @@ pub struct ContractEvidence {
     /// `clarity-contract::<contract>` (source hash and deploy height) at the
     /// deploying block's root.
     pub commitment: String,
-    pub commitment_proof: MarfProof,
     /// `vm-epoch::epoch-version` at the deploying block's root.
     pub epoch_key: Option<String>,
-    pub epoch_key_proof: MarfProof,
-    /// The deploying block is an ancestor of the parent: its
-    /// `__MARF_BLOCK_HASH_TO_HEIGHT` and `__MARF_BLOCK_HEIGHT_TO_HASH`
-    /// entries at the parent's root. `None` when it is the parent.
-    pub ancestry: Option<(MarfProof, MarfProof)>,
+    /// The deploy witness: chain state the deploy read, as it answered, in
+    /// the order re-derivation asked for it. Empty when the deploy reads only
+    /// itself and the contracts it depends on.
+    pub deploy_reads: Vec<(StoreQuery, Option<String>)>,
+    /// One per deploy read: proven at the deploying block's parent (or an
+    /// `at-block` target), as a block's own reads are at its parent.
+    pub deploy_proofs: Vec<StoreProof>,
 }
 
 impl ContractEvidence {
-    /// Every MARF proof this evidence carries.
-    pub fn marf_proofs(&self) -> Vec<&MarfProof> {
-        let mut proofs = vec![&self.commitment_proof, &self.epoch_key_proof];
-        if let Some((a, b)) = &self.ancestry {
-            proofs.extend([a, b]);
-        }
-        proofs
-    }
-
     pub fn byte_len(&self) -> usize {
         let source = match &self.source {
             DeploySource::Tx(inclusion) => inclusion.byte_len(),
@@ -506,9 +414,9 @@ impl ContractEvidence {
             + self.commitment.len()
             + self.epoch_key.as_ref().map_or(0, String::len)
             + self
-                .marf_proofs()
+                .deploy_reads
                 .iter()
-                .map(|p| p.byte_len())
+                .map(|(q, a)| q.wire_len() + a.as_ref().map_or(0, String::len))
                 .sum::<usize>()
     }
 }
@@ -522,6 +430,9 @@ pub struct ProvenWitness {
     /// Contracts whose metadata execution read, and the contracts their
     /// analysis depends on, dependencies first.
     pub contracts: Vec<ContractEvidence>,
+    /// The shared MARF proof (a [`Multiproof`]) every MARF-backed store
+    /// entry and contract fact is a walk of.
+    pub marf: Vec<u8>,
     /// Preimages of every consensus hash a lookup touches.
     pub burn: Vec<BurnBinding>,
     /// The tenure change that set the block's burn view, when it is in an
@@ -531,157 +442,30 @@ pub struct ProvenWitness {
     pub coinbases: Vec<TxInclusion>,
 }
 
-/// Witness and evidence sizes, in bytes.
+/// Evidence sizes, in bytes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ProofSize {
-    /// MARF proofs for store entries.
-    pub marf_proofs: usize,
-    pub inclusion_proofs: usize,
-    pub absence_proofs: usize,
-    /// Deploy txs, commitments and epoch proofs for metadata re-derivation.
+    /// The shared MARF proof.
+    pub marf: usize,
+    /// Deploy txs, commitments, epoch keys and deploy witnesses.
     pub contracts: usize,
     /// Burn bindings, burn-view and coinbase tx proofs.
     pub env: usize,
-    /// All MARF proofs (store and contract evidence) as one multiproof: each
-    /// distinct trie node once, with all its child hashes, and each distinct
-    /// shunt once.
-    pub marf_multiproof: usize,
-    /// The same, without the child hashes a verifier can rebuild (empty and
-    /// back-pointer children).
-    pub marf_multiproof_compact: usize,
-}
-
-impl MarfProof {
-    /// Every node and shunt of the proof as `(identity, bytes, compact
-    /// bytes)`, identity being the node's hash (shunts: their bytes). A node
-    /// costs its pointers plus one hash per child; compact, only its inline
-    /// children need hashes, because an empty child hashes as
-    /// `TrieHash::EMPTY` and a back-pointer child as the `back_block` its
-    /// pointer already carries.
-    fn multiproof_items(&self) -> Vec<(Vec<u8>, usize, usize)> {
-        let child_hashes = |ptrs: &[ProofTriePtr<StacksBlockId>]| {
-            let inline = ptrs
-                .iter()
-                .filter(|p| p.id != TrieNodeID::Empty as u8 && !is_backptr(p.id))
-                .count();
-            (32 * ptrs.len(), 32 * inline)
-        };
-        let mut out = vec![];
-        let (steps, mut hash) = match self {
-            MarfProof::Present(proof) => (&proof.0, None),
-            MarfProof::Absent(proof) => {
-                let (hash, bytes, full, compact) = match &proof.end {
-                    AbsenceEnd::Leaf(leaf) => {
-                        let bytes = leaf.serialize_to_vec().len();
-                        (get_leaf_hash(leaf), bytes, 0, 0)
-                    }
-                    AbsenceEnd::Node { node, hashes } => {
-                        let (full, compact) = child_hashes(&node.ptrs);
-                        (
-                            get_node_hash(node, hashes, &mut ()),
-                            node.serialize_to_vec().len(),
-                            full,
-                            compact,
-                        )
-                    }
-                };
-                out.push((hash.as_bytes().to_vec(), bytes + full, bytes + compact));
-                (&proof.proof, Some(hash))
-            }
-        };
-        for step in steps.iter() {
-            let node = match step {
-                TrieMerkleProofType::Leaf((_, leaf)) => {
-                    let h = get_leaf_hash(leaf);
-                    let len = leaf.serialize_to_vec().len();
-                    out.push((h.as_bytes().to_vec(), len, len));
-                    hash = Some(h);
-                    continue;
-                }
-                TrieMerkleProofType::Shunt(_) => {
-                    let bytes = step.serialize_to_vec();
-                    let len = bytes.len();
-                    out.push((bytes, len, len));
-                    hash = None;
-                    continue;
-                }
-                TrieMerkleProofType::Node4((chr, node, siblings)) => (chr, node, &siblings[..]),
-                TrieMerkleProofType::Node16((chr, node, siblings)) => (chr, node, &siblings[..]),
-                TrieMerkleProofType::Node48((chr, node, siblings)) => (chr, node, &siblings[..]),
-                TrieMerkleProofType::Node256((chr, node, siblings)) => (chr, node, &siblings[..]),
-            };
-            let (chr, node, siblings) = node;
-            let on_path = node
-                .ptrs
-                .iter()
-                .position(|p| p.id != TrieNodeID::Empty as u8 && p.chr == *chr);
-            // after a shunt, the on-path child is a back-pointer: its hash is its block
-            let child = hash
-                .or_else(|| on_path.map(|i| TrieHash(node.ptrs[i].back_block.clone().to_bytes())));
-            let (Some(on_path), Some(child)) = (on_path, child) else {
-                continue;
-            };
-            let mut all = siblings.to_vec();
-            all.insert(on_path.min(all.len()), child);
-            let h = get_node_hash(node, &all, &mut ());
-            let bytes = node.serialize_to_vec().len();
-            let (full, compact) = child_hashes(&node.ptrs);
-            out.push((h.as_bytes().to_vec(), bytes + full, bytes + compact));
-            hash = Some(h);
-        }
-        out
-    }
 }
 
 impl ProvenWitness {
-    /// Every MARF proof: store entries, then contract evidence.
-    pub fn marf_proofs(&self) -> Vec<&MarfProof> {
-        let mut proofs: Vec<&MarfProof> = vec![];
-        for proof in self.store.iter() {
-            match proof {
-                StoreProof::Marf(p) => proofs.push(p),
-                StoreProof::Ancestor {
-                    hash_to_height,
-                    height_to_hash,
-                } => proofs.extend([hash_to_height, height_to_hash]),
-                StoreProof::OpenBlock | StoreProof::Rederived | StoreProof::Served => {}
-            }
-        }
-        for c in self.contracts.iter() {
-            proofs.extend(c.marf_proofs());
-        }
-        proofs
-    }
-
     pub fn proof_size(&self) -> ProofSize {
-        let mut size = ProofSize::default();
-        for proof in self.store.iter() {
-            size.marf_proofs += proof.byte_len();
-            match proof {
-                StoreProof::Marf(MarfProof::Present(_)) => size.inclusion_proofs += 1,
-                StoreProof::Marf(MarfProof::Absent(_)) => size.absence_proofs += 1,
-                StoreProof::Ancestor { .. } => size.inclusion_proofs += 2,
-                _ => {}
-            }
+        ProofSize {
+            marf: self.marf.len(),
+            contracts: self.contracts.iter().map(ContractEvidence::byte_len).sum(),
+            env: self.burn.iter().map(BurnBinding::byte_len).sum::<usize>()
+                + self.burn_view.as_ref().map_or(0, TxInclusion::byte_len)
+                + self
+                    .coinbases
+                    .iter()
+                    .map(TxInclusion::byte_len)
+                    .sum::<usize>(),
         }
-        size.contracts = self.contracts.iter().map(ContractEvidence::byte_len).sum();
-        let mut seen = HashSet::new();
-        for (identity, full, compact) in
-            self.marf_proofs().iter().flat_map(|p| p.multiproof_items())
-        {
-            if seen.insert(identity) {
-                size.marf_multiproof += full;
-                size.marf_multiproof_compact += compact;
-            }
-        }
-        size.env = self.burn.iter().map(BurnBinding::byte_len).sum::<usize>()
-            + self.burn_view.as_ref().map_or(0, TxInclusion::byte_len)
-            + self
-                .coinbases
-                .iter()
-                .map(TxInclusion::byte_len)
-                .sum::<usize>();
-        size
     }
 }
 
@@ -733,13 +517,14 @@ fn block_answer(answer: &Option<String>) -> Result<Option<MARFValue>, String> {
 }
 
 /// What `(query, answer)` claims, read in the block whose parent is `parent`
-/// at `witness.open_height`. `at_height` gives the height of an `at-block`
+/// at `open_height` (a block being processed, or a deploy being re-derived;
+/// both run at the miner tip). `at_height` gives the height of an `at-block`
 /// target (from the header chain on the verifier side, the MARF on the
 /// prover side).
 fn claim_of(
     query: &StoreQuery,
     answer: &Option<String>,
-    witness: &ReadWitness,
+    open_height: u32,
     parent: &StacksBlockId,
     mut at_height: impl FnMut(&StacksBlockId) -> Option<u32>,
 ) -> Result<Claim, String> {
@@ -755,12 +540,12 @@ fn claim_of(
             path: *path,
             value: answer.as_deref().map(MARFValue::from_value),
         },
-        StoreQuery::BlockAtHeight { at: None, height } if *height == witness.open_height => {
+        StoreQuery::BlockAtHeight { at: None, height } if *height == open_height => {
             Claim::OpenBlock {
-                expected: Some(witness.open_tip.to_hex()),
+                expected: Some(miner_tip().to_hex()),
             }
         }
-        StoreQuery::BlockAtHeight { at: None, height } if height + 1 == witness.open_height => {
+        StoreQuery::BlockAtHeight { at: None, height } if height + 1 == open_height => {
             // the open trie rewrites its parent's entry with the parent's real id
             Claim::OpenBlock {
                 expected: Some(parent.to_hex()),
@@ -801,21 +586,13 @@ fn claim_of(
 // Prover
 // ---------------------------------------------------------------------------
 
-fn prove_key(
-    conn: &mut TrieStorageConnection<StacksBlockId>,
-    block: &StacksBlockId,
-    path: &TrieHash,
-    value: Option<&MARFValue>,
-) -> Result<MarfProof, MarfError> {
-    match value {
-        Some(value) => Ok(MarfProof::Present(TrieMerkleProof::from_path(
-            conn, path, value, block,
-        )?)),
-        None => Ok(MarfProof::Absent(TrieAbsenceProof::from_path(
-            conn, path, block,
-        )?)),
-    }
-}
+/// A deploy whose re-derivation keeps asking for more chain state than this
+/// many rounds of reads is not served.
+const MAX_DEPLOY_READ_ROUNDS: usize = 256;
+
+/// How deep contract dependencies (each re-derived first, possibly with its
+/// own deploy witness) may nest.
+pub const MAX_DEPENDENCY_DEPTH: usize = 16;
 
 /// The value a MARF leaf hashes (leaves hold value hashes; values live in the
 /// side table).
@@ -825,40 +602,92 @@ fn side_value(conn: &TrieStorageConnection<StacksBlockId>, value: &MARFValue) ->
         .flatten()
 }
 
-/// Prove whatever `path` holds at `block`, present or absent.
-fn prove_current(
+/// Walk `path` at `block` into the shared proof.
+fn walk(
     conn: &mut TrieStorageConnection<StacksBlockId>,
+    proof: &mut MultiproofBuilder<StacksBlockId>,
     block: &StacksBlockId,
     path: &TrieHash,
-) -> Result<MarfProof, MarfError> {
-    let value = MARF::get_by_path(conn, block, path)?;
-    prove_key(conn, block, path, value.as_ref())
+) -> Result<WalkEnd<StacksBlockId>, String> {
+    proof
+        .walk(conn, block, path)
+        .map_err(|e| format!("walk at {block}: {e:?}"))
+}
+
+/// Walk `path` at `block` into the shared proof and require it to hold
+/// `value` (`None`: absent).
+fn prove_key(
+    conn: &mut TrieStorageConnection<StacksBlockId>,
+    proof: &mut MultiproofBuilder<StacksBlockId>,
+    block: &StacksBlockId,
+    path: &TrieHash,
+    value: Option<&MARFValue>,
+) -> Result<(), String> {
+    let end = walk(conn, proof, block, path)?;
+    if end.value.as_ref() != value {
+        return Err(format!(
+            "{block} holds {:?} at {path}, not {value:?}",
+            end.value
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `target` is an ancestor of `parent`, as `parent`'s MARF records
 /// it: `__MARF_BLOCK_HASH_TO_HEIGHT::target` and, if present, the block at
-/// that height (`check_ancestor_block_hash`).
+/// that height (`check_ancestor_block_hash`). Both walks go into the proof.
 fn prove_ancestry(
     conn: &mut TrieStorageConnection<StacksBlockId>,
+    proof: &mut MultiproofBuilder<StacksBlockId>,
     parent: &StacksBlockId,
     target: &StacksBlockId,
-) -> Result<(MarfProof, MarfProof), MarfError> {
+) -> Result<bool, String> {
     let path = TrieHash::from_key(&hash_to_height_key(target));
-    let hash_to_height = prove_current(conn, parent, &path)?;
-    let height_to_hash = match hash_to_height.present_value() {
-        Some(height) => {
-            let path = TrieHash::from_key(&height_to_hash_key(u32::from(height)));
-            prove_current(conn, parent, &path)?
-        }
-        None => hash_to_height.clone(),
+    let Some(height) = walk(conn, proof, parent, &path)?.value else {
+        return Ok(false);
     };
-    Ok((hash_to_height, height_to_hash))
+    let path = TrieHash::from_key(&height_to_hash_key(u32::from(height)));
+    let block = walk(conn, proof, parent, &path)?.value;
+    Ok(block == Some(MARFValue::from(target.clone())))
 }
 
-/// MARF evidence for every store entry of a witness recorded for the block
-/// whose parent is `parent` (metadata entries are re-derived instead).
+/// Evidence for one store entry read at `open_height` on top of `parent` (a
+/// block's own read, or a deploy's), its MARF walks added to the proof.
+fn prove_store_entry(
+    conn: &mut TrieStorageConnection<StacksBlockId>,
+    proof: &mut MultiproofBuilder<StacksBlockId>,
+    query: &StoreQuery,
+    answer: &Option<String>,
+    open_height: u32,
+    parent: &StacksBlockId,
+) -> Result<StoreProof, String> {
+    let claim = claim_of(query, answer, open_height, parent, |at| {
+        MARF::get_block_height_miner_tip(conn, at, at)
+            .ok()
+            .flatten()
+    })?;
+    Ok(match claim {
+        Claim::Key { block, path, value } => {
+            prove_key(conn, proof, &block, &path, value.as_ref())?;
+            StoreProof::Marf
+        }
+        Claim::Ancestor { target, is } => {
+            if prove_ancestry(conn, proof, parent, &target)? != is {
+                return Err(format!("{target} is not an ancestor as answered"));
+            }
+            StoreProof::Ancestor
+        }
+        Claim::OpenBlock { .. } => StoreProof::OpenBlock,
+        Claim::Metadata => StoreProof::Rederived,
+    })
+}
+
+/// Evidence for every store entry of a witness recorded for the block whose
+/// parent is `parent` (metadata entries are re-derived instead). MARF walks
+/// go into `proof`.
 pub fn prove_store_reads(
     conn: &mut TrieStorageConnection<StacksBlockId>,
+    proof: &mut MultiproofBuilder<StacksBlockId>,
     parent: &StacksBlockId,
     witness: &ReadWitness,
 ) -> Result<Vec<StoreProof>, String> {
@@ -867,62 +696,112 @@ pub fn prove_store_reads(
     for (i, (query, answer)) in witness.store.iter().enumerate() {
         if i > 0 && i % 1000 == 0 {
             info!(
-                "Witness: proved {i} of {} store entries in {:?}",
+                "Witness: walked {i} of {} store entries in {:?}",
                 witness.store.len(),
                 started.elapsed()
             );
         }
-        let claim = claim_of(query, answer, witness, parent, |at| {
-            MARF::get_block_height_miner_tip(conn, at, at)
-                .ok()
-                .flatten()
-        })?;
-        let proof = match claim {
-            Claim::Key { block, path, value } => StoreProof::Marf(
-                prove_key(conn, &block, &path, value.as_ref())
-                    .map_err(|e| format!("{query:?}: {e:?}"))?,
-            ),
-            Claim::Ancestor { target, .. } => {
-                let (hash_to_height, height_to_hash) = prove_ancestry(conn, parent, &target)
-                    .map_err(|e| format!("{query:?}: {e:?}"))?;
-                StoreProof::Ancestor {
-                    hash_to_height,
-                    height_to_hash,
-                }
-            }
-            Claim::OpenBlock { .. } => StoreProof::OpenBlock,
-            Claim::Metadata => StoreProof::Rederived,
-        };
-        proofs.push(proof);
+        proofs.push(
+            prove_store_entry(conn, proof, query, answer, witness.open_height, parent)
+                .map_err(|e| format!("{query:?}: {e}"))?,
+        );
     }
     Ok(proofs)
 }
 
-/// Inclusion proofs of each `(key, value)` at `block`'s root: a block's final
+/// Walk each `(key, value)` at `block`'s root into `proof`: a block's final
 /// writes, proven against its own header.
 pub fn prove_writes(
     conn: &mut TrieStorageConnection<StacksBlockId>,
+    proof: &mut MultiproofBuilder<StacksBlockId>,
     block: &StacksBlockId,
     writes: &[(String, String)],
-) -> Result<Vec<(String, MarfProof)>, String> {
-    writes
-        .iter()
-        .map(|(key, value)| {
-            let proof = prove_key(
-                conn,
-                block,
-                &TrieHash::from_key(key),
-                Some(&MARFValue::from_value(value)),
-            )
-            .map_err(|e| format!("write {key}: {e:?}"))?;
-            Ok((key.clone(), proof))
-        })
-        .collect()
+) -> Result<(), String> {
+    for (key, value) in writes.iter() {
+        prove_key(
+            conn,
+            proof,
+            block,
+            &TrieHash::from_key(key),
+            Some(&MARFValue::from_value(value)),
+        )
+        .map_err(|e| format!("write {key}: {e}"))?;
+    }
+    Ok(())
 }
 
-/// Evidence for re-deriving `contract`, deployed in `block` (found through
-/// the commitment at `parent`).
-pub fn prove_contract(
+/// The answer a deploy at `open_height` on top of `parent` gets for `query`,
+/// read from the MARF. Answers are what [`claim_of`] claims, so each is
+/// provable the way a block's own reads are.
+fn answer_store_query(
+    conn: &mut TrieStorageConnection<StacksBlockId>,
+    query: &StoreQuery,
+    open_height: u32,
+    parent: &StacksBlockId,
+) -> Result<Option<String>, String> {
+    let marf = |e: MarfError| format!("{query:?}: {e:?}");
+    let value_at = |conn: &mut TrieStorageConnection<StacksBlockId>,
+                    block: &StacksBlockId,
+                    key: &str|
+     -> Result<Option<MARFValue>, String> {
+        MARF::get_by_key(conn, block, key).map_err(marf)
+    };
+    let side = |conn: &TrieStorageConnection<StacksBlockId>, value: Option<MARFValue>| {
+        value
+            .map(|v| side_value(conn, &v).ok_or_else(|| format!("{query:?}: no side-table value")))
+            .transpose()
+    };
+    let root_of = |at: &Option<StacksBlockId>| at.clone().unwrap_or_else(|| parent.clone());
+    Ok(match query {
+        StoreQuery::Data { at, key } => {
+            let value = value_at(conn, &root_of(at), key)?;
+            side(conn, value)?
+        }
+        StoreQuery::Path { at, path } => {
+            let value = MARF::get_by_path(conn, &root_of(at), path).map_err(marf)?;
+            side(conn, value)?
+        }
+        StoreQuery::BlockAtHeight { at: None, height } if *height == open_height => {
+            Some(miner_tip().to_hex())
+        }
+        StoreQuery::BlockAtHeight { at: None, height } if height + 1 == open_height => {
+            Some(parent.to_hex())
+        }
+        StoreQuery::BlockAtHeight { at, height } => {
+            let tip = root_of(at);
+            let own = MARF::get_block_height_miner_tip(conn, &tip, &tip).map_err(marf)?;
+            if at.is_some() && own == Some(*height) {
+                Some(tip.to_hex())
+            } else {
+                value_at(conn, &tip, &height_to_hash_key(*height))?
+                    .map(|v| StacksBlockId::from(v).to_hex())
+            }
+        }
+        StoreQuery::CurrentHeight { at } => {
+            value_at(conn, at, OWN_BLOCK_HEIGHT_KEY)?.map(|v| u32::from(v).to_string())
+        }
+        StoreQuery::AtBlock { target } if target == parent => Some("ok".into()),
+        StoreQuery::AtBlock { target } => {
+            let ancestor = match value_at(conn, parent, &hash_to_height_key(target))? {
+                Some(height) => {
+                    value_at(conn, parent, &height_to_hash_key(u32::from(height)))?
+                        == Some(MARFValue::from(target.clone()))
+                }
+                None => false,
+            };
+            ancestor.then(|| "ok".to_string())
+        }
+        StoreQuery::Metadata { .. } => {
+            return Err(format!(
+                "{query:?}: the deploy reads metadata of a contract not re-derived"
+            ))
+        }
+    })
+}
+
+/// A contract's commitment, deploying block, source and epoch key, read from
+/// the MARF at `parent` (nothing proven yet).
+fn contract_evidence(
     conn: &mut TrieStorageConnection<StacksBlockId>,
     parent: &StacksBlockId,
     contract: &QualifiedContractIdentifier,
@@ -931,58 +810,197 @@ pub fn prove_contract(
 ) -> Result<ContractEvidence, String> {
     let commitment_key = make_contract_hash_key(contract);
     let commitment = MARF::get_by_key(conn, parent, &commitment_key)
-        .map_err(|e| format!("{contract}: {e:?}"))?
-        .ok_or_else(|| format!("{contract} is not deployed"))?;
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("not deployed")?;
     // MARF leaves hold value hashes; the value itself is in the side table
-    let commitment = side_value(conn, &commitment)
-        .ok_or_else(|| format!("{contract}: no side-table value for its commitment"))?;
+    let commitment =
+        side_value(conn, &commitment).ok_or("no side-table value for its commitment")?;
     let height = ContractCommitment::deserialize(&commitment)
-        .map_err(|e| format!("{contract}: {e:?}"))?
+        .map_err(|e| format!("{e:?}"))?
         .block_height;
     let block = MARF::get_block_at_height(conn, height, parent)
-        .map_err(|e| format!("{contract}: {e:?}"))?
-        .ok_or_else(|| format!("{contract}: no block at height {height}"))?;
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or_else(|| format!("no block at height {height}"))?;
     let source = if boot_contract_source(contract, mainnet).is_some() {
         DeploySource::Boot
     } else {
         DeploySource::Tx(
             find_deploy(&block, contract)
-                .ok_or_else(|| format!("{contract}: deploy tx not found in {block}"))?,
+                .ok_or_else(|| format!("deploy tx not found in {block}"))?,
         )
     };
-    let commitment_proof = prove_key(
-        conn,
-        &block,
-        &TrieHash::from_key(&commitment_key),
-        Some(&MARFValue::from_value(&commitment)),
-    )
-    .map_err(|e| format!("{contract}: {e:?}"))?;
-    let epoch_path = TrieHash::from_key(EPOCH_VERSION_KEY);
-    let epoch_key = MARF::get_by_path(conn, &block, &epoch_path)
-        .map_err(|e| format!("{contract}: {e:?}"))?
-        .map(|value| side_value(conn, &value).expect("epoch value in the side table"));
-    let epoch_key_proof = prove_key(
-        conn,
-        &block,
-        &epoch_path,
-        epoch_key.as_deref().map(MARFValue::from_value).as_ref(),
-    )
-    .map_err(|e| format!("{contract}: {e:?}"))?;
-    let ancestry = if &block == parent {
-        None
-    } else {
-        Some(prove_ancestry(conn, parent, &block).map_err(|e| format!("{contract}: {e:?}"))?)
-    };
+    let epoch_key = MARF::get_by_path(conn, &block, &TrieHash::from_key(EPOCH_VERSION_KEY))
+        .map_err(|e| format!("{e:?}"))?
+        .map(|value| side_value(conn, &value).ok_or("no side-table value for the epoch"))
+        .transpose()?;
     Ok(ContractEvidence {
         contract: contract.clone(),
         block,
         source,
         commitment,
-        commitment_proof,
         epoch_key,
-        epoch_key_proof,
-        ancestry,
+        deploy_reads: vec![],
+        deploy_proofs: vec![],
     })
+}
+
+/// The commitment height a contract's evidence names.
+fn deploy_height(evidence: &ContractEvidence) -> Result<u32, String> {
+    ContractCommitment::deserialize(&evidence.commitment)
+        .map(|c| c.block_height)
+        .map_err(|e| format!("bad commitment: {e:?}"))
+}
+
+/// The key whose value at the deploying block, `height` high, is its
+/// parent's id: the child trie rewrites the parent's height-to-hash entry
+/// with the real id.
+fn deploy_parent_path(height: u32) -> Result<TrieHash, String> {
+    let parent_height = height
+        .checked_sub(1)
+        .ok_or("a genesis deploy has no parent")?;
+    Ok(TrieHash::from_key(&height_to_hash_key(parent_height)))
+}
+
+/// The MARF path of a deploy read whose key someone else could have written
+/// earlier in the deploying block: an open-block read of a key outside the
+/// contract's own storage. (A contract's own keys cannot exist before its
+/// deploy.)
+fn foreign_read_path(
+    contract: &QualifiedContractIdentifier,
+    query: &StoreQuery,
+) -> Option<TrieHash> {
+    match query {
+        StoreQuery::Data { at: None, key } => {
+            (!key.starts_with(&format!("vm::{contract}::"))).then(|| TrieHash::from_key(key))
+        }
+        StoreQuery::Path { at: None, path } => Some(*path),
+        _ => None,
+    }
+}
+
+/// A contract that cannot be resolved yet, or at all.
+enum Resolve {
+    /// Its analysis needs these contracts first.
+    Needs(Vec<QualifiedContractIdentifier>),
+    /// It cannot be re-derived, and why.
+    Fails(String),
+}
+
+/// A commitment read of another contract: re-derivation needs it first.
+fn dependency_of(
+    query: &StoreQuery,
+    contract: &QualifiedContractIdentifier,
+) -> Option<QualifiedContractIdentifier> {
+    let StoreQuery::Data { at: None, key } = query else {
+        return None;
+    };
+    let id = QualifiedContractIdentifier::parse(key.strip_prefix("clarity-contract::")?).ok()?;
+    (&id != contract).then_some(id)
+}
+
+/// Gather `contract`'s evidence and re-derive it given `known` contracts,
+/// answering the chain state its deploy reads from the MARF at the deploying
+/// block's parent (the deploy witness).
+fn resolve_contract(
+    conn: &mut TrieStorageConnection<StacksBlockId>,
+    parent: &StacksBlockId,
+    contract: &QualifiedContractIdentifier,
+    net: &NetworkParams,
+    find_deploy: &dyn Fn(&StacksBlockId, &QualifiedContractIdentifier) -> Option<TxInclusion>,
+    known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
+) -> Result<(ContractEvidence, Sha512Trunc256Sum, ContractMetadata), Resolve> {
+    let mut evidence = contract_evidence(conn, parent, contract, find_deploy, net.mainnet)
+        .map_err(Resolve::Fails)?;
+    let height = deploy_height(&evidence).map_err(Resolve::Fails)?;
+    let mut deploy_parent = None;
+    for _ in 0..MAX_DEPLOY_READ_ROUNDS {
+        let (store, env) = match rederive_unchecked(&evidence, net, known) {
+            Ok((hash, rows)) => return Ok((evidence, hash, rows)),
+            Err(Rederive::Invalid(e)) => return Err(Resolve::Fails(e)),
+            Err(Rederive::Missing { store, env }) => (store, env),
+        };
+        if !env.is_empty() {
+            return Err(Resolve::Fails(format!(
+                "its deploy reads chain state not provable yet: {env:?}"
+            )));
+        }
+        let deps: Vec<_> = store
+            .iter()
+            .filter_map(|q| dependency_of(q, contract))
+            .collect();
+        if !deps.is_empty() {
+            return Err(Resolve::Needs(deps));
+        }
+        let deploy_parent = match &deploy_parent {
+            Some(p) => p,
+            None => {
+                let path = deploy_parent_path(height).map_err(Resolve::Fails)?;
+                let id = MARF::get_by_path(conn, &evidence.block, &path)
+                    .map_err(|e| Resolve::Fails(format!("deploy block's parent: {e:?}")))?
+                    .ok_or_else(|| Resolve::Fails("deploy block has no parent entry".into()))?;
+                deploy_parent.insert(StacksBlockId::from(id))
+            }
+        };
+        for query in store {
+            if evidence.deploy_reads.iter().any(|(q, _)| q == &query) {
+                return Err(Resolve::Fails(format!(
+                    "its deploy asks for {query:?} again"
+                )));
+            }
+            let answer =
+                answer_store_query(conn, &query, height, deploy_parent).map_err(Resolve::Fails)?;
+            evidence.deploy_reads.push((query, answer));
+        }
+    }
+    Err(Resolve::Fails(format!(
+        "its deploy reads chain state in more than {MAX_DEPLOY_READ_ROUNDS} rounds"
+    )))
+}
+
+/// Walk every MARF fact `evidence` stands on into `proof`: commitment and
+/// epoch key at the deploying block, its ancestry at `parent`, and for a
+/// deploy witness, the deploying block's parent and each deploy read (plus,
+/// for reads of keys outside the contract, the same key at the deploying
+/// block, so the client can tell whether that block also wrote it).
+fn prove_contract_facts(
+    conn: &mut TrieStorageConnection<StacksBlockId>,
+    proof: &mut MultiproofBuilder<StacksBlockId>,
+    parent: &StacksBlockId,
+    evidence: &mut ContractEvidence,
+) -> Result<(), String> {
+    let block = evidence.block.clone();
+    let commitment_path = TrieHash::from_key(&make_contract_hash_key(&evidence.contract));
+    let commitment = MARFValue::from_value(&evidence.commitment);
+    prove_key(conn, proof, &block, &commitment_path, Some(&commitment))?;
+    let epoch = evidence.epoch_key.as_deref().map(MARFValue::from_value);
+    prove_key(
+        conn,
+        proof,
+        &block,
+        &TrieHash::from_key(EPOCH_VERSION_KEY),
+        epoch.as_ref(),
+    )?;
+    if &block != parent && !prove_ancestry(conn, proof, parent, &block)? {
+        return Err("deploy block is not an ancestor".into());
+    }
+    evidence.deploy_proofs.clear();
+    if evidence.deploy_reads.is_empty() {
+        return Ok(());
+    }
+    let height = deploy_height(evidence)?;
+    let deploy_parent = walk(conn, proof, &block, &deploy_parent_path(height)?)?
+        .value
+        .map(StacksBlockId::from)
+        .ok_or("deploy block has no parent entry")?;
+    for (query, answer) in evidence.deploy_reads.iter() {
+        let proven = prove_store_entry(conn, proof, query, answer, height, &deploy_parent)
+            .map_err(|e| format!("deploy read {query:?}: {e}"))?;
+        if let Some(path) = foreign_read_path(&evidence.contract, query) {
+            walk(conn, proof, &block, &path)?;
+        }
+        evidence.deploy_proofs.push(proven);
+    }
+    Ok(())
 }
 
 /// Contracts whose metadata `witness` read.
@@ -1000,27 +1018,35 @@ pub fn metadata_contracts(witness: &ReadWitness) -> Vec<QualifiedContractIdentif
         .collect()
 }
 
-/// Contracts that cannot be re-derived from their deploy alone, and why.
+/// Contracts that cannot be re-derived, and why.
 pub type UnprovenContracts = Vec<(QualifiedContractIdentifier, String)>;
 
 /// Contract evidence for every contract whose metadata `witness` read, plus
 /// whatever their analysis depends on, ordered so each contract's
-/// dependencies come first. Dependencies are found by re-deriving. Contracts
-/// that cannot be re-derived from their deploy alone come back separately,
-/// with the reason (their metadata can only be served as is).
+/// dependencies come first. Dependencies are found by re-deriving (at most
+/// [`MAX_DEPENDENCY_DEPTH`] deep). A contract whose deploy reads chain state
+/// carries a deploy witness: those reads, answered at its deploying block's
+/// parent. Contracts that cannot be re-derived come back separately, with the
+/// reason (their metadata can only be served as is). Only the evidence that
+/// is served has its MARF facts walked into `proof`.
 pub fn prove_contracts(
     conn: &mut TrieStorageConnection<StacksBlockId>,
+    proof: &mut MultiproofBuilder<StacksBlockId>,
     parent: &StacksBlockId,
     witness: &ReadWitness,
     net: &NetworkParams,
     find_deploy: &dyn Fn(&StacksBlockId, &QualifiedContractIdentifier) -> Option<TxInclusion>,
 ) -> Result<(Vec<ContractEvidence>, UnprovenContracts), String> {
     let mut ordered: Vec<ContractEvidence> = vec![];
-    let mut pending = metadata_contracts(witness);
+    // contracts still to resolve, with how deep a dependency each is
+    let mut pending: Vec<(QualifiedContractIdentifier, usize)> = metadata_contracts(witness)
+        .into_iter()
+        .map(|c| (c, 0))
+        .collect();
     let mut derived = HashMap::new();
     let mut failed: BTreeMap<QualifiedContractIdentifier, String> = BTreeMap::new();
     let mut attempts = 0;
-    while let Some(contract) = pending.last().cloned() {
+    while let Some((contract, depth)) = pending.last().cloned() {
         attempts += 1;
         if attempts > 1000 {
             return Err("contract dependencies do not resolve".into());
@@ -1029,43 +1055,36 @@ pub fn prove_contracts(
             pending.pop();
             continue;
         }
-        let evidence = match prove_contract(conn, parent, &contract, find_deploy, net.mainnet) {
-            Ok(evidence) => evidence,
-            Err(e) => {
-                failed.insert(contract, e);
-                pending.pop();
-                continue;
-            }
-        };
-        let failure = match rederive_unchecked(&evidence, net, &derived) {
-            Ok((hash, rows)) => {
-                derived.insert(contract.clone(), (hash, rows));
+        match resolve_contract(conn, parent, &contract, net, find_deploy, &derived) {
+            Ok((evidence, hash, rows)) => {
+                derived.insert(contract, (hash, rows));
                 ordered.push(evidence);
-                None
             }
-            Err(Rederive::Missing(missing)) => {
-                let deps: Vec<_> = missing
-                    .iter()
-                    .filter_map(|m| m.split("clarity-contract::").nth(1))
-                    .filter_map(|rest| rest.split('"').next())
-                    .filter_map(|id| QualifiedContractIdentifier::parse(id).ok())
-                    .filter(|id| !derived.contains_key(id) && id != &contract)
-                    .collect();
+            Err(Resolve::Needs(deps)) => {
                 if let Some(dep) = deps.iter().find(|d| failed.contains_key(d)) {
-                    Some(format!("depends on {dep}, which is not re-derivable"))
-                } else if deps.is_empty() {
-                    Some(format!("its deploy reads chain state: {missing:?}"))
+                    failed.insert(
+                        contract,
+                        format!("depends on {dep}, which is not re-derivable"),
+                    );
+                } else if depth >= MAX_DEPENDENCY_DEPTH {
+                    failed.insert(
+                        contract,
+                        format!("its dependencies nest deeper than {MAX_DEPENDENCY_DEPTH}"),
+                    );
                 } else {
-                    pending.extend(deps);
+                    pending.extend(deps.into_iter().map(|d| (d, depth + 1)));
                     continue;
                 }
             }
-            Err(Rederive::Invalid(e)) => Some(e),
-        };
-        if let Some(reason) = failure {
-            failed.insert(contract, reason);
+            Err(Resolve::Fails(reason)) => {
+                failed.insert(contract, reason);
+            }
         }
         pending.pop();
+    }
+    for evidence in ordered.iter_mut() {
+        prove_contract_facts(conn, proof, parent, evidence)
+            .map_err(|e| format!("{}: {e}", evidence.contract))?;
     }
     Ok((ordered, failed.into_iter().collect()))
 }
@@ -1175,49 +1194,128 @@ fn boot_deploy_tx(
 }
 
 enum Rederive {
-    /// Re-derivation needed something outside the deploy and the known
-    /// contracts.
-    Missing(Vec<String>),
+    /// Re-derivation asked for chain state the deploy witness does not hold
+    /// (store reads), or lookups not provable in a deploy yet (environment).
+    Missing {
+        store: Vec<StoreQuery>,
+        env: Vec<String>,
+    },
     Invalid(String),
 }
 
-/// Check one contract's evidence against the header chain and re-derive its
-/// metadata.
+/// A shared MARF proof a client opened against its headers, or why it could
+/// not be opened.
+pub struct OpenedProof {
+    proof: Result<Multiproof<StacksBlockId>, String>,
+}
+
+impl OpenedProof {
+    pub fn open(bytes: &[u8], headers: &HeaderChain) -> Self {
+        OpenedProof {
+            proof: headers.open_proof(bytes),
+        }
+    }
+
+    /// Where `path`'s walk from `block`'s root ends.
+    pub fn get(
+        &self,
+        block: &StacksBlockId,
+        path: &TrieHash,
+    ) -> Result<WalkEnd<StacksBlockId>, String> {
+        match &self.proof {
+            Ok(proof) => proof.get(block, path),
+            Err(e) => Err(format!("the shared proof does not decode: {e}")),
+        }
+    }
+
+    /// `path` holds `value` (`None`: absent) at `block`'s root.
+    pub fn holds(
+        &self,
+        block: &StacksBlockId,
+        path: &TrieHash,
+        value: Option<&MARFValue>,
+    ) -> Result<(), String> {
+        let end = self
+            .get(block, path)
+            .map_err(|e| format!("MARF proof fails: {e}"))?;
+        if end.value.as_ref() == value {
+            Ok(())
+        } else {
+            Err("MARF proof fails".into())
+        }
+    }
+
+    /// Why the proof is not exact: it did not decode, or it carries nodes no
+    /// walk so far reached (extra nodes).
+    pub fn strictness(&self) -> Option<String> {
+        match &self.proof {
+            Err(e) => Some(format!("does not decode: {e}")),
+            Ok(proof) if proof.unvisited() > 0 => Some(format!(
+                "{} of its {} nodes are reached by no entry",
+                proof.unvisited(),
+                proof.nodes()
+            )),
+            Ok(_) => None,
+        }
+    }
+
+    /// `(tries, nodes, bytes)`.
+    pub fn stats(&self) -> Option<(usize, usize, usize)> {
+        self.proof
+            .as_ref()
+            .ok()
+            .map(|p| (p.tries(), p.nodes(), p.byte_len()))
+    }
+}
+
+/// Deploy reads, by whether the deploying block also wrote the key read.
+/// Each is proven at the deploying block's parent, which is the value the
+/// deploy saw unless something earlier in that same block wrote the key. A
+/// key the block never wrote is settled; for one it also wrote, the client
+/// cannot tell from roots alone whether that write came before the deploy
+/// (e.g. `_stx-data::ustx_liquid_supply`, which every block's teardown
+/// rewrites after its transactions).
+pub const DEPLOY_READ_SETTLED: &str = "deploy read (key not written in its block)";
+pub const DEPLOY_READ_ORDER_ASSUMED: &str = "deploy read (block also wrote key; assumed after)";
+
+/// Check one contract's evidence (deploy block an ancestor of `parent`,
+/// commitment, epoch, source, deploy witness) and re-derive its metadata.
 fn rederive(
     evidence: &ContractEvidence,
+    parent: &StacksBlockId,
     headers: &HeaderChain,
+    marf: &OpenedProof,
     net: &NetworkParams,
     known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
+    kinds: &mut BTreeMap<&'static str, usize>,
 ) -> Result<(Sha512Trunc256Sum, ContractMetadata), Rederive> {
     let invalid = |s: String| Rederive::Invalid(s);
     let header = headers
         .get(&evidence.block)
         .ok_or_else(|| invalid(format!("unknown deploy block {}", evidence.block)))?;
-    let root = header.state_index_root;
+    if &evidence.block != parent && !ancestry_of(marf, &evidence.block, parent).map_err(invalid)? {
+        return Err(invalid("deploy block is not an ancestor".into()));
+    }
 
     // the commitment pins the source hash and the deploy height
     let commitment_key = make_contract_hash_key(&evidence.contract);
-    if !evidence.commitment_proof.holds(
+    marf.holds(
+        &evidence.block,
         &TrieHash::from_key(&commitment_key),
         Some(&MARFValue::from_value(&evidence.commitment)),
-        &root,
-        headers,
-    ) {
-        return Err(invalid("commitment proof fails".into()));
-    }
+    )
+    .map_err(|e| invalid(format!("commitment: {e}")))?;
     // the epoch the deploy ran in
-    if !evidence.epoch_key_proof.holds(
+    marf.holds(
+        &evidence.block,
         &TrieHash::from_key(EPOCH_VERSION_KEY),
         evidence
             .epoch_key
             .as_deref()
             .map(MARFValue::from_value)
             .as_ref(),
-        &root,
-        headers,
-    ) {
-        return Err(invalid("epoch proof fails".into()));
-    }
+    )
+    .map_err(|e| invalid(format!("epoch key: {e}")))?;
     if let DeploySource::Tx(inclusion) = &evidence.source {
         if !inclusion.holds(headers) {
             return Err(invalid("deploy tx is not in the deploy block".into()));
@@ -1230,7 +1328,80 @@ fn rederive(
             deploy.commitment.block_height, header.height
         )));
     }
+    verify_deploy_reads(evidence, header, headers, marf, kinds)?;
     deploy.derive(evidence, net, known)
+}
+
+/// Check a contract's deploy witness: the deploying block's parent (its own
+/// trie names it), then every read as a block's own reads are checked, at
+/// that parent's root.
+fn verify_deploy_reads(
+    evidence: &ContractEvidence,
+    header: &ChainHeader,
+    headers: &HeaderChain,
+    marf: &OpenedProof,
+    kinds: &mut BTreeMap<&'static str, usize>,
+) -> Result<(), Rederive> {
+    let invalid = |s: String| Rederive::Invalid(s);
+    if evidence.deploy_proofs.len() != evidence.deploy_reads.len() {
+        return Err(invalid("one proof per deploy read".into()));
+    }
+    if evidence.deploy_reads.is_empty() {
+        return Ok(());
+    }
+    let path = deploy_parent_path(header.height).map_err(invalid)?;
+    let deploy_parent = marf
+        .get(&evidence.block, &path)
+        .map_err(|e| invalid(format!("deploy block's parent: MARF proof fails: {e}")))?
+        .value
+        .map(StacksBlockId::from)
+        .ok_or_else(|| invalid("deploy block has no parent entry".into()))?;
+    if header.is_nakamoto() && header.parent != deploy_parent {
+        return Err(invalid(format!(
+            "deploy block's trie names parent {deploy_parent}, its header {}",
+            header.parent
+        )));
+    }
+    let (mut settled, mut assumed) = (0, 0);
+    for ((query, answer), proof) in evidence
+        .deploy_reads
+        .iter()
+        .zip(evidence.deploy_proofs.iter())
+    {
+        let named = |e: String| invalid(format!("deploy read {query:?}: {e}"));
+        if matches!(query, StoreQuery::Metadata { .. })
+            || matches!(proof, StoreProof::Rederived | StoreProof::Served)
+        {
+            return Err(named("not a chain-state read".into()));
+        }
+        verify_store_entry(
+            query,
+            answer,
+            proof,
+            header.height,
+            &deploy_parent,
+            headers,
+            marf,
+        )
+        .map_err(named)?;
+        let also_written = match foreign_read_path(&evidence.contract, query) {
+            Some(path) => {
+                let end = marf
+                    .get(&evidence.block, &path)
+                    .map_err(|e| named(format!("at the deploy block: MARF proof fails: {e}")))?;
+                end.value.is_some() && end.trie == evidence.block
+            }
+            None => false,
+        };
+        if also_written {
+            assumed += 1;
+        } else {
+            settled += 1;
+        }
+    }
+    *kinds.entry(DEPLOY_READ_SETTLED).or_default() += settled;
+    *kinds.entry(DEPLOY_READ_ORDER_ASSUMED).or_default() += assumed;
+    Ok(())
 }
 
 /// Re-derive a contract's metadata from evidence the caller produced itself
@@ -1298,14 +1469,13 @@ impl Deploy {
             height: self.commitment.block_height,
             epoch: self.epoch,
             epoch_key: evidence.epoch_key.clone(),
+            reads: &evidence.deploy_reads,
         };
         match derive_contract_metadata(&deploy, known, net.mainnet, net.chain_id) {
             Ok((id, rows)) if id == evidence.contract => Ok((self.commitment.hash.clone(), rows)),
             Ok((id, _)) => Err(Rederive::Invalid(format!("deploy tx deploys {id}"))),
-            Err(StatelessError::WitnessIncomplete(missing)) => Err(Rederive::Missing(missing)),
-            Err(StatelessError::Block(e)) => {
-                Err(Rederive::Invalid(format!("deploy failed: {e:?}")))
-            }
+            Err(DeriveError::Missing { store, env }) => Err(Rederive::Missing { store, env }),
+            Err(DeriveError::Failed(e)) => Err(Rederive::Invalid(format!("deploy failed: {e:?}"))),
         }
     }
 }
@@ -1442,12 +1612,25 @@ pub fn verify_read_witness(
     proven: &ProvenWitness,
 ) -> Result<(), Rejection> {
     match check_read_witness(block, txs, trusted, proven)
+        .rejections
         .into_iter()
         .next()
     {
         Some(rejection) => Err(rejection),
         None => Ok(()),
     }
+}
+
+/// What [`check_read_witness`] established.
+#[derive(Debug, Default)]
+pub struct WitnessCheck {
+    /// Every entry that failed.
+    pub rejections: Vec<Rejection>,
+    /// Entries checked whose kind the witness alone does not show (deploy
+    /// reads, see [`DEPLOY_READ_SETTLED`]).
+    pub kinds: BTreeMap<&'static str, usize>,
+    /// The shared MARF proof: tries, nodes, bytes (`None`: it did not decode).
+    pub marf: Option<(usize, usize, usize)>,
 }
 
 /// [`verify_read_witness`], reporting every entry that fails rather than the
@@ -1457,10 +1640,13 @@ pub fn check_read_witness(
     txs: &[StacksTransaction],
     trusted: &TrustedState,
     proven: &ProvenWitness,
-) -> Vec<Rejection> {
+) -> WitnessCheck {
     match check_block_context(block, txs, trusted, proven) {
-        Ok(rejections) => rejections,
-        Err(rejection) => vec![rejection],
+        Ok(check) => check,
+        Err(rejection) => WitnessCheck {
+            rejections: vec![rejection],
+            ..Default::default()
+        },
     }
 }
 
@@ -1469,7 +1655,7 @@ fn check_block_context(
     txs: &[StacksTransaction],
     trusted: &TrustedState,
     proven: &ProvenWitness,
-) -> Result<Vec<Rejection>, Rejection> {
+) -> Result<WitnessCheck, Rejection> {
     let TrustedState {
         headers,
         bitcoin,
@@ -1518,16 +1704,37 @@ fn check_block_context(
         return Err(reject("store", "one proof per store entry"));
     }
 
-    let mut rejections = vec![];
+    let marf = OpenedProof::open(&proven.marf, headers);
+    let mut check = WitnessCheck {
+        marf: marf.stats(),
+        ..Default::default()
+    };
     // store entries
     for ((query, answer), proof) in witness.store.iter().zip(proven.store.iter()) {
-        if let Err(e) = verify_store_entry(query, answer, proof, witness, &parent.id, headers) {
-            rejections.push(reject(query, e));
+        if let Err(e) = verify_store_entry(
+            query,
+            answer,
+            proof,
+            witness.open_height,
+            &parent.id,
+            headers,
+            &marf,
+        ) {
+            check.rejections.push(reject(query, e));
         }
     }
 
     // contract metadata
-    rejections.extend(verify_metadata(witness, proven, &parent.id, headers, net));
+    let rejections = verify_metadata(
+        witness,
+        proven,
+        &parent.id,
+        headers,
+        &marf,
+        net,
+        &mut check.kinds,
+    );
+    check.rejections.extend(rejections);
 
     // environment lookups
     let ctx = EnvContext {
@@ -1540,51 +1747,37 @@ fn check_block_context(
     };
     for read in witness.env.iter() {
         if let Err(e) = verify_env(read, &ctx) {
-            rejections.push(reject(read, e));
+            check.rejections.push(reject(read, e));
         }
     }
-    Ok(rejections)
+
+    // the shared proof is exact: every node it carries is on some entry's walk
+    if let Some(reason) = marf.strictness() {
+        check.rejections.push(reject("shared MARF proof", reason));
+    }
+    Ok(check)
 }
 
+/// Check one store entry read at `open_height` on top of `parent` (a block's
+/// own read, or a deploy's) against the shared proof.
 fn verify_store_entry(
     query: &StoreQuery,
     answer: &Option<String>,
     proof: &StoreProof,
-    witness: &ReadWitness,
+    open_height: u32,
     parent: &StacksBlockId,
     headers: &HeaderChain,
+    marf: &OpenedProof,
 ) -> Result<(), String> {
-    let root_of = |block: &StacksBlockId| {
-        headers
-            .get(block)
-            .map(|h| h.state_index_root)
-            .ok_or_else(|| format!("unknown block {block}"))
-    };
-    let claim = claim_of(query, answer, witness, parent, |at| {
+    let claim = claim_of(query, answer, open_height, parent, |at| {
         headers.get(at).map(|h| h.height)
     })?;
     match (claim, proof) {
-        (Claim::Key { block, path, value }, StoreProof::Marf(proof)) => {
-            if proof.holds(&path, value.as_ref(), &root_of(&block)?, headers) {
-                Ok(())
-            } else {
-                Err("MARF proof fails".into())
-            }
+        (Claim::Key { block, path, value }, StoreProof::Marf) => {
+            marf.holds(&block, &path, value.as_ref())
         }
-        (
-            Claim::Ancestor { target, is },
-            StoreProof::Ancestor {
-                hash_to_height,
-                height_to_hash,
-            },
-        ) => {
-            let proven = ancestry_of(
-                &target,
-                hash_to_height,
-                height_to_hash,
-                &root_of(parent)?,
-                headers,
-            )?;
+        (Claim::Ancestor { target, is }, StoreProof::Ancestor) => {
+            let proven = ancestry_of(marf, &target, parent)?;
             if proven == is {
                 Ok(())
             } else {
@@ -1600,34 +1793,33 @@ fn verify_store_entry(
         }
         (Claim::Metadata, StoreProof::Rederived) => Ok(()),
         (Claim::Metadata, StoreProof::Served) => {
-            Err("not provable yet: its contract is not re-derivable from its deploy alone".into())
+            Err("not provable yet: its contract is not re-derivable".into())
         }
         _ => Err("wrong kind of proof".into()),
     }
 }
 
-/// Check [`prove_ancestry`]'s proofs against the parent's root and return
-/// whether they show `target` is an ancestor.
+/// Whether the shared proof shows `target` is an ancestor of `parent`:
+/// `__MARF_BLOCK_HASH_TO_HEIGHT::target` at the parent's root and, if
+/// present, the block at that height.
 fn ancestry_of(
+    marf: &OpenedProof,
     target: &StacksBlockId,
-    hash_to_height: &MarfProof,
-    height_to_hash: &MarfProof,
-    parent_root: &TrieHash,
-    headers: &HeaderChain,
+    parent: &StacksBlockId,
 ) -> Result<bool, String> {
-    let height = hash_to_height.present_value();
     let path = TrieHash::from_key(&hash_to_height_key(target));
-    if !hash_to_height.holds(&path, height.as_ref(), parent_root, headers) {
-        return Err("height proof fails".into());
-    }
+    let height = marf
+        .get(parent, &path)
+        .map_err(|e| format!("height proof fails: {e}"))?
+        .value;
     let Some(height) = height else {
         return Ok(false);
     };
     let path = TrieHash::from_key(&height_to_hash_key(u32::from(height)));
-    let block = height_to_hash.present_value();
-    if !height_to_hash.holds(&path, block.as_ref(), parent_root, headers) {
-        return Err("block-at-height proof fails".into());
-    }
+    let block = marf
+        .get(parent, &path)
+        .map_err(|e| format!("block-at-height proof fails: {e}"))?
+        .value;
     Ok(block == Some(MARFValue::from(target.clone())))
 }
 
@@ -1638,50 +1830,31 @@ struct Rederived {
     deployed_in: HashMap<String, StacksBlockId>,
 }
 
-/// Check every contract's evidence (deploy block an ancestor of the parent,
-/// commitment, epoch, source) and re-derive its metadata, dependencies first.
-/// A contract that fails is rejected and left out (so are contracts that
-/// depend on it).
+/// Check every contract's evidence and re-derive its metadata, dependencies
+/// first. A contract that fails is rejected and left out (so are contracts
+/// that depend on it).
 fn rederive_contracts(
     proven: &ProvenWitness,
     parent: &StacksBlockId,
     headers: &HeaderChain,
+    marf: &OpenedProof,
     net: &NetworkParams,
+    kinds: &mut BTreeMap<&'static str, usize>,
 ) -> (Rederived, Vec<Rejection>) {
     let mut known = HashMap::new();
     let mut deployed_in = HashMap::new();
     let mut rejections = vec![];
-    let parent_root = headers.get(parent).map(|h| h.state_index_root);
     for evidence in proven.contracts.iter() {
-        let checked = (|| {
-            let parent_root = parent_root.ok_or("unknown parent")?;
-            let is_ancestor = match &evidence.ancestry {
-                None => &evidence.block == parent,
-                Some((hash_to_height, height_to_hash)) => ancestry_of(
-                    &evidence.block,
-                    hash_to_height,
-                    height_to_hash,
-                    &parent_root,
-                    headers,
-                )?,
-            };
-            if !is_ancestor {
-                return Err("deploy block is not an ancestor".to_string());
-            }
-            match rederive(evidence, headers, net, &known) {
-                Ok(derived) => Ok(derived),
-                Err(Rederive::Missing(missing)) => Err(format!(
-                    "not re-derivable from its deploy alone: {missing:?}"
-                )),
-                Err(Rederive::Invalid(e)) => Err(e),
-            }
-        })();
-        match checked {
+        match rederive(evidence, parent, headers, marf, net, &known, kinds) {
             Ok(derived) => {
                 known.insert(evidence.contract.clone(), derived);
                 deployed_in.insert(evidence.contract.to_string(), evidence.block.clone());
             }
-            Err(e) => rejections.push(reject(&evidence.contract, e)),
+            Err(Rederive::Missing { store, env }) => rejections.push(reject(
+                &evidence.contract,
+                format!("its deploy witness lacks reads: {store:?} {env:?}"),
+            )),
+            Err(Rederive::Invalid(e)) => rejections.push(reject(&evidence.contract, e)),
         }
     }
     let rows = known
@@ -1726,9 +1899,11 @@ fn verify_metadata(
     proven: &ProvenWitness,
     parent: &StacksBlockId,
     headers: &HeaderChain,
+    marf: &OpenedProof,
     net: &NetworkParams,
+    kinds: &mut BTreeMap<&'static str, usize>,
 ) -> Vec<Rejection> {
-    let (rederived, mut rejections) = rederive_contracts(proven, parent, headers, net);
+    let (rederived, mut rejections) = rederive_contracts(proven, parent, headers, marf, net, kinds);
     for ((query, answer), proof) in witness.store.iter().zip(proven.store.iter()) {
         if !matches!(query, StoreQuery::Metadata { .. }) || !matches!(proof, StoreProof::Rederived)
         {
@@ -1756,24 +1931,36 @@ fn verify_metadata(
 /// served witness leaves those values out (they are ~95% of a plain
 /// witness), so a client calls this before [`verify_read_witness`] (which
 /// checks the contract evidence and reports what did not re-derive) and
-/// re-execution.
+/// re-execution. Returns the contracts whose entries stay unfilled because
+/// they did not re-derive: re-executing without their metadata is
+/// meaningless.
 pub fn fill_rederived_metadata(
     proven: &mut ProvenWitness,
     block: &StacksBlockId,
     headers: &HeaderChain,
     net: &NetworkParams,
-) {
+) -> Vec<String> {
     let Some(parent) = headers.get(block).map(|h| h.parent.clone()) else {
-        return;
+        return vec![];
     };
-    let (rederived, _) = rederive_contracts(proven, &parent, headers, net);
+    let marf = OpenedProof::open(&proven.marf, headers);
+    let (rederived, _) =
+        rederive_contracts(proven, &parent, headers, &marf, net, &mut BTreeMap::new());
+    let mut unfilled = BTreeSet::new();
     for ((query, answer), proof) in proven.witness.store.iter_mut().zip(proven.store.iter()) {
-        if matches!(proof, StoreProof::Rederived) {
-            if let Ok(derived) = rederived_answer(query, &rederived) {
-                *answer = derived;
+        if !matches!(proof, StoreProof::Rederived) {
+            continue;
+        }
+        match rederived_answer(query, &rederived) {
+            Ok(derived) => *answer = derived,
+            Err(_) => {
+                if let StoreQuery::Metadata { contract, .. } = query {
+                    unfilled.insert(contract.clone());
+                }
             }
         }
     }
+    unfilled.into_iter().collect()
 }
 
 /// The consensus hash of `block`'s burn view: its own tenure change, else the
@@ -1970,9 +2157,10 @@ mod tests {
 
     /// Every mainnet boot contract re-derives from its bundled source in the
     /// epoch whose transition deploys it, given the boot contracts before it,
-    /// except two. `signers-voting` stores a constant read from `pox-4` state
-    /// at deploy time (`pox-info`), so it needs the deploy block's own witness
-    /// (`NOTES.md`, gap 4). `pox-5` needs the user-deployed sBTC token first.
+    /// except two, which name what they need. `signers-voting` stores a
+    /// constant read from `pox-4` state at deploy time (`pox-info`): a deploy
+    /// witness carries those reads. `pox-5` needs the user-deployed sBTC
+    /// token re-derived first.
     #[test]
     fn mainnet_boot_contracts_rederive_from_bundled_sources() {
         use StacksEpochId::*;
@@ -2014,6 +2202,7 @@ mod tests {
                 height: 1,
                 epoch,
                 epoch_key: (epoch != Epoch20).then(|| (epoch as u32).serialize()),
+                reads: &[],
             };
             let TransactionPayload::SmartContract(ref payload, _) = tx.payload else {
                 unreachable!()
@@ -2033,10 +2222,10 @@ mod tests {
                     assert!(rows.contains_key("vm-metadata::9::contract"), "{name}");
                     known.insert(id, (hash, rows));
                 }
-                Err(StatelessError::WitnessIncomplete(missing)) => {
-                    panic!("{name} needs {missing:?}")
+                Err(DeriveError::Missing { store, env }) => {
+                    panic!("{name} needs {store:?} {env:?}")
                 }
-                Err(StatelessError::Block(e)) => panic!("{name} fails to deploy: {e:?}"),
+                Err(DeriveError::Failed(e)) => panic!("{name} fails to deploy: {e:?}"),
             }
         }
 
@@ -2045,8 +2234,11 @@ mod tests {
             ("pox-5", Epoch40, "sbtc-token"),
         ] {
             match deploy_with(name, epoch, &known).2 {
-                Err(StatelessError::WitnessIncomplete(missing)) => {
-                    assert!(missing.iter().any(|m| m.contains(needs)), "{missing:?}")
+                Err(DeriveError::Missing { store, .. }) => {
+                    assert!(
+                        store.iter().any(|q| format!("{q:?}").contains(needs)),
+                        "{store:?}"
+                    )
                 }
                 other => panic!("{name} re-derived alone: {other:?}"),
             }

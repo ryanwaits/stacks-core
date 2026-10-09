@@ -29,6 +29,7 @@ use crate::chainstate::nakamoto::staging_blocks::NakamotoStagingBlocksConn;
 use crate::chainstate::nakamoto::{NakamotoBlock, NakamotoChainState};
 use crate::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksChainState, StacksHeaderInfo};
 use crate::chainstate::stacks::index::marf::MarfConnection;
+use crate::chainstate::stacks::index::multiproof::MultiproofBuilder;
 use crate::chainstate::stacks::{StacksTransaction, TransactionPayload};
 use crate::clarity_vm::read_witness::{EnvQuery, ReadWitness, StoreQuery};
 use crate::clarity_vm::state_writes::StateWrite;
@@ -36,7 +37,7 @@ use crate::clarity_vm::witness_proof::{
     mark_served_metadata, prove_contracts, prove_store_reads, prove_writes, BitcoinHeader,
     BurnBinding, NetworkParams, ProvenWitness, TxInclusion,
 };
-use crate::clarity_vm::witness_wire::{ServedHeader, ServedWitness};
+use crate::clarity_vm::witness_wire::{ServedHeader, ServedWitness, WriteProof};
 use crate::core::FIRST_STACKS_BLOCK_ID;
 use crate::util_lib::db::DBConn;
 
@@ -328,25 +329,27 @@ pub fn serve_witness(
         }
     }
 
-    // MARF proofs: store entries, contract evidence, and the block's writes
-    // at its own root
+    // MARF proofs: one shared proof for every read (store entries and
+    // contract evidence, at the parent, `at-block` targets, deploy blocks and
+    // their parents), one for the block's final writes at its own root
     let mut last: BTreeMap<String, String> = BTreeMap::new();
     for write in writes.iter() {
         last.insert(write.key.clone(), write.value.clone());
     }
-    let (store, (contracts, unproven), write_proofs) =
+    let (store, (contracts, unproven), marf, write_proof, tries) =
         chainstate.clarity_state.with_marf(|marf| {
             marf.with_conn(|conn| {
-                // proofs re-derive the same skip-list ancestors over and over;
-                // memoize those lookups for this call only. Every root proven
-                // here is on the block's own chain.
+                // a trie's skip-list ancestors are looked up by height; memoize
+                // those lookups for this call only. Every root proven here is
+                // on the block's own chain.
                 conn.enable_lookup_memo(Some(block_id.clone()));
                 let proven = (|| {
+                    let mut reads = MultiproofBuilder::new();
                     let started = Instant::now();
-                    info!("Witness: proving {} store entries", witness.store.len());
-                    let store = prove_store_reads(conn, &parent, witness)?;
+                    info!("Witness: walking {} store entries", witness.store.len());
+                    let store = prove_store_reads(conn, &mut reads, &parent, witness)?;
                     info!(
-                        "Witness: proved {} store entries in {:?}",
+                        "Witness: walked {} store entries in {:?}",
                         store.len(),
                         started.elapsed()
                     );
@@ -359,22 +362,44 @@ pub fn serve_witness(
                                 .flatten()
                         };
                     let (contracts, unproven) =
-                        prove_contracts(conn, &parent, witness, &net, &find_deploy)?;
+                        prove_contracts(conn, &mut reads, &parent, witness, &net, &find_deploy)?;
                     info!(
-                        "Witness: proved {} contracts ({} unprovable) in {:?}",
+                        "Witness: proved {} contracts ({} with a deploy witness, {} unprovable) in {:?}",
                         contracts.len(),
+                        contracts.iter().filter(|c| !c.deploy_reads.is_empty()).count(),
                         unproven.len(),
                         started.elapsed()
                     );
                     let started = Instant::now();
-                    let writes: Vec<(String, String)> = last.into_iter().collect();
-                    let write_proofs = prove_writes(conn, &block_id, &writes)?;
+                    let marf = reads
+                        .encode(conn)
+                        .map_err(|e| format!("shared read proof: {e:?}"))?;
                     info!(
-                        "Witness: proved {} final writes in {:?}",
-                        write_proofs.len(),
+                        "Witness: encoded the shared read proof ({} tries, {} bytes) in {:?}",
+                        reads.tries().count(),
+                        marf.len(),
                         started.elapsed()
                     );
-                    Ok::<_, String>((store, (contracts, unproven), write_proofs))
+                    let started = Instant::now();
+                    let finals: Vec<(String, String)> = last.into_iter().collect();
+                    let mut written = MultiproofBuilder::new();
+                    prove_writes(conn, &mut written, &block_id, &finals)?;
+                    let write_proof = WriteProof {
+                        keys: finals.into_iter().map(|(key, _)| key).collect(),
+                        proof: written
+                            .encode(conn)
+                            .map_err(|e| format!("final-write proof: {e:?}"))?,
+                    };
+                    info!(
+                        "Witness: proved {} final writes ({} tries, {} bytes) in {:?}",
+                        write_proof.keys.len(),
+                        written.tries().count(),
+                        write_proof.proof.len(),
+                        started.elapsed()
+                    );
+                    let tries: Vec<StacksBlockId> =
+                        reads.tries().chain(written.tries()).cloned().collect();
+                    Ok::<_, String>((store, (contracts, unproven), marf, write_proof, tries))
                 })();
                 if let Some((tries, heights, blocks)) = conn.lookup_memo_len() {
                     info!(
@@ -391,17 +416,14 @@ pub fn serve_witness(
         witness: witness.clone(),
         store,
         contracts,
+        marf,
         burn,
         burn_view,
         coinbases,
     };
     mark_served_metadata(&mut proven);
-    for proof in proven.marf_proofs() {
-        needed.extend(proof.crossed_blocks());
-    }
-    for (_, proof) in write_proofs.iter() {
-        needed.extend(proof.crossed_blocks());
-    }
+    // every trie a proof holds: the client pins each to its header's root
+    needed.extend(tries);
     for evidence in proven.contracts.iter() {
         needed.insert(evidence.block.clone());
     }
@@ -429,7 +451,7 @@ pub fn serve_witness(
         proven,
         headers,
         bitcoin: bitcoin.into_values().collect(),
-        writes: write_proofs,
+        writes: write_proof,
         unproven_contracts: unproven
             .into_iter()
             .map(|(contract, reason)| (contract.to_string(), reason))

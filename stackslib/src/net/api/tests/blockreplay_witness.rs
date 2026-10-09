@@ -21,10 +21,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use clarity::types::chainstate::StacksPrivateKey;
 use clarity::vm::types::PrincipalData;
-use clarity::vm::{ClarityName, ClarityVersion, ContractName};
+use clarity::vm::{ClarityName, ClarityVersion, ContractName, Value as ClarityValue};
 use serde_json::Value;
 use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::util::hash::{hex_bytes, to_hex};
 
 use crate::burnchains::Txid;
 use crate::chainstate::nakamoto::tests::stateless_reexec::{
@@ -117,6 +118,14 @@ fn fetch(
         .remove(0)
         .decode_nakamoto_block()
         .expect("block decodes");
+    let body: Value = serde_json::from_str(&replay_body).unwrap();
+    let hex_len = |v: &Value| v.as_str().map_or(0, str::len) / 2;
+    eprintln!(
+        "MEASURE-HTTP {test_name}: replay body {} bytes, shared read proof {} bytes, final-write proof {} bytes",
+        replay_body.len(),
+        hex_len(&body["read_witness"]["marf"]),
+        hex_len(&body["read_witness"]["writes"]["proof"]),
+    );
     Fetched {
         block_id,
         block,
@@ -140,6 +149,17 @@ fn store_entry<'a>(body: &'a mut Value, key: &str) -> &'a mut Value {
         .iter_mut()
         .find(|e| e["query"]["key"] == key)
         .unwrap_or_else(|| panic!("no store entry for {key}"))
+}
+
+/// Flip one bit of the shared read proof's first ancestor hash, which the
+/// first trie the proof holds (the first root walked) hashes with.
+fn tamper_shared_proof(body: &mut Value) {
+    let proof = &mut body["read_witness"]["marf"];
+    let mut bytes = hex_bytes(proof.as_str().unwrap()).unwrap();
+    let n_blocks = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
+    let first_hash = 1 + 4 + 32 * n_blocks + 4;
+    bytes[first_hash] ^= 1;
+    *proof = Value::String(to_hex(&bytes));
 }
 
 /// Flip the last hex digit of a string.
@@ -246,16 +266,23 @@ fn tampered_witness_byte_fails_naming_the_entry() {
     assert!(failure.detail.contains(&note), "{report}");
     assert!(failure.detail.contains("MARF proof fails"), "{report}");
 
-    // a byte of its proof
+    // a byte of the shared proof (in the parent's trie, which `note` is
+    // read through)
+    let body = fetched.tampered(tamper_shared_proof);
+    let report = fetched.check(&body);
+    let failure = report.failure().expect("tampered proof is rejected");
+    assert!(failure.detail.contains(&note), "{report}");
+    assert!(failure.detail.contains("does not hash"), "{report}");
+
+    // and of the final-write proof
     let body = fetched.tampered(|body| {
-        let entry = store_entry(body, &note);
-        let proof = &mut entry["proof"]["marf"]["present"];
+        let proof = &mut body["read_witness"]["writes"]["proof"];
         let hex = proof.as_str().unwrap().to_string();
         *proof = Value::String(flip_last_hex(&hex));
     });
     let report = fetched.check(&body);
-    let failure = report.failure().expect("tampered proof is rejected");
-    assert!(failure.detail.contains(&note), "{report}");
+    let failure = report.failure().expect("tampered write proof is rejected");
+    assert_eq!(failure.name, "write proofs", "{report}");
 
     // an environment answer (a block time, also print-only)
     let body = fetched.tampered(|body| {
@@ -280,10 +307,11 @@ fn tampered_witness_byte_fails_naming_the_entry() {
     assert!(fetched.check(&fetched.replay_body).ok());
 }
 
-/// A contract whose initialization reads chain state cannot be re-derived
-/// from its deploy alone. The node serves its metadata as is; the client
-/// rejects those entries (naming the contract and why) but still re-executes
-/// and compares everything else.
+/// A contract whose initialization makes an environment lookup (here
+/// `burn-block-height`) cannot be re-derived yet: a deploy witness carries
+/// store reads only. The node serves its metadata as is; the client rejects
+/// those entries (naming the contract and why) but still re-executes and
+/// compares everything else.
 #[test]
 fn unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs() {
     let privk = StacksPrivateKey::from_seed(b"unprovable-metadata");
@@ -334,4 +362,139 @@ fn unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs() {
             "{name} did not pass: {report}"
         );
     }
+}
+
+const KIKI_SRC: &str = "
+(define-fungible-token kiki)
+(define-constant liquid-at-deploy stx-liquid-supply)
+(ft-mint? kiki u1000000 tx-sender)
+(define-read-only (backing) liquid-at-deploy)
+(define-read-only (minted) (ft-get-supply kiki))
+(define-public (send (amount uint) (to principal))
+  (ft-transfer? kiki amount tx-sender to))
+";
+
+const WRAPPER_SRC: &str = "
+(define-constant wrapped-at-deploy (contract-call? .kiki-token minted))
+(define-constant backing-at-deploy (contract-call? .kiki-token backing))
+(define-public (report)
+  (begin
+    (print {wrapped: wrapped-at-deploy, backing: backing-at-deploy,
+            now: (contract-call? .kiki-token minted)})
+    (ok true)))
+";
+
+/// Contracts whose deploy reads chain state: `kiki-token` stores
+/// `stx-liquid-supply` in a constant and mints at deploy; `kiki-wrapper`
+/// (a later block) stores what it reads from `kiki-token` at deploy. Each
+/// carries a deploy witness (its reads, proven at its deploying block's
+/// parent), the client re-derives both, and the block calling them verifies.
+/// A tampered deploy-witness entry is rejected, naming it.
+#[test]
+fn contracts_whose_deploy_reads_chain_state_rederive_from_a_deploy_witness() {
+    let privk = StacksPrivateKey::from_seed(b"deploy-witness");
+    let sender = to_addr(&privk);
+    let recipient = to_addr(&StacksPrivateKey::from_seed(b"deploy-witness-recipient"));
+    let publish = |nonce, name: &str, src: &str| {
+        make_contract_publish_tx(
+            &privk,
+            nonce,
+            1000,
+            CHAIN_ID_TESTNET,
+            name,
+            src,
+            Some(ClarityVersion::Clarity3),
+        )
+    };
+    let call = |nonce, contract: &'static str, function: &'static str, args: &[ClarityValue]| {
+        make_contract_call_tx(
+            &privk,
+            nonce,
+            1000,
+            CHAIN_ID_TESTNET,
+            &sender,
+            ContractName::from_literal(contract),
+            ClarityName::from_literal(function),
+            args,
+        )
+    };
+    let report = call(2, "kiki-wrapper", "report", &[]);
+    let send = call(
+        3,
+        "kiki-token",
+        "send",
+        &[
+            ClarityValue::UInt(10),
+            ClarityValue::Principal(recipient.into()),
+        ],
+    );
+    let txid = report.txid();
+    let tenures = vec![NakamotoBootTenure::Sortition(vec![
+        NakamotoBootStep::Block(vec![publish(0, "kiki-token", KIKI_SRC)]),
+        NakamotoBootStep::Block(vec![publish(1, "kiki-wrapper", WRAPPER_SRC)]),
+        NakamotoBootStep::Block(vec![report, send]),
+    ])];
+    let fetched = fetch(
+        function_name!(),
+        tenures,
+        vec![(sender.clone().into(), 10_000_000)],
+        &txid,
+    );
+    let report = fetched.check(&fetched.replay_body);
+    eprintln!("{report}");
+    assert!(report.ok(), "{report}");
+    assert_eq!(
+        report.entries.get("contract (with deploy witness)"),
+        Some(&2),
+        "{report}"
+    );
+    let body: Value = serde_json::from_str(&fetched.replay_body).unwrap();
+    let contracts = body["read_witness"]["contracts"].as_array().unwrap();
+    let reads_of = |name: &str| -> Vec<String> {
+        contracts
+            .iter()
+            .find(|c| c["contract"].as_str().unwrap().ends_with(name))
+            .unwrap_or_else(|| panic!("no evidence for {name}"))["deploy_reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["query"].to_string())
+            .collect()
+    };
+    assert!(
+        reads_of(".kiki-token")
+            .iter()
+            .any(|q| q.contains("_stx-data::ustx_liquid_supply")),
+        "{:?}",
+        reads_of(".kiki-token")
+    );
+    assert!(
+        reads_of(".kiki-wrapper")
+            .iter()
+            .any(|q| q.contains(".kiki-token::")),
+        "{:?}",
+        reads_of(".kiki-wrapper")
+    );
+
+    // one deploy-witness value changed in transit
+    let body = fetched.tampered(|body| {
+        let entry = body["read_witness"]["contracts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|c| c["deploy_reads"].as_array_mut().unwrap().iter_mut())
+            .find(|e| e["query"]["key"] == "_stx-data::ustx_liquid_supply")
+            .expect("the liquid-supply deploy read");
+        let value = entry["value"].as_str().unwrap().to_string();
+        entry["value"] = Value::String(flip_last_hex(&value));
+    });
+    let report = fetched.check(&body);
+    let failure = report.failure().expect("tampered deploy read is rejected");
+    assert_eq!(failure.name, "witness", "{report}");
+    assert!(
+        failure
+            .detail
+            .contains("deploy read Data { at: None, key: \"_stx-data::ustx_liquid_supply\" }: MARF proof fails"),
+        "{report}"
+    );
 }

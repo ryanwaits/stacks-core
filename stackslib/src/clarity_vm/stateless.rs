@@ -138,7 +138,7 @@ pub fn execute_statelessly<'t>(
         .expect("witness store always records writes");
     clarity_tx.rollback_block();
 
-    let mut missing = missing.take();
+    let mut missing: Vec<String> = missing.take().iter().map(|q| format!("{q:?}")).collect();
     missing.extend(env.missing());
     if !missing.is_empty() {
         return Err(StatelessError::WitnessIncomplete(missing));
@@ -168,6 +168,21 @@ pub struct ContractDeployment<'a> {
     pub epoch: StacksEpochId,
     /// `vm-epoch::epoch-version` as the deploy saw it (`None`: never set).
     pub epoch_key: Option<String>,
+    /// Chain state the deploy read (its deploy witness), as it answered.
+    pub reads: &'a [(StoreQuery, Option<String>)],
+}
+
+/// Why a contract's metadata could not be re-derived.
+#[derive(Debug)]
+pub enum DeriveError {
+    /// The deploy read chain state its deploy witness does not hold (store
+    /// queries), or made environment lookups (not provable in a deploy yet).
+    Missing {
+        store: Vec<StoreQuery>,
+        env: Vec<String>,
+    },
+    /// The deploy failed.
+    Failed(ChainstateError),
 }
 
 /// Re-derive the metadata a contract deployment stored (AST, analysis,
@@ -176,18 +191,18 @@ pub struct ContractDeployment<'a> {
 /// `known` contracts (already re-derived; source hash and metadata).
 ///
 /// Re-derivation is exact when analysis and initialization read nothing but
-/// those contracts and the deploy context (sender, sponsor, height, epoch):
-/// any other read fails with [`StatelessError::WitnessIncomplete`]. Contracts
-/// whose top-level code reads chain state need the deploy block's own read
-/// witness (see `NOTES.md`).
+/// those contracts, the deploy context (sender, sponsor, height, epoch) and
+/// `deploy.reads`: any other read fails with [`DeriveError::Missing`], naming
+/// it. A contract whose top-level code reads chain state carries those reads
+/// as its deploy witness (see `NOTES.md`).
 pub fn derive_contract_metadata(
     deploy: &ContractDeployment,
     known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
     mainnet: bool,
     chain_id: u32,
-) -> Result<(QualifiedContractIdentifier, ContractMetadata), StatelessError> {
+) -> Result<(QualifiedContractIdentifier, ContractMetadata), DeriveError> {
     let TransactionPayload::SmartContract(ref contract, _) = deploy.tx.payload else {
-        return Err(StatelessError::Block(
+        return Err(DeriveError::Failed(
             ChainstateError::InvalidStacksTransaction("not a contract deploy".into(), false),
         ));
     };
@@ -215,6 +230,7 @@ pub fn derive_contract_metadata(
         ),
     ];
     let mut entries = entries;
+    entries.extend(deploy.reads.iter().cloned());
     let mut setup = vec![];
     match deploy.epoch_key.as_ref() {
         Some(epoch_key) => setup.push((EPOCH_VERSION_KEY.to_string(), epoch_key.clone())),
@@ -272,12 +288,12 @@ pub fn derive_contract_metadata(
     });
     conn.rollback_block();
 
-    let mut missing = missing.take();
-    missing.extend(env.missing());
-    if !missing.is_empty() {
-        return Err(StatelessError::WitnessIncomplete(missing));
+    let store = missing.take();
+    let env = env.missing();
+    if !store.is_empty() || !env.is_empty() {
+        return Err(DeriveError::Missing { store, env });
     }
-    receipt.map_err(StatelessError::Block)?;
+    receipt.map_err(DeriveError::Failed)?;
     let wanted = contract_id.to_string();
     let rows = metadata
         .take()
@@ -299,7 +315,7 @@ struct WitnessStore {
     overlay: HashMap<String, String>,
     path_overlay: HashMap<TrieHash, String>,
     metadata: Rc<RefCell<HashMap<(String, String), String>>>,
-    missing: Rc<RefCell<Vec<String>>>,
+    missing: Rc<RefCell<Vec<StoreQuery>>>,
     write_log: StateWriteLog,
     /// Unused; the trait requires a side store.
     side_store: Connection,
@@ -313,7 +329,7 @@ impl WitnessStore {
         open_height: u32,
         entries: &[(StoreQuery, Option<String>)],
         setup: impl Iterator<Item = (String, String)>,
-        missing: Rc<RefCell<Vec<String>>>,
+        missing: Rc<RefCell<Vec<StoreQuery>>>,
         metadata: Rc<RefCell<HashMap<(String, String), String>>>,
     ) -> Self {
         let mut answers = HashMap::new();
@@ -350,7 +366,10 @@ impl WitnessStore {
     fn witnessed(&self, query: StoreQuery) -> Option<Option<String>> {
         let answer = self.answers.get(&query).cloned();
         if answer.is_none() {
-            self.missing.borrow_mut().push(format!("{query:?}"));
+            let mut missing = self.missing.borrow_mut();
+            if !missing.contains(&query) {
+                missing.push(query);
+            }
         }
         answer
     }

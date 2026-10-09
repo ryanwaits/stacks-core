@@ -26,12 +26,12 @@ use stacks_common::types::chainstate::{
 
 use crate::util_lib::db::Error as db_error;
 
-pub mod absence;
 pub mod bits;
 pub mod blob_layout;
 pub mod cache;
 pub mod file;
 pub mod marf;
+pub mod multiproof;
 pub mod node;
 pub mod proofs;
 pub mod squash;

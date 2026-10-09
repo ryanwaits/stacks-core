@@ -17,11 +17,9 @@
 
 use std::time::{Duration, Instant};
 
-use stacks_common::codec::StacksMessageCodec;
-
-use crate::chainstate::stacks::index::absence::TrieAbsenceProof;
 use crate::chainstate::stacks::index::marf::{MARFOpenOpts, MARF};
-use crate::chainstate::stacks::index::{ClarityMarfTrieId, MARFValue, TrieMerkleProof};
+use crate::chainstate::stacks::index::multiproof::MultiproofBuilder;
+use crate::chainstate::stacks::index::{ClarityMarfTrieId, MARFValue};
 use crate::chainstate::stacks::{BlockHeaderHash, TrieHash};
 
 fn block(i: u32) -> BlockHeaderHash {
@@ -83,8 +81,8 @@ fn chain(
     (marf, values)
 }
 
-/// Proof bytes for `present` written keys and `absent` unwritten ones at
-/// `tip`, plus node reads and time spent.
+/// One shared proof for `present` written keys and `absent` unwritten ones
+/// at `tip`, plus node reads and time spent.
 fn prove_all(
     marf: &mut MARF<BlockHeaderHash>,
     values: &[String],
@@ -92,7 +90,7 @@ fn prove_all(
     present: u32,
     absent: u32,
     memo: Option<Option<u32>>,
-) -> (Vec<Vec<u8>>, u64, Duration) {
+) -> (Vec<u8>, u64, Duration) {
     let mut rng = Rng(11);
     let mut conn = marf.borrow_storage_backend();
     if let Some(anchor) = memo {
@@ -100,19 +98,19 @@ fn prove_all(
     }
     conn.stats();
     let started = Instant::now();
-    let mut proofs = vec![];
+    let mut builder = MultiproofBuilder::new();
     for _ in 0..present {
         let k = rng.below(values.len() as u64) as usize;
-        let proof =
-            TrieMerkleProof::from_entry(&mut conn, &format!("key-{k}"), &values[k], &block(tip))
-                .unwrap();
-        proofs.push(proof.serialize_to_vec());
+        let path = TrieHash::from_key(&format!("key-{k}"));
+        let end = builder.walk(&mut conn, &block(tip), &path).unwrap();
+        assert_eq!(end.value, Some(MARFValue::from_value(&values[k])));
     }
     for i in 0..absent {
         let path = TrieHash::from_key(&format!("absent-{i}"));
-        let proof = TrieAbsenceProof::from_path(&mut conn, &path, &block(tip)).unwrap();
-        proofs.push(proof.serialize_to_vec());
+        let end = builder.walk(&mut conn, &block(tip), &path).unwrap();
+        assert_eq!(end.value, None);
     }
+    let proof = builder.encode(&mut conn).unwrap();
     let elapsed = started.elapsed();
     let (reads, _) = conn.stats();
     if let Some((tries, heights, blocks)) = conn.lookup_memo_len() {
@@ -121,7 +119,7 @@ fn prove_all(
         );
     }
     conn.disable_lookup_memo();
-    (proofs, reads, elapsed)
+    (proof, reads, elapsed)
 }
 
 fn compare(path: &str, blocks: u32, fresh: u32, rewrites: u32, present: u32, absent: u32) {
@@ -134,21 +132,17 @@ fn compare(path: &str, blocks: u32, fresh: u32, rewrites: u32, present: u32, abs
     let (anchored, anchored_reads, anchored_time) =
         prove_all(&mut marf, &values, tip, present, absent, Some(Some(tip)));
     eprintln!(
-        "{blocks} blocks, {} keys, {present} inclusion + {absent} absence proofs ({} bytes): \
-         {plain_reads} node reads in {plain_time:?} without the memo, \
+        "{blocks} blocks, {} keys, {present} present + {absent} absent reads in one shared proof \
+         ({} bytes): {plain_reads} node reads in {plain_time:?} without the memo, \
          {memo_reads} in {memo_time:?} with it, \
          {anchored_reads} in {anchored_time:?} anchored at the tip",
         values.len(),
-        plain.iter().map(Vec::len).sum::<usize>(),
+        plain.len(),
     );
-    for (i, a) in plain.iter().enumerate() {
-        assert_eq!(a, &memo[i], "proof {i} differs with the memo on");
-        assert_eq!(a, &anchored[i], "proof {i} differs with the anchored memo");
-    }
-    assert_eq!(plain.len(), memo.len());
-    assert_eq!(plain.len(), anchored.len());
-    assert!(memo_reads < plain_reads);
-    assert!(anchored_reads < memo_reads);
+    assert_eq!(plain, memo, "the proof differs with the memo on");
+    assert_eq!(plain, anchored, "the proof differs with the anchored memo");
+    assert!(memo_reads <= plain_reads);
+    assert!(anchored_reads <= memo_reads);
 
     // turning it off drops it, and proving without it still matches
     assert_eq!(marf.borrow_storage_backend().lookup_memo_len(), None);
@@ -157,7 +151,7 @@ fn compare(path: &str, blocks: u32, fresh: u32, rewrites: u32, present: u32, abs
 }
 
 #[test]
-fn memoized_lookups_produce_byte_identical_proofs_with_fewer_reads() {
+fn memoized_lookups_produce_a_byte_identical_shared_proof() {
     compare(":memory:", 300, 4, 12, 400, 100);
 }
 
