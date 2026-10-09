@@ -22,6 +22,7 @@
 //! | `GET /witness/{index_block_hash}` | wire v3 bytes, `x-block-height`, `x-state-root`; 404 unknown; 503 + `retry-after: 1` when every extraction slot is busy |
 //! | `GET /burn/{consensus_hash}` | `{consensus_hash, burn_height, bitcoin_block_hash, preimage}`; 404 unknown |
 //! | `GET /bitcoin/headers?from=H&count=N` | `{from, headers: [80-byte hex, …]}`, 1 ≤ N ≤ 2016, truncated at the tip |
+//! | `GET /marf/{path}?tip=T`, `GET /marf?key=K&tip=T` | `{data, proof}`: the leaf's 40-byte value and its `TrieMerkleProof`, both `0x` hex; 404 unknown tip or absent key |
 //! | `GET /health` | `{ok, marf_tip_height, bitcoin_tip_height}` |
 //!
 //! Threads: the accept loop only hands connections to a bounded queue (a full
@@ -43,8 +44,8 @@ use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde_json::json;
-use stacks_common::types::chainstate::StacksBlockId;
-use stacks_common::util::hash::to_hex;
+use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
+use stacks_common::util::hash::{hex_bytes, to_hex};
 
 use crate::extract::{ReadOnlyMarf, checked_witness};
 use crate::{burn, headers};
@@ -56,6 +57,8 @@ const CHEAP_WORKERS: usize = 8;
 const QUEUE: usize = 64;
 /// Longest request head (request line + headers) read.
 const MAX_HEAD: u64 = 16 * 1024;
+/// Longest MARF key `/marf?key=` accepts, in bytes after percent-decoding.
+pub const MAX_MARF_KEY: usize = 4096;
 
 pub struct Config {
     pub marf: PathBuf,
@@ -390,6 +393,8 @@ fn route(shared: &Shared, handles: &mut Handles, target: &str) -> Response {
         ["witness", id] => witness(shared, handles, id),
         ["burn", ch] => burn_route(shared, handles, ch),
         ["bitcoin", "headers"] => headers_route(shared, handles, query),
+        ["marf", path] => marf_route(shared, handles, MarfKey::Path(path), query),
+        ["marf"] => marf_route(shared, handles, MarfKey::Key, query),
         ["health"] => health(shared, handles),
         _ => Ok(error(404, "no such route")),
     };
@@ -464,13 +469,7 @@ fn burn_route(shared: &Shared, handles: &mut Handles, ch: &str) -> Result<Respon
 }
 
 fn headers_route(shared: &Shared, handles: &mut Handles, query: &str) -> Result<Response, String> {
-    let param = |name: &str| {
-        query
-            .split('&')
-            .filter_map(|kv| kv.split_once('='))
-            .find(|(k, _)| *k == name)
-            .and_then(|(_, v)| v.parse::<u64>().ok())
-    };
+    let param = |name: &str| query_param(query, name).and_then(|v| v.parse::<u64>().ok());
     let (Some(from), Some(count)) = (param("from"), param("count")) else {
         return Ok(error(400, "from and count must be non-negative integers"));
     };
@@ -480,6 +479,87 @@ fn headers_route(shared: &Shared, handles: &mut Handles, query: &str) -> Result<
     let hs = headers::read_headers(handles.headers(&shared.cfg)?, from, count)?;
     let hex: Vec<String> = hs.iter().map(|h| to_hex(h)).collect();
     Ok(json_response(200, &json!({ "from": from, "headers": hex })))
+}
+
+/// The raw value of query parameter `name`, not percent-decoded.
+fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v)
+}
+
+/// `%XX`-decode a query value. `None` on a bad escape or non-UTF-8 result.
+fn percent_decode(s: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        if b != b'%' {
+            out.push(b);
+            continue;
+        }
+        let hi = char::from(bytes.next()?).to_digit(16)?;
+        let lo = char::from(bytes.next()?).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    String::from_utf8(out).ok()
+}
+
+/// How `/marf` names the leaf: a hashed path segment, or `?key=`.
+enum MarfKey<'a> {
+    Path(&'a str),
+    Key,
+}
+
+/// Inclusion proof of one MARF leaf as of a tip block, for any key, including
+/// the MARF's own `__MARF_*` keys that a node's `/v2/clarity/marf` cannot
+/// serve (they have no stored value string). Same JSON fields and proof
+/// encoding as the node's `?proof=1` answer, but `data` is always the leaf's
+/// raw 40-byte value.
+fn marf_route(
+    shared: &Shared,
+    handles: &mut Handles,
+    key: MarfKey,
+    query: &str,
+) -> Result<Response, String> {
+    let path: [u8; 32] = match key {
+        MarfKey::Path(p) => {
+            let p = p.trim_start_matches("0x");
+            let Some(path) = hex_bytes(p).ok().and_then(|b| b.try_into().ok()) else {
+                return Ok(error(400, "path must be a 32-byte hex MARF path"));
+            };
+            path
+        }
+        MarfKey::Key => {
+            let Some(key) = query_param(query, "key").and_then(percent_decode) else {
+                return Ok(error(400, "key must be a percent-encoded UTF-8 MARF key"));
+            };
+            if key.is_empty() || key.len() > MAX_MARF_KEY {
+                return Ok(error(400, "key must be 1 to 4096 bytes"));
+            }
+            TrieHash::from_key(&key).0
+        }
+    };
+    let Some(Ok(tip)) =
+        query_param(query, "tip").map(|t| StacksBlockId::from_hex(t.trim_start_matches("0x")))
+    else {
+        return Ok(error(400, "tip must be a 32-byte hex index block hash"));
+    };
+    let marf = handles.marf(&shared.cfg)?;
+    if marf.find_height(&tip)?.is_none() {
+        return Ok(error(404, "tip block is not in the MARF"));
+    }
+    Ok(match marf.proof_at(&tip, &path)? {
+        Some((value, proof)) => json_response(
+            200,
+            &json!({
+                "data": format!("0x{}", to_hex(&value)),
+                "proof": format!("0x{}", to_hex(&proof)),
+            }),
+        ),
+        None => error(404, "no MARF entry at that path as of tip"),
+    })
 }
 
 fn health(shared: &Shared, handles: &mut Handles) -> Result<Response, String> {

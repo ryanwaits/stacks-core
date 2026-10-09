@@ -18,14 +18,15 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use stacks_common::codec::StacksMessageCodec;
 use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
 use stacks_common::util::hash::to_hex;
-use stackslib::chainstate::stacks::index::BlockMap;
 use stackslib::chainstate::stacks::index::marf::{MARF, MARFOpenOpts, MarfConnection};
 use stackslib::chainstate::stacks::index::node::{TrieNodeType, TriePtr, is_backptr};
 use stackslib::chainstate::stacks::index::storage::{TrieFileStorage, TrieStorageConnection};
 use stackslib::chainstate::stacks::index::trie::Trie;
 use stackslib::chainstate::stacks::index::trie_sql;
+use stackslib::chainstate::stacks::index::{BlockMap, Error as MarfError};
 
 use crate::wire::{self, Encoder, Ptr};
 
@@ -114,6 +115,22 @@ impl ReadOnlyMarf {
             .with_conn(|conn| MARF::get_by_hash(conn, block, &TrieHash(*path)))
             .map_err(|e| format!("read {} at {block}: {e:?}", TrieHash(*path)))?;
         Ok(v.map(|v| v.0[..32].try_into().expect("32 bytes")))
+    }
+
+    /// Inclusion proof of the leaf at `path` as of `tip`: its 40-byte value
+    /// and the consensus-serialized `TrieMerkleProof`, the bytes a node's
+    /// `/v2/clarity/marf/{path}?proof=1` returns hex-encoded. Works for keys
+    /// with no stored value string (`__MARF_*`). `None` when the key is absent.
+    pub fn proof_at(
+        &mut self,
+        tip: &StacksBlockId,
+        path: &[u8; 32],
+    ) -> Result<Option<([u8; 40], Vec<u8>)>, String> {
+        match self.marf.get_with_proof_from_hash(tip, &TrieHash(*path)) {
+            Ok(Some((value, proof))) => Ok(Some((value.0, proof.serialize_to_vec()))),
+            Ok(None) | Err(MarfError::NotFoundError) => Ok(None),
+            Err(e) => Err(format!("proof of {} at {tip}: {e:?}", TrieHash(*path))),
+        }
     }
 
     /// Emit the v3 witness of `block`'s trie.

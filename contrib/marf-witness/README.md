@@ -201,11 +201,28 @@ once per worker on first use.
 | `GET /witness/{index_block_hash}` | `application/octet-stream`: wire format v3 bytes, identical to `extract`'s `.witness`. Headers `x-block-height`, `x-state-root` (hex), `cache-control: public, max-age=31536000, immutable`, `x-cache: hit\|miss` | 400 bad hash, 404 not in the MARF, 503 + `retry-after: 1` when every extraction slot is busy |
 | `GET /burn/{consensus_hash}` | `{consensus_hash, burn_height, bitcoin_block_hash, preimage}`, as `burn` (mainnet first burn height); `preimage[4..36]` is the Bitcoin block hash in display order, no reversal | 400 bad hash, 404 unknown |
 | `GET /bitcoin/headers?from=H&count=N` | `{from, headers: [hex of the 80-byte wire header, …]}` in height order, `1 ≤ N ≤ 2016`; truncated at the tip (or a gap), empty past it | 400 bad or missing params |
+| `GET /marf/{path}?tip={index_block_hash}` | `{data, proof}`: inclusion proof of the leaf at a 32-byte hashed MARF path as of `tip`. `proof` is `0x` hex of the consensus-serialized `TrieMerkleProof`, byte-identical to a node's `/v2/clarity/marf/{path}?tip=…&proof=1`; `data` is `0x` hex of the leaf's raw 40-byte value | 400 bad path or tip, 404 tip not in the MARF or no such key at `tip` |
+| `GET /marf?key={key}&tip={index_block_hash}` | Same, by key string (percent-encoded, at most 4096 bytes decoded), hashed with `TrieHash::from_key` | 400 bad, empty or oversize key, 404 as above |
 | `GET /health` | `{ok: true, marf_tip_height, bitcoin_tip_height}` | 503 `{ok: false, …, error}` |
 
 Errors are JSON `{error}`; other methods get 405. Every response closes the
 connection. Each served witness is self-checked like `extract`: its
 recomputed root must equal the MARF's root, else 500.
+
+`/marf` serves any key, including the MARF's own bookkeeping keys a node's
+`/v2/clarity/marf` 404s because they have no stored value string, e.g.
+`__MARF_BLOCK_HEIGHT_TO_HASH::<h>`, whose value is the id of the block at
+height `h` on `tip`'s fork (zero-padded to 40 bytes):
+
+```bash
+curl -s "localhost:20450/marf?key=__MARF_BLOCK_HEIGHT_TO_HASH::150000&tip=<index_block_hash>"
+# {"data":"0x7172a926…00000000","proof":"0x…"}
+```
+
+Verify it as any node proof: the leaf value is `data`, the root is `tip`'s
+`state_index_root`. Upstream stackslib cannot build a proof from read-only
+storage: `write_children_hashes`, a pure read, refused it. This branch drops
+that check.
 
 Headers come from the SPV DB's columns (`SpvClient` in stackslib's
 `burnchains/bitcoin/spv.rs`) re-encoded with stackslib's `BlockHeader`
@@ -218,7 +235,8 @@ How it behaves under load:
   immediate 503. `max-concurrent-extractions + 8` workers serve the queue,
   each with its own read-only handles, so no handle crosses threads.
 - A witness that is not cached takes an extraction slot or gets 503 at
-  once, never waiting. Cache hits, burn, headers and health need no slot.
+  once, never waiting. Cache hits, burn, headers, `/marf` and health need
+  no slot.
 - Extracted witnesses live in an LRU bounded by `--cache-bytes` (busy
   mainnet blocks are up to ~12.5 MB) and are served without copying.
 - `--request-timeout-secs` is the socket read/write timeout. An extraction
@@ -296,8 +314,10 @@ sortition rows, an SPV headers DB of mainnet genesis plus chained headers):
 served witnesses equal `extract` output and recompute the MARF root, unknown
 blocks are 404, burn returns the mainnet preimage, header ranges come back
 in order as 80-byte wire headers (400 past 2016), held slots turn uncached
-witnesses into 503 while cache hits still serve, and every database file is
-byte-identical afterwards.
+witnesses into 503 while cache hits still serve, `/marf` proofs of
+`__MARF_BLOCK_HEIGHT_TO_HASH::<h>` and stored keys verify against the tip's
+root with stackslib's `TrieMerkleProof::verify` and equal the bytes a
+read-write MARF builds, and every database file is byte-identical afterwards.
 
 `tests/fixtures/witness/` holds three witnesses with their expected roots for
 cross-language verifiers. They are regenerated, deterministically, with:

@@ -32,11 +32,14 @@ use marf_witness::serve::{Config, Server, Slots};
 use marf_witness::wire;
 use rusqlite::{Connection, params};
 use serde_json::Value;
+use stacks_common::codec::StacksMessageCodec;
 use stacks_common::deps_common::bitcoin::blockdata::block::BlockHeader;
 use stacks_common::deps_common::bitcoin::network::serialize::BitcoinHash;
 use stacks_common::deps_common::bitcoin::util::hash::Sha256dHash;
-use stacks_common::types::chainstate::BurnchainHeaderHash;
+use stacks_common::types::chainstate::{BurnchainHeaderHash, StacksBlockId, TrieHash};
 use stacks_common::util::hash::{hex_bytes, to_hex};
+use stackslib::chainstate::stacks::index::marf::MARF;
+use stackslib::chainstate::stacks::index::{MARFValue, TrieMerkleProof};
 
 const MAINNET_GENESIS_HEADER: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
 const MAINNET_GENESIS_HASH: &str =
@@ -394,6 +397,126 @@ fn headers_route_returns_80_byte_wire_headers_in_height_order() {
     assert_eq!(h.json()["bitcoin_tip_height"], HEADERS - 1);
 }
 
+fn unhex_field(r: &Reply, field: &str) -> Vec<u8> {
+    let v = r.json()[field].as_str().unwrap().to_string();
+    hex_bytes(v.strip_prefix("0x").unwrap()).unwrap()
+}
+
+/// Check a `/marf` answer with stackslib's own `TrieMerkleProof::verify`
+/// against `tip`'s state root; returns the proven leaf value.
+fn verified_marf_value(
+    r: &Reply,
+    marf: &mut ReadOnlyMarf,
+    blocks: &[StacksBlockId],
+    tip: &StacksBlockId,
+    path: &TrieHash,
+) -> MARFValue {
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.header("content-type"), "application/json");
+    let value = MARFValue(unhex_field(r, "data").try_into().unwrap());
+    let bytes = unhex_field(r, "proof");
+    let proof = TrieMerkleProof::<StacksBlockId>::consensus_deserialize(&mut &bytes[..]).unwrap();
+    let root_to_block: HashMap<TrieHash, StacksBlockId> = blocks
+        .iter()
+        .map(|b| (marf.root_hash_at(b).unwrap(), b.clone()))
+        .collect();
+    let root = marf.root_hash_at(tip).unwrap();
+    assert!(
+        proof.verify(path, &value, &root, &root_to_block),
+        "proof of {path} at {tip} does not verify"
+    );
+    value
+}
+
+#[test]
+fn marf_route_proves_height_to_hash_keys_against_the_tip_root() {
+    let node = NodeDir::new();
+    let (addr, _) = node.serve(2);
+    let mut marf = ReadOnlyMarf::open(&node.local.path).unwrap();
+    let blocks = &node.local.blocks;
+    let tip = blocks.last().unwrap();
+    let mut proofs = vec![];
+
+    for height in [0, 5, MARF_BLOCKS as usize - 2] {
+        let key = format!("__MARF_BLOCK_HEIGHT_TO_HASH::{height}");
+        let path = TrieHash::from_key(&key);
+        let by_key = get(addr, &format!("/marf?key={key}&tip={tip}"));
+        let value = verified_marf_value(&by_key, &mut marf, blocks, tip, &path);
+        // The value is the block id at that height, zero-padded to 40 bytes.
+        assert_eq!(value.0[..32], blocks[height].0, "{key}");
+        assert_eq!(value.0[32..], [0; 8]);
+
+        let by_path = get(addr, &format!("/marf/0x{path}?tip=0x{tip}"));
+        assert!(by_path.body == by_key.body, "{key}: by path != by key");
+        let encoded = key.replace("::", "%3A%3A");
+        let decoded = get(addr, &format!("/marf?tip={tip}&key={encoded}"));
+        assert!(decoded.body == by_key.body, "{key}: percent-encoded key");
+        proofs.push((path, unhex_field(&by_key, "proof")));
+    }
+
+    // Byte-identical to the proof a node builds from its read-write MARF.
+    drop(marf);
+    let mut rw =
+        MARF::<StacksBlockId>::from_path(node.local.path.to_str().unwrap(), node_opts(false))
+            .unwrap();
+    for (path, served) in proofs {
+        let (_, proof) = rw.get_with_proof_from_hash(tip, &path).unwrap().unwrap();
+        assert!(proof.serialize_to_vec() == served, "proof of {path}");
+    }
+}
+
+#[test]
+fn marf_route_proves_a_stored_key_as_of_an_older_tip() {
+    let node = NodeDir::new();
+    let (addr, _) = node.serve(2);
+    let mut marf = ReadOnlyMarf::open(&node.local.path).unwrap();
+    let tip = &node.local.blocks[20];
+    let (key, value) = node.local.writes[20].iter().next().unwrap();
+    let path = TrieHash::from_key(key);
+    let r = get(addr, &format!("/marf/{path}?tip={tip}"));
+    let got = verified_marf_value(&r, &mut marf, &node.local.blocks, tip, &path);
+    assert_eq!(got, MARFValue::from_value(value));
+}
+
+#[test]
+fn marf_route_rejects_unknown_tips_absent_keys_and_malformed_params() {
+    let node = NodeDir::new();
+    let (addr, _) = node.serve(2);
+    let tip = node.local.blocks.last().unwrap();
+    let absent = format!("__MARF_BLOCK_HEIGHT_TO_HASH::{MARF_BLOCKS}");
+
+    let r = get(addr, &format!("/marf?key={absent}&tip={tip}"));
+    assert_eq!(r.status, 404);
+    assert_eq!(r.json()["error"], "no MARF entry at that path as of tip");
+    let unknown = "ab".repeat(32);
+    let r = get(
+        addr,
+        &format!("/marf?key=__MARF_BLOCK_HEIGHT_TO_HASH::1&tip={unknown}"),
+    );
+    assert_eq!(r.status, 404);
+    assert_eq!(r.json()["error"], "tip block is not in the MARF");
+
+    let long = "k".repeat(marf_witness::serve::MAX_MARF_KEY + 1);
+    for bad in [
+        "/marf?key=__MARF_BLOCK_HEIGHT_TO_HASH::1".to_string(),
+        format!(
+            "/marf?key=__MARF_BLOCK_HEIGHT_TO_HASH::1&tip={}",
+            "ab".repeat(31)
+        ),
+        format!("/marf?key=&tip={tip}"),
+        format!("/marf?key=%zz&tip={tip}"),
+        format!("/marf?key=%ff&tip={tip}"),
+        format!("/marf?key={long}&tip={tip}"),
+        format!("/marf?tip={tip}"),
+        format!("/marf/{}?tip={tip}", "ab".repeat(31)),
+        format!("/marf/not-a-path?tip={tip}"),
+    ] {
+        let r = get(addr, &bad);
+        assert_eq!(r.status, 400, "{bad}");
+        assert!(r.json()["error"].is_string(), "{bad}");
+    }
+}
+
 #[test]
 fn saturated_extraction_slots_return_503_with_retry_after_but_cache_hits_still_serve() {
     let node = NodeDir::new();
@@ -429,6 +552,14 @@ fn serving_leaves_every_database_file_byte_identical() {
         .to_string();
     assert_eq!(get(addr, &format!("/burn/{ch}")).status, 200);
     assert_eq!(get(addr, "/bitcoin/headers?from=0&count=10").status, 200);
+    let tip = node.local.blocks.last().unwrap();
+    for h in 0..MARF_BLOCKS {
+        let r = get(
+            addr,
+            &format!("/marf?key=__MARF_BLOCK_HEIGHT_TO_HASH::{h}&tip={tip}"),
+        );
+        assert_eq!(r.status, 200);
+    }
     assert_eq!(get(addr, "/health").status, 200);
     node.assert_untouched(&before);
 }
