@@ -2,9 +2,11 @@
 
 Phase 1 (below, through "Why replay diverged"): re-execute a block from a
 read witness. Phase 2a (after it): make every witness entry provable and
-verify it. Phase 2b prep (last): serve the proof-carrying witness from
+verify it. Phase 2b prep: serve the proof-carrying witness from
 `/v3/blocks/replay`, a wire format, and a client that verifies and
-re-executes a mainnet block.
+re-executes a mainnet block. Phase 2c (last): deploy witnesses for
+contracts whose deploy reads chain state, and one shared MARF proof per
+served witness instead of one proof per read (wire format v2).
 
 # Phase 1: re-execute from a read witness
 
@@ -159,6 +161,10 @@ failing entry.
 
 ## Absence proofs
 
+Superseded in phase 2c: absence is now a walk of the shared proof that ends
+without a leaf (`index/multiproof.rs`), and `absence.rs` is gone. The
+semantics below (where a walk ends, "absent" = never written) still hold.
+
 The MARF only had inclusion proofs. An absence proof is the read's own walk:
 start at the tip trie's root and follow back-pointers into ancestor tries,
 exactly as `MARF::walk` does, until the walk stops without a leaf for the key.
@@ -298,11 +304,11 @@ Other environment checks:
 1. **Environment classes (c) and (d)** (table above). A block that reads them is rejected, not accepted.
 2. **Burn view recency.** The verifier checks that the tenure change is in this tenure, not that no later extend happened before the block. A client verifying blocks in order has every tx list and can check it. A one-block client needs every intermediate block's tx list.
 3. **Nested `at-block`.** Ancestry is checked against the parent, not the enclosing `at-block` target.
-4. **Contracts whose initialization reads chain state** need the deploy block's own witness (recursive). Boot contracts not in the table are rejected.
+4. ~~**Contracts whose initialization reads chain state** need the deploy block's own witness (recursive).~~ Store reads: deploy witness (phase 2c), with the limits listed there. Environment lookups at deploy: still rejected. Boot contracts not in the table are rejected.
 5. **Block-level writes** (setup and teardown, coinbase-attached events) are still inputs. Not covered.
 6. **Epoch 2.x and microblocks**: no tests.
 7. **Signer signatures and Bitcoin PoW** are assumed checked by whoever builds `HeaderChain` / `BitcoinChain`.
-8. ~~No wire format.~~ Done in phase 2b (`witness_wire.rs`).
+8. ~~No wire format.~~ Done in phase 2b (`witness_wire.rs`), v2 in phase 2c.
 
 # Phase 2b prep: serve, ship and check a witness
 
@@ -323,10 +329,9 @@ fill metadata by re-derivation → check every entry → re-execute from the wit
 |---|---|
 | Replay flag, burn-view fix, `block_vm_events` / `receipt_events` | `stackslib/src/net/api/blockreplay.rs` |
 | Node side: gather proofs and headers (`serve_witness`) | `stackslib/src/clarity_vm/witness_serve.rs` |
-| Wire format v1 (`ServedWitness` <-> `WitnessEnvelope`) | `stackslib/src/clarity_vm/witness_wire.rs` |
+| Wire format (v1 here, v2 since phase 2c) (`ServedWitness` <-> `WitnessEnvelope`) | `stackslib/src/clarity_vm/witness_wire.rs` |
 | Client checks (`check_replayed_block`, `ClientParams::mainnet`) | `stackslib/src/clarity_vm/witness_client.rs` |
 | CLI | `contrib/reexec-verify` |
-| `TrieAbsenceProof` consensus codec | `stackslib/src/chainstate/stacks/index/absence.rs` |
 | Tests | `net/api/tests/blockreplay_witness.rs` (HTTP), `proven_witness.rs` (round trip), `stateless_reexec.rs` (burn view), `witness_proof.rs` (mainnet boot sources) |
 
 ## Endpoint
@@ -339,6 +344,9 @@ fill metadata by re-derivation → check every entry → re-execute from the wit
 - **Burn view fix.** Replay used `index_handle_at_block(parent)` (the parent's burn view). It now uses `get_block_burn_view` (the block's own tenure change, else the parent's), as `process_next_nakamoto_block` does. For a tenure-start block the old code printed `burn-block-height` one lower (`u42` vs `u43` in the test), and the client caught it from the proofs alone: `tip_burn_block_height() answered 52, proven 53`.
 
 ## Wire format v1 (`WitnessEnvelope`)
+
+Replaced by v2 in phase 2c (per-entry proofs became two shared proofs; see
+there). Kept for the record.
 
 JSON. Binary as lowercase hex, no `0x`. Ids and hashes: their bytes. Proofs, transactions, headers, addresses: consensus encoding. Store values: the side-store string as is.
 
@@ -410,6 +418,9 @@ Size: the history fixture's envelope is 2.4 MB of JSON (35 entries, 10 write pro
 
 ## Proving cost (lookup memo)
 
+Per-read proofs and their shunts are gone since phase 2c; the memo now only
+serves each trie's skip-list (its ancestor roots), once per distinct trie.
+
 First mainnet run (block 1,113,075, `sbtc-yield-rewards-v3`, 1,239 store entries, 408 write proofs): VERIFIED, but replay plus proving took 1,413 s. Replay itself is ~50 s; the rest was proving.
 
 - **Why.** Every back-pointer a proof's walk crosses gets a shunt proof. Each hop of a shunt recomputes that trie's skip-list ancestor hashes: ~20 `block at height` lookups, each 2 MARF walks on disk. Nothing was reused across keys.
@@ -476,12 +487,147 @@ Memory: plan for a normal mainnet follower (8 GB+). Replay with `read_witness=1`
 
 ## Still blocking or untested for a mainnet run
 
-1. **Contracts whose initialization reads chain state** (gap 4). Their metadata is served and rejected; the run still re-executes and compares. Known: `signers-voting`. Unknown until run: `sbtc-token` and its dependencies (needed by `pox-5`), and the target's own contracts (e.g. `sbtc-yield-rewards-v3`). The fix is a deploy witness: the deploy tx's own reads, proven at its parent's root, re-executed to re-derive.
+1. **Contracts whose initialization reads chain state** (gap 4). Store reads: deploy witness since phase 2c (limits there). Environment lookups at deploy: their metadata is served and rejected; the run still re-executes and compares.
 2. **Env classes (c)/(d)** (miner address, block rewards, burn spends, PoX payouts, Clarity 1/2 `block-height` on Nakamoto) are rejected.
 3. **Never run on mainnet data.** In particular: the bundled `sip-031` and `pox-5` bodies must hash to mainnet's commitments byte for byte; mainnet MARF proofs must find full tries (a squashed or pruned chainstate breaks proofs into old tries; `marf-squash` output is not usable); `--chainstate` mode is only exercised through the shared handler code, not on a real directory.
 4. **Header and Bitcoin authenticity** are not checked here: headers by id hash only, Bitcoin heights from the node. `@secondlayer/verify` (signer signatures, canonical fork) and an SPV header chain compose on top by checking the same ids and hashes.
 5. **Burn-view recency** (gap 2) and **nested `at-block`** (gap 3) as in 2a.
 6. **Epoch 2.x**: a parent or `at-block` target in 2.x is shipped as an epoch-2 header (its parent id unknown, zero); untested. First Nakamoto blocks (2.x parent) untested.
-7. **Response size** (per-entry proofs). A multiproof is the fix.
+7. ~~**Response size** (per-entry proofs).~~ Shared proofs since phase 2c; still untested on mainnet.
 
 First target is still the `sbtc-yield-rewards-v3` block: run it and read which entries are rejected and why.
+
+# Phase 2c: deploy witness and shared proofs
+
+Mainnet run before this phase (12 DeFi blocks, `reexec-verify <id>
+--chainstate`): every one of 4,421 re-executed events equals the canonical
+event byte for byte, and 10 of 12 blocks are VERIFIED. The other two fail only
+on the metadata of contracts whose deploy reads chain state: 1,170,254
+(`SP001SFSMC2ZY76PD4M68P3WGX154XCH7NE3TYMX.pox4-pools`, reads
+`_stx-data::ustx_liquid_supply`) and 1,230,200 (`kiki-token`, which mints at
+deploy, and `token-wkiki`, which depends on it). Serving cost: per-read proofs
+made the response ~430 MB and took 341 to 1,534 s per block.
+
+## Deploy witness
+
+A contract whose deploy reads chain state is re-derived by re-running its
+deploy with those reads, each proven the way a block's own reads are.
+
+```
+prover (C deployed in D, D's parent P)
+  re-derive C from its deploy, with the contracts it depends on
+  ├─ reads a commitment of contract X → re-derive X first (≤ 16 deep, X may carry its own deploy witness)
+  ├─ reads chain state K            → answer K at P from the MARF, add (K, answer), re-derive again (≤ 256 rounds)
+  └─ makes an environment lookup    → unprovable ("not provable yet", lookup named)
+client
+  P = __MARF_BLOCK_HEIGHT_TO_HASH::(h(D) - 1) at D's root (the child trie rewrites it with the real id;
+      must equal the header's parent for a Nakamoto D, and also works for an epoch 2.x D)
+  each deploy read: checked like a block read, at P (or its `at-block` target), open height h(D)
+  re-run the deploy with those reads → metadata → compare with the block's metadata entries
+```
+
+| Piece | Where |
+|---|---|
+| Deploy reads in a re-derivation (`ContractDeployment::reads`, typed misses `DeriveError::Missing`) | `stateless.rs::derive_contract_metadata` |
+| Prover (`resolve_contract`, `answer_store_query`, `prove_contract_facts`) | `witness_proof.rs` |
+| Verifier (`verify_deploy_reads`) | `witness_proof.rs` |
+| Wire: `contracts[].deploy_reads` | `witness_wire.rs` |
+
+What a deploy read proves, and what it cannot:
+
+- **The value at P.** The deploy saw P's value unless something earlier in D wrote the key: block setup, an earlier transaction, or the deploy transaction's own fee. Roots cannot show order within a block.
+- **So each read is also classified at D's root.** The client walks every key read outside the contract's own storage (`vm::<C>::…` cannot exist before C) at D's root too. Not written in D: settled. Written in D: counted as `deploy read (block also wrote key; assumed after)` in the report. The run is still VERIFIED, but the report shows how many reads rest on that assumption.
+- **`_stx-data::ustx_liquid_supply` always lands in "assumed after".** Every block's teardown rewrites it after its transactions (`finish_block` adds unlocks and matured rewards, even 0). So the value at P is what a deploy sees, unless an earlier transaction in D burned STX.
+- **Closing it** needs D's own read witness up to the deploy transaction (re-execute D's prefix). Not done.
+- **Same-block dependencies.** If X was deployed earlier in D and C's deploy reads X's state, P has none of it. The read is flagged "assumed after" and the metadata will not match (rejected). Analysis-only dependencies are fine: `ledger` and `relay` in the history fixture share a block.
+- **Environment lookups at deploy** (`burn-block-height`, `block-height` for Clarity 1/2 on Nakamoto, `get-*-info?`) need D's burn view. Not provable in a deploy yet: the contract is served unproven, naming the lookup (`born` test).
+- **Epoch 2.x deploys in a microblock** are not in D's anchored tx list: unprovable (deploy tx not found).
+
+## Shared proofs
+
+One proof for every read, at every root, instead of one proof per read
+(`stackslib/src/chainstate/stacks/index/multiproof.rs`):
+
+```
+reads ─► MultiproofBuilder::walk(root, path)   per trie: the nodes walks touched
+                                                (others: their hash; back-pointers: the ancestor's block id)
+       ─► encode                                 + each trie's skip-list (ancestor roots), deduplicated
+client ─► Multiproof::open(bytes, header roots)  every trie hashes to its header's root
+       ─► get(root, path) per claim              walk exactly as the MARF does
+       ─► unvisited() == 0                       no node no claim reaches
+```
+
+- **No shunt proofs.** A back-pointer child hashes as the id of the block it points into, and that block's trie is pinned by its header's root. The client already needed a header for every crossed trie, so the skip-list hash chains between tries (shunt proofs) are redundant. They were the expensive part of proving: ~20 block-at-height lookups per hop, per read. Each trie still ships its own skip-list (≤ log2 height hashes) to recompute its root.
+- **Strict verifier.** The bytes must parse exactly, with no trailing bytes and every block and ancestor hash in the tables used. Every trie must hash to its block header's root (genesis: pinned). A claim whose walk needs a node the proof left out fails. After every claim is checked, a node no claim reached fails the witness ("extra nodes"). A trie that does not hash fails exactly the walks that reach it, so the report still names entries.
+- **Two proofs per served witness.** The read proof covers every store entry and every contract fact. Its claims are at the parent, at `at-block` targets, and at deploy blocks (commitment, epoch key, parent entry, the "written in D?" walks). Deploy reads are at the deploy blocks' parents. A trie reached from several roots ships once. The final-write proof is at the block's own root, checked after re-execution.
+- **Proving** walks each read once (node reads ∝ distinct nodes), computes one skip-list per distinct trie (lookup memo, anchored at the block), and encodes. Contract facts are walked only for evidence that is served, so a contract that fails re-derivation leaves no extra nodes.
+
+## Wire format v2 (`WitnessEnvelope`)
+
+JSON, binary as lowercase hex without `0x`. Changes from v1: every `proof`
+of an entry is now a tag, MARF bytes live in `marf` and `writes.proof`,
+contracts lost their proof fields and gained `deploy_reads`.
+
+| Field | Content | How the client checks it |
+|---|---|---|
+| `version` | `2` | Rejects anything else |
+| `network` | `{mainnet, chain_id}` | Must equal the client's pinned network |
+| `witness.open_tip`, `open_height`, `epoch`, `env[]` | As v1 | As v1 |
+| `witness.store[]` | `{query, value, proof}`, `proof` one of `"marf"`, `"ancestor"`, `"open_block"`, `"rederived"`, `"served"` | `marf`: walk at the root the query names (parent, or `at-block` target) gives `value` (`null`: absent). `ancestor`: walks of `__MARF_BLOCK_HASH_TO_HEIGHT::X` and back at the parent. `open_block`: deterministic. `rederived`: value left out, filled by re-derivation. `served`: rejected |
+| `contracts[]` | `{contract, block, source: "boot" \| {tx}, commitment, epoch_key, deploy_reads: [store entry]}` | Commitment and epoch key: walks at the deploy block's root. Ancestry: walks at the parent's root. Source hashes to the commitment. `deploy_reads`: as above, then re-derived with them |
+| `marf` | Shared read proof (format below) | Opened against the headers; strict (every node reached) |
+| `burn[]`, `burn_view`, `coinbases[]`, `bitcoin[]` | As v1 | As v1 |
+| `headers[]` | As v1; now: every trie either proof holds, plus deploy blocks, env-named blocks, the burn-view walk, coinbase blocks | Hashed to ids; each trie's root must equal its header's |
+| `writes` | `{keys: [key], proof}`: keys the block wrote, shared proof at the block's own root | Keys = re-executed final keys; each final value = walk; strict |
+| `unproven_contracts[]` | `[contract, reason]` | Diagnostic only |
+
+Shared proof (big-endian):
+
+```
+proof := u8 version=1 | u32 n_blocks | [32]*n_blocks | u32 n_hashes | [32]*n_hashes | u32 n_tries | trie*
+trie  := u32 block index | u8 n_anc | u32*n_anc hash index | node            (root: Node256)
+node  := u8 id | u8 path_len | path | leaf: [40] value | interior: ptr*(4/16/48/256) | child*
+ptr   := u8 tag | (tag != 0: u8 chr) | (0x80 back-pointer: u32 block index) | (0x40 pruned: [32] hash)
+```
+
+A ptr tag is 0 (empty), or a node id 1..=5 plus at most one flag. Expanded
+children follow their node in preorder. Like marf-witness v3 (u32 tables, one
+32-byte id per distinct ancestor block), but many tries per proof, pruned
+children, and a shared ancestor-hash table.
+
+## Results
+
+| Test | Shows |
+|---|---|
+| `contracts_whose_deploy_reads_chain_state_rederive_from_a_deploy_witness` (HTTP) | `kiki-token` keeps `stx-liquid-supply` in a constant and mints at deploy; `kiki-wrapper` (next block) keeps what it reads from `kiki-token` at deploy. Both carry deploy witnesses (3 reads: 2 settled, `ustx_liquid_supply` "assumed after"), re-derive, and the calling block is VERIFIED. One deploy-read value changed in transit: rejected, `deploy read Data { …ustx_liquid_supply }: MARF proof fails` |
+| `unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs` | Unchanged outcome: a deploy reading `burn-block-height` is served unproven, naming the lookup |
+| `tampered_witness_byte_fails_naming_the_entry` | A flipped bit in the shared proof's ancestor table: the trie no longer hashes, every entry read through it is rejected by name (incl. `note`); re-execution is skipped (metadata did not re-derive). A flipped bit in the final-write proof fails `write proofs` |
+| `absent_and_present_reads_verify_from_one_shared_proof` | 300 absent + 320 present keys at the tip, absent walks ending in the tip trie and through back-pointers in older ones; a present key is never absent from it and vice versa |
+| `tampering_with_any_byte_of_a_shared_proof_breaks_it` | Bits 0x01 and 0x80 of every byte of a 5-read, multi-trie proof, plus truncation and a trailing byte: each is caught |
+| `a_shared_proof_holds_its_reads_and_no_others` | Verifying half the reads leaves extra nodes (rejected); a read the proof was not made for needs a pruned node (fails) |
+| `absence_holds_until_the_block_that_writes_the_key`, `near_miss_…` | Ported from the absence-proof tests |
+| `memoized_lookups_produce_a_byte_identical_shared_proof`, `lookup_memo_proves_the_fixture_witness_byte_identically` | Same proof bytes with the memo off, on and anchored |
+
+All witness, replay, stateless, state-writes and index tests pass.
+
+## Measurements (optimized + debuginfo, Apple silicon)
+
+| | per-read (v1, `ba75388`) | shared (v2) |
+|---|---|---|
+| History fixture: all evidence (MARF + contracts + env) | 1,036,610 B (store proofs 654,161) | 18,097 B (shared proof 14,183): **57x** |
+| State-writes fixture: all evidence | 847,627 B | 16,278 B (shared proof 13,455): **52x** |
+| History fixture envelope (JSON) | 2,436,295 B | 56,070 B: **43x** |
+| History fixture proving, 35 entries + 10 writes: plain / memo / anchored | 6.4 / 3.2 / 2.9 ms (1,146 / 368 / 308 node reads) | 1.36 / 1.13 / 1.03 ms (305 / 249 / 219): **~3–5x** |
+| Synthetic, 300 blocks, 400 present + 100 absent reads: bytes, plain / memo / anchored | 22.9 MB, 390 / 123 / 113 ms | 361 KB (**64x**), 23.6 / 18.0 / 13.2 ms (**~9–17x**) |
+| Synthetic, 8 blocks, 620 reads at the tip | 10.8 MB (inclusion proofs of the 320 present keys alone) | 35 KB (8 tries, 474 nodes): **309x** |
+| History fixture verify (without metadata re-derivation) | 6.5 ms (0.65 ms) | 5.7 ms (0.21 ms) |
+| HTTP test blocks, whole replay body | not measured | 94 to 148 KB (read proof 33 to 43 KB, write proof 5 to 6 KB) |
+
+The HTTP chain is longer than the `proven_witness` one, so its tries' root
+nodes and skip-lists are bigger. Root `Node256`s dominate: 256 ptr tags, 6
+bytes per back-pointer, 34 per pruned child.
+
+## Still to expect on mainnet
+
+- **Deploy witnesses.** Both mainnet failures should move: `pox4-pools` reads `ustx_liquid_supply` (shown as "assumed after"), and `kiki-token` reads and writes its own FT keys (settled). Blockers that would still reject them: an environment lookup at deploy (`block-height` in Clarity 1/2 on Nakamoto is class (c)), a deploy in an epoch 2.x microblock, or `token-wkiki` reading `kiki-token` state at deploy when both were deployed in the same block. Never run on mainnet.
+- **Size and time.** Both now scale with distinct tries and nodes. A mainnet block crosses many more tries (1,113,075 had 1,239 entries + 408 writes). Each distinct trie costs its root node (~0.3–1.5 KB in this format), its skip-list references, one skip-list computation (memoized), and a header in the response. Expect single-digit MB and seconds, not 430 MB and 20 minutes. Unmeasured.
