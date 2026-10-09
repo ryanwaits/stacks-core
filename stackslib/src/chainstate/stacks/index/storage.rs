@@ -2851,15 +2851,14 @@ impl<T: MarfTrieId> TrieStorageConnection<'_, T> {
     /// `TrieHashCalculationMode::All` or `TrieHashCalculationMode::Immediate`.  There is no need
     /// to call if the hash mode is `::Deferred`.  The only way this gets called while not in
     /// `::Deferred` mode is when generating a Merkle proof.
+    ///
+    /// Only reads storage (the hashes go to `w`), so read-only storage may
+    /// call it: that is how a read-only MARF builds Merkle proofs.
     pub fn write_children_hashes<W: Write>(
         &mut self,
         node: &TrieNodeType,
         w: &mut W,
     ) -> Result<(), Error> {
-        if self.data.readonly {
-            return Err(Error::ReadOnlyError);
-        }
-
         trace!("write_children_hashes for {:?}", node);
 
         let mut map = TrieSqlHashMapCursor {
