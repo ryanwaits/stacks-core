@@ -168,6 +168,13 @@ pub struct WireContract {
     /// The deploy witness: chain state the deploy read, each entry proven
     /// at the deploying block's parent.
     pub deploy_reads: Vec<WireStoreEntry>,
+    /// Environment lookups the deploy made, encoded as `witness.env`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deploy_env: Vec<WireEnvEntry>,
+    /// The tenure change that set the deploying block's burn view, when a
+    /// deploy lookup reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burn_view: Option<WireTxInclusion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -530,6 +537,26 @@ fn decode_answer(query: &EnvQuery, answer: &Value) -> Result<EnvRead, String> {
     by_answer_type!(query, decode, query, answer)
 }
 
+fn env_to_wire(reads: &[EnvRead]) -> Result<Vec<WireEnvEntry>, String> {
+    reads
+        .iter()
+        .map(|read| {
+            Ok(WireEnvEntry {
+                query: read.query.clone(),
+                answer: encode_answer(read)?,
+            })
+        })
+        .collect()
+}
+
+fn env_from_wire(entries: &[WireEnvEntry]) -> Result<Vec<EnvRead>, String> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| decode_answer(&e.query, &e.answer).map_err(|err| format!("env[{i}] {err}")))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Served witness <-> envelope
 // ---------------------------------------------------------------------------
@@ -611,40 +638,35 @@ impl ServedWitness {
                 proof: store_proof_to_wire(proof),
             })
             .collect();
-        let env = w
-            .env
-            .iter()
-            .map(|read| {
-                Ok(WireEnvEntry {
-                    query: read.query.clone(),
-                    answer: encode_answer(read)?,
-                })
-            })
-            .collect::<Result<_, String>>()?;
+        let env = env_to_wire(&w.env)?;
         let contracts = proven
             .contracts
             .iter()
-            .map(|c| WireContract {
-                contract: c.contract.to_string(),
-                block: c.block.hex(),
-                source: match &c.source {
-                    DeploySource::Boot => WireSource::Boot,
-                    DeploySource::Tx(inclusion) => WireSource::Tx(inclusion_to_wire(inclusion)),
-                },
-                commitment: c.commitment.clone(),
-                epoch_key: c.epoch_key.clone(),
-                deploy_reads: c
-                    .deploy_reads
-                    .iter()
-                    .zip(c.deploy_proofs.iter())
-                    .map(|((query, value), proof)| WireStoreEntry {
-                        query: query.clone(),
-                        value: value.clone(),
-                        proof: store_proof_to_wire(proof),
-                    })
-                    .collect(),
+            .map(|c| {
+                Ok(WireContract {
+                    contract: c.contract.to_string(),
+                    block: c.block.hex(),
+                    source: match &c.source {
+                        DeploySource::Boot => WireSource::Boot,
+                        DeploySource::Tx(inclusion) => WireSource::Tx(inclusion_to_wire(inclusion)),
+                    },
+                    commitment: c.commitment.clone(),
+                    epoch_key: c.epoch_key.clone(),
+                    deploy_reads: c
+                        .deploy_reads
+                        .iter()
+                        .zip(c.deploy_proofs.iter())
+                        .map(|((query, value), proof)| WireStoreEntry {
+                            query: query.clone(),
+                            value: value.clone(),
+                            proof: store_proof_to_wire(proof),
+                        })
+                        .collect(),
+                    deploy_env: env_to_wire(&c.deploy_env)?,
+                    burn_view: c.deploy_burn_view.as_ref().map(inclusion_to_wire),
+                })
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
         let burn = proven
             .burn
             .iter()
@@ -711,14 +733,7 @@ impl WitnessEnvelope {
             store.push((entry.query.clone(), entry.value.clone()));
             store_proofs.push(store_proof_from_wire(&entry.proof));
         }
-        let env = w
-            .env
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                decode_answer(&e.query, &e.answer).map_err(|err| format!("env[{i}] {err}"))
-            })
-            .collect::<Result<_, _>>()?;
+        let env = env_from_wire(&w.env)?;
         let witness = ReadWitness {
             open_tip: StacksBlockId::parse(&w.open_tip)?,
             open_height: w.open_height,
@@ -753,6 +768,13 @@ impl WitnessEnvelope {
                         .iter()
                         .map(|e| store_proof_from_wire(&e.proof))
                         .collect(),
+                    deploy_env: env_from_wire(&c.deploy_env).map_err(named)?,
+                    deploy_burn_view: c
+                        .burn_view
+                        .as_ref()
+                        .map(inclusion_from_wire)
+                        .transpose()
+                        .map_err(|e| named(format!("burn_view: {e}")))?,
                 })
             })
             .collect::<Result<_, String>>()?;

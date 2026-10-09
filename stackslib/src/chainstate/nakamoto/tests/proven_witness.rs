@@ -20,6 +20,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use clarity::types::chainstate::StacksPrivateKey;
+use clarity::vm::database::HeadersDB;
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use stacks_common::consts::CHAIN_ID_TESTNET;
 use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId, TrieHash};
@@ -33,17 +35,18 @@ use crate::chainstate::nakamoto::NakamotoChainState;
 use crate::chainstate::stacks::events::TransactionOrigin;
 use crate::chainstate::stacks::index::multiproof::MultiproofBuilder;
 use crate::chainstate::stacks::{StacksTransaction, TransactionPayload};
-use crate::clarity_vm::read_witness::{EnvQuery, ReadWitness, StoreQuery};
+use crate::clarity_vm::read_witness::{EnvQuery, EnvRead, ReadWitness, StoreQuery};
 use crate::clarity_vm::witness_proof::{
-    prove_contracts, prove_store_reads, prove_writes, verify_read_witness, BitcoinChain,
-    BitcoinHeader, ChainHeader, DeploySource, HeaderChain, NetworkParams, ProvenWitness, Rejection,
-    StoreProof, TrustedState, TxInclusion,
+    prove_contracts, prove_env_reads, prove_store_reads, prove_writes, verify_read_witness,
+    BitcoinChain, BitcoinHeader, ChainHeader, DeploySource, HeaderChain, NetworkParams,
+    ProvenWitness, Rejection, StoreProof, TrustedState, TxInclusion,
 };
 use crate::clarity_vm::witness_serve::burn_binding;
 use crate::clarity_vm::witness_wire::WitnessEnvelope;
+use crate::core::test_util::{make_stacks_transfer_tx, to_addr};
 use crate::net::api::blockreplay::{remine_nakamoto_block, ReplayTrace};
 use crate::net::test::{TestEventObserver, TestEventObserverBlock, TestPeer};
-use crate::net::tests::NakamotoBootTenure;
+use crate::net::tests::{NakamotoBootStep, NakamotoBootTenure};
 
 /// Everything a client holds for one block: what it trusts, and the
 /// proof-carrying witness a node served.
@@ -84,7 +87,19 @@ fn serve(
     observer: &TestEventObserver,
     block: &TestEventObserverBlock,
 ) -> Served {
-    let live = LiveBlock::of(block);
+    serve_with_lookups(peer, observer, block, vec![])
+}
+
+/// [`serve`], with `extra` lookups added to the block's witness (lookups the
+/// test chain's contracts cannot make, answered by the node).
+fn serve_with_lookups(
+    peer: &mut TestPeer,
+    observer: &TestEventObserver,
+    block: &TestEventObserverBlock,
+    extra: Vec<EnvRead>,
+) -> Served {
+    let mut live = LiveBlock::of(block);
+    live.witness.env.extend(extra);
     let block_id = block.metadata.index_block_hash();
     let parent = block.parent.clone();
 
@@ -257,9 +272,17 @@ fn serve(
                 let mut conn = marf.borrow_storage_backend();
                 let mut proof = MultiproofBuilder::new();
                 let store = prove_store_reads(&mut conn, &mut proof, &parent, witness).unwrap();
-                let (contracts, unproven) =
-                    prove_contracts(&mut conn, &mut proof, &parent, witness, &net, &find_deploy)
-                        .unwrap();
+                prove_env_reads(&mut conn, &mut proof, &witness.env).unwrap();
+                let (contracts, unproven) = prove_contracts(
+                    &mut conn,
+                    &mut proof,
+                    &parent,
+                    witness,
+                    &net,
+                    &find_deploy,
+                    None,
+                )
+                .unwrap();
                 assert!(unproven.is_empty(), "{unproven:?}");
                 (store, contracts, proof.encode(&mut conn).unwrap())
             });
@@ -795,4 +818,113 @@ fn served_witness_round_trips_through_json() {
         served.bitcoin.len(),
         served.writes.keys.len()
     );
+}
+
+/// Clarity 2 `get-block-info?` on Nakamoto maps a tenure height to the first
+/// block of that tenure (`stacks_height_for_tenure_height`). The test chain
+/// runs on the testnet chain id, where Clarity skips that mapping, so the
+/// lookup is added to a witness as the node answers it. It is proven by
+/// walks of `_stx-data::tenure_height` (at the tenure's first block and its
+/// parent) and block-at-height at the tip. A height that is not the
+/// tenure's first block, or a tenure height off by one, is rejected naming
+/// the lookup; so is the first Nakamoto tenure (its parent block predates
+/// tenure heights).
+#[test]
+fn tenure_height_lookup_is_proven_by_tenure_height_walks() {
+    let privk = StacksPrivateKey::from_seed(b"tenure-height");
+    let sender = to_addr(&privk);
+    let transfer = |nonce| {
+        let to = PrincipalData::from(to_addr(&StacksPrivateKey::from_seed(b"tenure-height-to")));
+        make_stacks_transfer_tx(&privk, nonce, 1000, CHAIN_ID_TESTNET, &to, 1)
+    };
+    let last = transfer(4);
+    let txid = last.txid();
+    let tenures = vec![
+        NakamotoBootTenure::Sortition(vec![NakamotoBootStep::Block(vec![transfer(0)])]),
+        NakamotoBootTenure::Sortition(vec![
+            NakamotoBootStep::Block(vec![transfer(1)]),
+            NakamotoBootStep::Block(vec![transfer(2)]),
+        ]),
+        NakamotoBootTenure::Sortition(vec![
+            NakamotoBootStep::Block(vec![transfer(3)]),
+            NakamotoBootStep::Block(vec![last]),
+        ]),
+    ];
+    let observer = TestEventObserver::new();
+    let mut peer = boot(
+        function_name!(),
+        &observer,
+        tenures,
+        vec![(sender.into(), 10_000_000)],
+    );
+    let block = block_with_tx(&observer, &txid);
+    let parent = block.parent.clone();
+    let chainstate = &peer.chain.coord.chain_state_db;
+    let current = NakamotoChainState::get_coinbase_height_at(&mut chainstate.index_conn(), &parent)
+        .unwrap()
+        .unwrap() as u32;
+    let lookup = |tenure_height: u32, answer: Option<u32>| {
+        EnvRead::new(
+            EnvQuery::StacksHeightForTenureHeight {
+                tip: parent.clone(),
+                tenure_height,
+            },
+            answer,
+        )
+    };
+    // this tenure, the one before, and the first Nakamoto tenure
+    let answers: Vec<(u32, Option<u32>)> = [current, current - 1, current - 2]
+        .into_iter()
+        .map(|th| {
+            let answer = HeadersDB::get_stacks_height_for_tenure_height(
+                &chainstate.state_index,
+                &parent,
+                th,
+            );
+            assert!(answer.is_some(), "tenure {th} has a first block");
+            (th, answer)
+        })
+        .collect();
+    assert!(answers[1].1 < answers[0].1);
+    let honest: Vec<EnvRead> = answers[..2].iter().map(|(th, a)| lookup(*th, *a)).collect();
+    let served = serve_with_lookups(&mut peer, &observer, &block, honest);
+    served
+        .verify(&served.proven)
+        .expect("tenure-height lookups verify");
+    let i = served.proven.witness.env.len() - 1;
+    let (th, answer) = answers[1];
+    let rejected = |read: EnvRead| {
+        let mut forged = served.proven.clone();
+        forged.witness.env[i] = read;
+        let rejection = served.verify(&forged).unwrap_err();
+        assert!(
+            rejection.entry.contains("stacks_height_for_tenure_height("),
+            "{rejection:?}"
+        );
+        rejection.reason
+    };
+
+    // the block one past the tenure's first: not its start
+    rejected(lookup(th, answer.map(|h| h + 1)));
+    // a tenure height off by one, same block
+    let reason = rejected(lookup(th + 1, answer));
+    assert!(reason.contains("tenure"), "{reason}");
+
+    // the first Nakamoto tenure: its start block's parent is an epoch 2.x
+    // block, which has no tenure height, so the node cannot prove it and a
+    // client rejects it
+    let (th, answer) = answers[2];
+    let first = lookup(th, answer);
+    let refused = peer
+        .chain
+        .coord
+        .chain_state_db
+        .clarity_state
+        .with_marf(|marf| {
+            let mut conn = marf.borrow_storage_backend();
+            prove_env_reads(&mut conn, &mut MultiproofBuilder::new(), &[first.clone()])
+        })
+        .unwrap_err();
+    assert!(refused.contains("predates epoch 3.0"), "{refused}");
+    rejected(first);
 }

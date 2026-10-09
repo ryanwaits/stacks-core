@@ -35,7 +35,9 @@ use crate::chainstate::nakamoto::NakamotoBlock;
 use crate::chainstate::stacks::events::TransactionOrigin;
 use crate::clarity_vm::witness_client::{check_replayed_block, event_rows, ClientParams, Report};
 use crate::clarity_vm::witness_serve::node_network_params;
-use crate::core::test_util::{make_contract_call_tx, make_contract_publish_tx, to_addr};
+use crate::core::test_util::{
+    make_contract_call_tx, make_contract_publish_tx, make_stacks_transfer_tx, to_addr,
+};
 use crate::core::FIRST_STACKS_BLOCK_ID;
 use crate::net::api::blockreplay::{receipt_events, RPCReplayedBlock, ReplayTrace};
 use crate::net::api::tests::TestRPC;
@@ -307,11 +309,10 @@ fn tampered_witness_byte_fails_naming_the_entry() {
     assert!(fetched.check(&fetched.replay_body).ok());
 }
 
-/// A contract whose initialization makes an environment lookup (here
-/// `burn-block-height`) cannot be re-derived yet: a deploy witness carries
-/// store reads only. The node serves its metadata as is; the client rejects
-/// those entries (naming the contract and why) but still re-executes and
-/// compares everything else.
+/// A contract whose initialization makes a lookup not provable yet (here
+/// the winning miner's spend, class (c)) cannot be re-derived. The node
+/// serves its metadata as is; the client rejects those entries (naming the
+/// contract and why) but still re-executes and compares everything else.
 #[test]
 fn unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs() {
     let privk = StacksPrivateKey::from_seed(b"unprovable-metadata");
@@ -321,10 +322,11 @@ fn unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs() {
         0,
         1000,
         CHAIN_ID_TESTNET,
-        "born",
-        "(define-data-var born uint burn-block-height)
-         (define-public (age)
-           (begin (print {born: (var-get born), now: burn-block-height}) (ok true)))",
+        "spent",
+        "(define-data-var spent (optional uint)
+           (get-tenure-info? miner-spend-winner (- stacks-block-height u1)))
+         (define-public (show)
+           (begin (print {spent: (var-get spent), now: burn-block-height}) (ok true)))",
         Some(ClarityVersion::Clarity3),
     );
     let call = make_contract_call_tx(
@@ -333,8 +335,8 @@ fn unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs() {
         1000,
         CHAIN_ID_TESTNET,
         &sender,
-        ContractName::from_literal("born"),
-        ClarityName::from_literal("age"),
+        ContractName::from_literal("spent"),
+        ClarityName::from_literal("show"),
         &[],
     );
     let txid = call.txid();
@@ -354,7 +356,13 @@ fn unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs() {
     assert_eq!(failure.name, "witness");
     assert!(failure.detail.contains("not provable yet"), "{report}");
     assert!(failure.detail.contains("served unproven"), "{report}");
-    assert!(failure.detail.contains(".born"), "{report}");
+    assert!(
+        failure
+            .detail
+            .contains("burnchain_tokens_spent_for_winning_block"),
+        "{report}"
+    );
+    assert!(failure.detail.contains(".spent"), "{report}");
     assert!(report.entries.contains_key("metadata (served, unproven)"));
     for name in ["re-execute", "writes", "write proofs", "events"] {
         assert!(
@@ -362,6 +370,229 @@ fn unprovable_metadata_is_served_and_rejected_but_reexecution_still_runs() {
             "{name} did not pass: {report}"
         );
     }
+}
+
+/// Clarity 3: burn height and burn header hash through the burn view, and
+/// an older block's id, time, burn block time and burn header hash (each
+/// lookup by id also asks for that block's burn height, to pick its epoch).
+const CLOCK_SRC: &str = "
+(define-constant born-burn burn-block-height)
+(define-constant born-burn-hash (get-burn-block-info? header-hash (- burn-block-height u1)))
+(define-constant born-id (get-stacks-block-info? id-header-hash (- stacks-block-height u2)))
+(define-constant born-time (get-stacks-block-info? time (- stacks-block-height u2)))
+(define-constant born-tenure-hash (get-tenure-info? burnchain-header-hash (- stacks-block-height u2)))
+(define-constant born-tenure-time (get-tenure-info? time (- stacks-block-height u2)))
+(define-public (tick)
+  (begin
+    (print {born: born-burn, born-hash: born-burn-hash, born-id: born-id, born-time: born-time,
+            born-tenure-hash: born-tenure-hash, born-tenure-time: born-tenure-time,
+            now: burn-block-height,
+            hash: (get-burn-block-info? header-hash (- burn-block-height u2)),
+            id: (get-stacks-block-info? id-header-hash (- stacks-block-height u3)),
+            time: (get-stacks-block-info? time (- stacks-block-height u3)),
+            tenure-time: (get-tenure-info? time (- stacks-block-height u3))})
+    (ok true)))
+";
+
+/// Clarity 2 on Nakamoto: `block-height` is the tenure height. On mainnet
+/// `get-block-info?` would map it to the tenure's first block (the
+/// tenure-height lookup, proven in `proven_witness.rs`); on the test chain's
+/// testnet chain id Clarity reads it as a Stacks height, so here it reads an
+/// older block's id, time and burn header hash.
+const LEGACY_SRC: &str = "
+(define-constant born block-height)
+(define-constant born-id (get-block-info? id-header-hash (- block-height u1)))
+(define-constant born-time (get-block-info? time (- block-height u1)))
+(define-constant born-burn-hash (get-block-info? burnchain-header-hash (- block-height u1)))
+(define-public (tick)
+  (begin
+    (print {born: born, born-id: born-id, born-time: born-time, born-burn-hash: born-burn-hash,
+            now: block-height, burn: burn-block-height,
+            id: (get-block-info? id-header-hash (- block-height u2)),
+            time: (get-block-info? time (- block-height u2))})
+    (ok true)))
+";
+
+/// The env lookups of `contract`'s deploy, as served.
+fn deploy_env<'a>(body: &'a mut Value, contract: &str) -> &'a mut Vec<Value> {
+    body["read_witness"]["contracts"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|c| c["contract"].as_str().unwrap().ends_with(contract))
+        .unwrap_or_else(|| panic!("no evidence for {contract}"))["deploy_env"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("{contract} has no deploy lookups"))
+}
+
+/// Contracts whose deploy (and a later call) read burn heights, burn header
+/// hashes, and older blocks' ids, times and burn heights. Each deploy's
+/// lookups are served with its deploying block's burn view and checked like
+/// the block's own; both contracts re-derive and the calling block verifies
+/// end to end. A tampered burn height (through the burn view, and for an
+/// older block) and a dropped deploy burn view are each rejected, naming the
+/// entry.
+#[test]
+fn deploys_reading_burn_and_header_lookups_rederive_and_verify() {
+    let privk = StacksPrivateKey::from_seed(b"burn-lookups");
+    let sender = to_addr(&privk);
+    let publish = |nonce, name: &str, src: &str, version| {
+        make_contract_publish_tx(
+            &privk,
+            nonce,
+            1000,
+            CHAIN_ID_TESTNET,
+            name,
+            src,
+            Some(version),
+        )
+    };
+    let call = |nonce, contract: &'static str| {
+        make_contract_call_tx(
+            &privk,
+            nonce,
+            1000,
+            CHAIN_ID_TESTNET,
+            &sender,
+            ContractName::from_literal(contract),
+            ClarityName::from_literal("tick"),
+            &[],
+        )
+    };
+    // blocks of their own, so the lookups reach back past them
+    let filler_key = StacksPrivateKey::from_seed(b"burn-lookups-filler");
+    let filler = |nonce| {
+        let to = PrincipalData::from(sender.clone());
+        NakamotoBootStep::Block(vec![make_stacks_transfer_tx(
+            &filler_key,
+            nonce,
+            1000,
+            CHAIN_ID_TESTNET,
+            &to,
+            1,
+        )])
+    };
+    let tick_clock = call(2, "clock");
+    let txid = tick_clock.txid();
+    let tenures = vec![
+        NakamotoBootTenure::Sortition(vec![filler(0), filler(1)]),
+        NakamotoBootTenure::Sortition(vec![
+            filler(2),
+            NakamotoBootStep::Block(vec![publish(
+                0,
+                "clock",
+                CLOCK_SRC,
+                ClarityVersion::Clarity3,
+            )]),
+            NakamotoBootStep::Block(vec![publish(
+                1,
+                "legacy",
+                LEGACY_SRC,
+                ClarityVersion::Clarity2,
+            )]),
+        ]),
+        NakamotoBootTenure::Sortition(vec![
+            filler(3),
+            NakamotoBootStep::Block(vec![tick_clock, call(3, "legacy")]),
+        ]),
+    ];
+    let fetched = fetch(
+        function_name!(),
+        tenures,
+        vec![
+            (sender.clone().into(), 10_000_000),
+            (to_addr(&filler_key).into(), 10_000_000),
+        ],
+        &txid,
+    );
+    let report = fetched.check(&fetched.replay_body);
+    eprintln!("{report}");
+    assert!(report.ok(), "{report}");
+    for kind in [
+        "deploy env (a) header",
+        "deploy env (b) burn",
+        "env (a) header",
+        "env (b) burn",
+    ] {
+        assert!(
+            report.entries.contains_key(kind),
+            "no {kind} entry: {report}"
+        );
+    }
+    let mut body: Value = serde_json::from_str(&fetched.replay_body).unwrap();
+    let methods: Vec<String> = deploy_env(&mut body, ".clock")
+        .iter()
+        .map(|e| e["query"]["method"].as_str().unwrap().to_string())
+        .collect();
+    for method in [
+        "tip_burn_block_height",
+        "burn_header_hash",
+        "burn_block_height_for_block",
+        "stacks_block_time",
+        "burn_block_time",
+        "burn_header_hash_for_block",
+    ] {
+        assert!(methods.iter().any(|m| m == method), "{methods:?}");
+    }
+
+    // the clock deploy's burn height, one higher
+    let tampered = fetched.tampered(|body| {
+        let read = deploy_env(body, ".clock")
+            .iter_mut()
+            .find(|e| e["query"]["method"] == "tip_burn_block_height")
+            .unwrap();
+        let height = read["answer"].as_u64().unwrap();
+        read["answer"] = Value::from(height + 1);
+    });
+    let report = fetched.check(&tampered);
+    let failure = report
+        .failure()
+        .expect("tampered deploy lookup is rejected");
+    assert_eq!(failure.name, "witness", "{report}");
+    assert!(
+        failure
+            .detail
+            .contains("ContractName(\"clock\") }: deploy lookup tip_burn_block_height()"),
+        "{report}"
+    );
+    assert!(failure.detail.contains("answered"), "{report}");
+
+    // an older block's burn height the clock deploy read, one lower
+    let tampered = fetched.tampered(|body| {
+        let read = deploy_env(body, ".clock")
+            .iter_mut()
+            .find(|e| e["query"]["method"] == "burn_block_height_for_block")
+            .unwrap();
+        let height = read["answer"].as_u64().unwrap();
+        read["answer"] = Value::from(height - 1);
+    });
+    let report = fetched.check(&tampered);
+    let failure = report.failure().expect("tampered burn height is rejected");
+    assert!(
+        failure
+            .detail
+            .contains("ContractName(\"clock\") }: deploy lookup burn_block_height_for_block("),
+        "{report}"
+    );
+
+    // the clock deploy's burn view dropped
+    let tampered = fetched.tampered(|body| {
+        let clock = body["read_witness"]["contracts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|c| c["contract"].as_str().unwrap().ends_with(".clock"))
+            .unwrap();
+        clock.as_object_mut().unwrap().remove("burn_view");
+    });
+    let report = fetched.check(&tampered);
+    let failure = report
+        .failure()
+        .expect("missing deploy burn view is rejected");
+    assert!(failure.detail.contains("no burn view proven"), "{report}");
+
+    // and the honest body still verifies
+    assert!(fetched.check(&fetched.replay_body).ok());
 }
 
 const KIKI_SRC: &str = "

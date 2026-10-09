@@ -37,8 +37,10 @@
 //! | the open block's own bookkeeping | deterministic from the parent id and height |
 //! | contract metadata | re-derived from the deploy (see [`derive_contract_metadata`]), with the deploy's own reads proven at its parent (deploy witness) |
 //! | header lookups | the header chain |
-//! | burn lookups | consensus-hash preimages ([`BurnBinding`]) plus the Bitcoin chain |
+//! | burn lookups | consensus-hash preimages ([`BurnBinding`]) plus the Bitcoin chain; through the burn view, its tenure change too |
+//! | tenure height to block | walks of `_stx-data::tenure_height` at the tenure's first block and its parent |
 //! | epochs, PoX parameters | network constants |
+//! | a deploy's own lookups | the same, with the deploying block's burn view |
 //!
 //! See `NOTES.md` for the lookups that are not provable yet.
 
@@ -46,8 +48,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::time::Instant;
 
+use clarity::vm::database::clarity_db::TENURE_HEIGHT_KEY;
 use clarity::vm::database::clarity_store::{make_contract_hash_key, ContractCommitment};
-use clarity::vm::database::{ClarityDeserializable, SqliteConnection};
+use clarity::vm::database::{
+    BurnStateDB, ClarityDeserializable, ClaritySerializable, HeadersDB, SqliteConnection,
+};
 use clarity::vm::types::QualifiedContractIdentifier;
 use clarity::vm::{ClarityVersion, ContractName};
 use stacks_common::codec::StacksMessageCodec;
@@ -82,7 +87,7 @@ use crate::chainstate::stacks::{
     StacksTransaction, TransactionPayload, TransactionSmartContract, TransactionVersion,
     MINER_BLOCK_CONSENSUS_HASH, MINER_BLOCK_HEADER_HASH,
 };
-use crate::clarity_vm::read_witness::{EnvQuery, EnvRead, ReadWitness, StoreQuery};
+use crate::clarity_vm::read_witness::{EnvQuery, EnvRead, EnvTap, ReadWitness, StoreQuery};
 use crate::clarity_vm::stateless::{
     derive_contract_metadata, ContractDeployment, ContractMetadata, DeriveError, EPOCH_VERSION_KEY,
 };
@@ -400,6 +405,14 @@ pub struct ContractEvidence {
     /// One per deploy read: proven at the deploying block's parent (or an
     /// `at-block` target), as a block's own reads are at its parent.
     pub deploy_proofs: Vec<StoreProof>,
+    /// Environment lookups the deploy made, as they answered, checked as a
+    /// block's own lookups are (header chain, burn preimages and Bitcoin
+    /// headers, tenure-height walks, constants).
+    pub deploy_env: Vec<EnvRead>,
+    /// The tenure change that set the deploying block's burn view (in that
+    /// block, else earlier in its tenure), when a deploy lookup reads the burn
+    /// view (`burn-block-height` on Nakamoto, `get-burn-block-info?`).
+    pub deploy_burn_view: Option<TxInclusion>,
 }
 
 impl ContractEvidence {
@@ -418,6 +431,15 @@ impl ContractEvidence {
                 .iter()
                 .map(|(q, a)| q.wire_len() + a.as_ref().map_or(0, String::len))
                 .sum::<usize>()
+            + self
+                .deploy_env
+                .iter()
+                .map(|r| r.query.to_string().len() + r.shown.len())
+                .sum::<usize>()
+            + self
+                .deploy_burn_view
+                .as_ref()
+                .map_or(0, TxInclusion::byte_len)
     }
 }
 
@@ -583,6 +605,138 @@ fn claim_of(
 }
 
 // ---------------------------------------------------------------------------
+// What each environment lookup is proven by
+// ---------------------------------------------------------------------------
+
+/// The evidence an environment lookup is checked against (`NOTES.md`,
+/// "Environment lookups").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvClass {
+    /// (a) The header of the block it names.
+    Header,
+    /// (b) The consensus-hash preimage of a named block or sortition, and
+    /// that Bitcoin block's header.
+    Burn,
+    /// (b) Through the burn view of the block (or deploy) being evaluated:
+    /// its tenure change, that consensus hash's preimage, Bitcoin headers.
+    BurnView,
+    /// Walks of `_stx-data::tenure_height` (and block-at-height) in the
+    /// shared MARF proof.
+    TenureHeight,
+    /// Network constants.
+    Constant,
+    /// (c)/(d): needs evidence outside headers, preimages and the MARF.
+    Unprovable,
+}
+
+impl EnvClass {
+    pub fn of(query: &EnvQuery) -> Self {
+        use EnvQuery::*;
+        match query {
+            StacksBlockHeaderHash { .. }
+            | ConsensusHashForBlock { .. }
+            | StacksBlockTime { .. }
+            | VrfSeed { .. } => EnvClass::Header,
+            BurnHeaderHashForBlock { .. }
+            | BurnBlockHeightForBlock { .. }
+            | BurnBlockTime { .. }
+            | BurnBlockHeight { .. }
+            | SortitionIdFromConsensusHash { .. } => EnvClass::Burn,
+            TipBurnBlockHeight | TipSortitionId | BurnHeaderHash { .. } => EnvClass::BurnView,
+            StacksHeightForTenureHeight { .. } => EnvClass::TenureHeight,
+            StacksEpoch { .. }
+            | StacksEpochById { .. }
+            | BurnStartHeight
+            | V1UnlockHeight
+            | V2UnlockHeight
+            | V3UnlockHeight
+            | Pox3ActivationHeight
+            | Pox4ActivationHeight
+            | Pox5ActivationHeight
+            | PoxPrepareLength
+            | PoxRewardCycleLength
+            | PoxRejectionFraction => EnvClass::Constant,
+            MinerAddress { .. }
+            | TokensSpent { .. }
+            | TokensSpentWinning { .. }
+            | TokensEarned { .. }
+            | PoxPayoutAddrs { .. } => EnvClass::Unprovable,
+        }
+    }
+
+    /// How a client report names the class.
+    pub fn label(self) -> &'static str {
+        match self {
+            EnvClass::Header => "env (a) header",
+            EnvClass::Burn | EnvClass::BurnView => "env (b) burn",
+            EnvClass::TenureHeight => "env tenure height",
+            EnvClass::Constant => "env constant",
+            EnvClass::Unprovable => "env (c/d) unprovable",
+        }
+    }
+
+    /// The same, for a lookup a contract's deploy made.
+    pub fn deploy_label(self) -> &'static str {
+        match self {
+            EnvClass::Header => "deploy env (a) header",
+            EnvClass::Burn | EnvClass::BurnView => "deploy env (b) burn",
+            EnvClass::TenureHeight => "deploy env tenure height",
+            EnvClass::Constant => "deploy env constant",
+            EnvClass::Unprovable => "deploy env (c/d) unprovable",
+        }
+    }
+}
+
+/// The MARF facts that pin `stacks_height_for_tenure_height(tip, th) = s`:
+/// the block `b` at height `s` on `tip`'s fork has tenure height `th`, and
+/// its parent `th - 1`. Tenure height is the coinbase height, which every
+/// tenure-start block sets to its parent's plus one and every other block
+/// keeps, so `b` is the first block of tenure `th`: the block the headers DB
+/// maps `th` to (`nakamoto::tenures::ongoing_tenure_coinbase_height`).
+/// `walk(block, path)` returns the value hash the walk ends at.
+fn tenure_start_facts(
+    tip: &StacksBlockId,
+    tip_height: u32,
+    tenure_height: u32,
+    answer: Option<u32>,
+    mut walk: impl FnMut(&StacksBlockId, &TrieHash) -> Result<Option<MARFValue>, String>,
+) -> Result<(), String> {
+    let s = answer.ok_or("no such tenure on the fork: not provable yet")?;
+    if s == 0 || tenure_height == 0 {
+        return Err("genesis starts no tenure".into());
+    }
+    if s > tip_height {
+        return Err(format!("height {s} is above the tip's {tip_height}"));
+    }
+    let block = if s == tip_height {
+        tip.clone()
+    } else {
+        walk(tip, &TrieHash::from_key(&height_to_hash_key(s)))?
+            .map(StacksBlockId::from)
+            .ok_or_else(|| format!("no block at height {s}"))?
+    };
+    let tenure_key = TrieHash::from_key(TENURE_HEIGHT_KEY);
+    let has = |v: Option<MARFValue>, th: u32| v == Some(MARFValue::from_value(&th.serialize()));
+    if !has(walk(&block, &tenure_key)?, tenure_height) {
+        return Err(format!(
+            "block at height {s} is not in tenure {tenure_height}"
+        ));
+    }
+    // the child trie rewrites its parent's entry with the parent's real id
+    let parent = walk(&block, &TrieHash::from_key(&height_to_hash_key(s - 1)))?
+        .map(StacksBlockId::from)
+        .ok_or("tenure-start block has no parent entry")?;
+    if !has(walk(&parent, &tenure_key)?, tenure_height - 1) {
+        return Err(format!(
+            "block at height {s} does not start tenure {tenure_height} \
+             (its parent is not in tenure {}, or predates epoch 3.0)",
+            tenure_height - 1
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Prover
 // ---------------------------------------------------------------------------
 
@@ -730,6 +884,48 @@ pub fn prove_writes(
     Ok(())
 }
 
+/// Walk the MARF facts behind every tenure-height lookup in `reads` into
+/// `proof` (see [`tenure_start_facts`]); other lookups need no MARF walks.
+pub fn prove_env_reads(
+    conn: &mut TrieStorageConnection<StacksBlockId>,
+    proof: &mut MultiproofBuilder<StacksBlockId>,
+    reads: &[EnvRead],
+) -> Result<(), String> {
+    for read in reads.iter() {
+        let EnvQuery::StacksHeightForTenureHeight { tip, tenure_height } = &read.query else {
+            continue;
+        };
+        let named = |e: String| format!("{}: {e}", read.query);
+        let answer = *read
+            .answer
+            .downcast_ref::<Option<u32>>()
+            .ok_or_else(|| named("answer has the wrong type".into()))?;
+        let tip_height = MARF::get_block_height_miner_tip(conn, tip, tip)
+            .map_err(|e| named(format!("{e:?}")))?
+            .ok_or_else(|| named("tip has no height".into()))?;
+        tenure_start_facts(tip, tip_height, *tenure_height, answer, |block, path| {
+            Ok(walk(conn, proof, block, path)?.value)
+        })
+        .map_err(named)?;
+    }
+    Ok(())
+}
+
+/// The node side of a deploy's environment lookups.
+pub trait DeployEnvSource {
+    /// Run `f` with the headers DB and the burn state the deploying block
+    /// `block` was processed under (its burn view, for a Nakamoto block).
+    fn with_env(
+        &self,
+        block: &StacksBlockId,
+        f: &mut dyn FnMut(&dyn HeadersDB, &dyn BurnStateDB),
+    ) -> Result<(), String>;
+
+    /// The tenure change that set `block`'s burn view: in `block`, else the
+    /// latest earlier in its tenure. Errors for an epoch 2.x block.
+    fn burn_view(&self, block: &StacksBlockId) -> Result<TxInclusion, String>;
+}
+
 /// The answer a deploy at `open_height` on top of `parent` gets for `query`,
 /// read from the MARF. Answers are what [`claim_of`] claims, so each is
 /// provable the way a block's own reads are.
@@ -841,6 +1037,8 @@ fn contract_evidence(
         epoch_key,
         deploy_reads: vec![],
         deploy_proofs: vec![],
+        deploy_env: vec![],
+        deploy_burn_view: None,
     })
 }
 
@@ -907,6 +1105,7 @@ fn resolve_contract(
     contract: &QualifiedContractIdentifier,
     net: &NetworkParams,
     find_deploy: &dyn Fn(&StacksBlockId, &QualifiedContractIdentifier) -> Option<TxInclusion>,
+    env_source: Option<&dyn DeployEnvSource>,
     known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
 ) -> Result<(ContractEvidence, Sha512Trunc256Sum, ContractMetadata), Resolve> {
     let mut evidence = contract_evidence(conn, parent, contract, find_deploy, net.mainnet)
@@ -914,14 +1113,17 @@ fn resolve_contract(
     let height = deploy_height(&evidence).map_err(Resolve::Fails)?;
     let mut deploy_parent = None;
     for _ in 0..MAX_DEPLOY_READ_ROUNDS {
-        let (store, env) = match rederive_unchecked(&evidence, net, known) {
-            Ok((hash, rows)) => return Ok((evidence, hash, rows)),
+        let (store, env) = match rederive_recording(&evidence, net, known, env_source) {
+            Ok((hash, rows, lookups)) => {
+                settle_deploy_env(&mut evidence, lookups, env_source).map_err(Resolve::Fails)?;
+                return Ok((evidence, hash, rows));
+            }
             Err(Rederive::Invalid(e)) => return Err(Resolve::Fails(e)),
             Err(Rederive::Missing { store, env }) => (store, env),
         };
         if !env.is_empty() {
             return Err(Resolve::Fails(format!(
-                "its deploy reads chain state not provable yet: {env:?}"
+                "its deploy makes lookups no node answered: {env:?}"
             )));
         }
         let deps: Vec<_> = store
@@ -957,6 +1159,73 @@ fn resolve_contract(
     )))
 }
 
+/// Re-derive `evidence`'s contract (the prover: no proofs checked), answering
+/// its environment lookups from `env_source` and recording them. Without a
+/// source, any lookup is missing.
+fn rederive_recording(
+    evidence: &ContractEvidence,
+    net: &NetworkParams,
+    known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
+    env_source: Option<&dyn DeployEnvSource>,
+) -> Result<(Sha512Trunc256Sum, ContractMetadata, Vec<EnvRead>), Rederive> {
+    let deploy = Deploy::of(evidence, net)?;
+    let Some(source) = env_source else {
+        let env = EnvTap::from_witness(&[]);
+        return deploy
+            .derive(evidence, net, known, &env)
+            .map(|(hash, rows)| (hash, rows, vec![]));
+    };
+    let epoch = net
+        .epoch(&deploy.epoch)
+        .cloned()
+        .ok_or_else(|| Rederive::Invalid(format!("no epoch {}", deploy.epoch)))?;
+    let mut result = None;
+    source
+        .with_env(&evidence.block, &mut |headers, burn| {
+            let env = EnvTap::recording(headers, burn, epoch.clone());
+            let derived = deploy.derive(evidence, net, known, &env);
+            let lookups = env
+                .take_recorded()
+                .map(|(_, reads)| reads)
+                .unwrap_or_default();
+            result = Some(derived.map(|(hash, rows)| (hash, rows, lookups)));
+        })
+        .map_err(|e| Rederive::Invalid(format!("deploy lookups: {e}")))?;
+    result.unwrap_or_else(|| Err(Rederive::Invalid("deploy lookups were not answered".into())))
+}
+
+/// Keep a re-derived deploy's lookups as its evidence, refusing those not
+/// provable yet and adding the burn-view proof when a lookup reads it.
+fn settle_deploy_env(
+    evidence: &mut ContractEvidence,
+    lookups: Vec<EnvRead>,
+    env_source: Option<&dyn DeployEnvSource>,
+) -> Result<(), String> {
+    let unprovable: Vec<String> = lookups
+        .iter()
+        .filter(|r| EnvClass::of(&r.query) == EnvClass::Unprovable)
+        .map(|r| r.query.to_string())
+        .collect();
+    if !unprovable.is_empty() {
+        return Err(format!(
+            "its deploy reads chain state not provable yet: {unprovable:?}"
+        ));
+    }
+    let reads_view = lookups
+        .iter()
+        .any(|r| EnvClass::of(&r.query) == EnvClass::BurnView);
+    evidence.deploy_burn_view = match (reads_view, env_source) {
+        (true, Some(source)) => Some(
+            source
+                .burn_view(&evidence.block)
+                .map_err(|e| format!("its deploy reads the burn view, not provable: {e}"))?,
+        ),
+        _ => None,
+    };
+    evidence.deploy_env = lookups;
+    Ok(())
+}
+
 /// Walk every MARF fact `evidence` stands on into `proof`: commitment and
 /// epoch key at the deploying block, its ancestry at `parent`, and for a
 /// deploy witness, the deploying block's parent and each deploy read (plus,
@@ -984,6 +1253,7 @@ fn prove_contract_facts(
         return Err("deploy block is not an ancestor".into());
     }
     evidence.deploy_proofs.clear();
+    prove_env_reads(conn, proof, &evidence.deploy_env)?;
     if evidence.deploy_reads.is_empty() {
         return Ok(());
     }
@@ -1026,9 +1296,11 @@ pub type UnprovenContracts = Vec<(QualifiedContractIdentifier, String)>;
 /// dependencies come first. Dependencies are found by re-deriving (at most
 /// [`MAX_DEPENDENCY_DEPTH`] deep). A contract whose deploy reads chain state
 /// carries a deploy witness: those reads, answered at its deploying block's
-/// parent. Contracts that cannot be re-derived come back separately, with the
-/// reason (their metadata can only be served as is). Only the evidence that
-/// is served has its MARF facts walked into `proof`.
+/// parent, and its environment lookups, answered by `env_source` (without
+/// one, a deploy that makes lookups is not re-derivable). Contracts that
+/// cannot be re-derived come back separately, with the reason (their
+/// metadata can only be served as is). Only the evidence that is served has
+/// its MARF facts walked into `proof`.
 pub fn prove_contracts(
     conn: &mut TrieStorageConnection<StacksBlockId>,
     proof: &mut MultiproofBuilder<StacksBlockId>,
@@ -1036,6 +1308,7 @@ pub fn prove_contracts(
     witness: &ReadWitness,
     net: &NetworkParams,
     find_deploy: &dyn Fn(&StacksBlockId, &QualifiedContractIdentifier) -> Option<TxInclusion>,
+    env_source: Option<&dyn DeployEnvSource>,
 ) -> Result<(Vec<ContractEvidence>, UnprovenContracts), String> {
     let mut ordered: Vec<ContractEvidence> = vec![];
     // contracts still to resolve, with how deep a dependency each is
@@ -1055,7 +1328,15 @@ pub fn prove_contracts(
             pending.pop();
             continue;
         }
-        match resolve_contract(conn, parent, &contract, net, find_deploy, &derived) {
+        match resolve_contract(
+            conn,
+            parent,
+            &contract,
+            net,
+            find_deploy,
+            env_source,
+            &derived,
+        ) {
             Ok((evidence, hash, rows)) => {
                 derived.insert(contract, (hash, rows));
                 ordered.push(evidence);
@@ -1280,15 +1561,15 @@ pub const DEPLOY_READ_ORDER_ASSUMED: &str = "deploy read (block also wrote key; 
 
 /// Check one contract's evidence (deploy block an ancestor of `parent`,
 /// commitment, epoch, source, deploy witness) and re-derive its metadata.
+/// `ctx` checks the deploy's lookups (its burn view is the deploy's own).
 fn rederive(
     evidence: &ContractEvidence,
     parent: &StacksBlockId,
-    headers: &HeaderChain,
-    marf: &OpenedProof,
-    net: &NetworkParams,
+    ctx: &EnvContext,
     known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
     kinds: &mut BTreeMap<&'static str, usize>,
 ) -> Result<(Sha512Trunc256Sum, ContractMetadata), Rederive> {
+    let (headers, marf, net) = (ctx.headers, ctx.marf, ctx.net);
     let invalid = |s: String| Rederive::Invalid(s);
     let header = headers
         .get(&evidence.block)
@@ -1329,7 +1610,48 @@ fn rederive(
         )));
     }
     verify_deploy_reads(evidence, header, headers, marf, kinds)?;
-    deploy.derive(evidence, net, known)
+    verify_deploy_env(evidence, header, ctx, kinds)?;
+    let env = EnvTap::from_witness(&evidence.deploy_env);
+    deploy.derive(evidence, net, known, &env)
+}
+
+/// Check every lookup a contract's deploy made, as a block's own lookups are
+/// checked, with the deploying block's burn view (from its tenure change).
+fn verify_deploy_env(
+    evidence: &ContractEvidence,
+    header: &ChainHeader,
+    ctx: &EnvContext,
+    kinds: &mut BTreeMap<&'static str, usize>,
+) -> Result<(), Rederive> {
+    let invalid = |s: String| Rederive::Invalid(s);
+    let view = match &evidence.deploy_burn_view {
+        None => None,
+        Some(inclusion) => {
+            if !header.is_nakamoto() {
+                return Err(invalid(
+                    "an epoch 2.x deploy has no tenure-change burn view".into(),
+                ));
+            }
+            let ch = tenure_change_view(header, inclusion, ctx.headers)
+                .map_err(|e| invalid(format!("deploy burn view: {e}")))?;
+            let (binding, btc) = ctx
+                .burn
+                .block_of(&ch)
+                .map_err(|e| invalid(format!("deploy burn view: {e}")))?;
+            Some((binding.sortition_id(), btc.height))
+        }
+    };
+    let ctx = EnvContext {
+        view,
+        ..ctx.clone()
+    };
+    for read in evidence.deploy_env.iter() {
+        verify_env(read, &ctx).map_err(|e| invalid(format!("deploy lookup {read:?}: {e}")))?;
+        *kinds
+            .entry(EnvClass::of(&read.query).deploy_label())
+            .or_default() += 1;
+    }
+    Ok(())
 }
 
 /// Check a contract's deploy witness: the deploying block's parent (its own
@@ -1404,16 +1726,6 @@ fn verify_deploy_reads(
     Ok(())
 }
 
-/// Re-derive a contract's metadata from evidence the caller produced itself
-/// (the prover: no proofs checked).
-fn rederive_unchecked(
-    evidence: &ContractEvidence,
-    net: &NetworkParams,
-    known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
-) -> Result<(Sha512Trunc256Sum, ContractMetadata), Rederive> {
-    Deploy::of(evidence, net)?.derive(evidence, net, known)
-}
-
 /// The deploy a contract's evidence describes.
 struct Deploy {
     tx: StacksTransaction,
@@ -1463,6 +1775,7 @@ impl Deploy {
         evidence: &ContractEvidence,
         net: &NetworkParams,
         known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
+        env: &EnvTap,
     ) -> Result<(Sha512Trunc256Sum, ContractMetadata), Rederive> {
         let deploy = ContractDeployment {
             tx: &self.tx,
@@ -1470,6 +1783,7 @@ impl Deploy {
             epoch: self.epoch,
             epoch_key: evidence.epoch_key.clone(),
             reads: &evidence.deploy_reads,
+            env,
         };
         match derive_contract_metadata(&deploy, known, net.mainnet, net.chain_id) {
             Ok((id, rows)) if id == evidence.contract => Ok((self.commitment.hash.clone(), rows)),
@@ -1709,6 +2023,10 @@ fn check_block_context(
         marf: marf.stats(),
         ..Default::default()
     };
+    let ctx = EnvContext {
+        view: Some((view_binding.sortition_id(), view_block.height)),
+        ..EnvContext::new(trusted, &burn, &marf, &proven.coinbases)
+    };
     // store entries
     for ((query, answer), proof) in witness.store.iter().zip(proven.store.iter()) {
         if let Err(e) = verify_store_entry(
@@ -1725,26 +2043,10 @@ fn check_block_context(
     }
 
     // contract metadata
-    let rejections = verify_metadata(
-        witness,
-        proven,
-        &parent.id,
-        headers,
-        &marf,
-        net,
-        &mut check.kinds,
-    );
+    let rejections = verify_metadata(witness, proven, &parent.id, &ctx, &mut check.kinds);
     check.rejections.extend(rejections);
 
     // environment lookups
-    let ctx = EnvContext {
-        headers,
-        burn: &burn,
-        net,
-        coinbases: &proven.coinbases,
-        view_sortition: view_binding.sortition_id(),
-        view_height: view_block.height,
-    };
     for read in witness.env.iter() {
         if let Err(e) = verify_env(read, &ctx) {
             check.rejections.push(reject(read, e));
@@ -1836,16 +2138,14 @@ struct Rederived {
 fn rederive_contracts(
     proven: &ProvenWitness,
     parent: &StacksBlockId,
-    headers: &HeaderChain,
-    marf: &OpenedProof,
-    net: &NetworkParams,
+    ctx: &EnvContext,
     kinds: &mut BTreeMap<&'static str, usize>,
 ) -> (Rederived, Vec<Rejection>) {
     let mut known = HashMap::new();
     let mut deployed_in = HashMap::new();
     let mut rejections = vec![];
     for evidence in proven.contracts.iter() {
-        match rederive(evidence, parent, headers, marf, net, &known, kinds) {
+        match rederive(evidence, parent, ctx, &known, kinds) {
             Ok(derived) => {
                 known.insert(evidence.contract.clone(), derived);
                 deployed_in.insert(evidence.contract.to_string(), evidence.block.clone());
@@ -1898,12 +2198,10 @@ fn verify_metadata(
     witness: &ReadWitness,
     proven: &ProvenWitness,
     parent: &StacksBlockId,
-    headers: &HeaderChain,
-    marf: &OpenedProof,
-    net: &NetworkParams,
+    ctx: &EnvContext,
     kinds: &mut BTreeMap<&'static str, usize>,
 ) -> Vec<Rejection> {
-    let (rederived, mut rejections) = rederive_contracts(proven, parent, headers, marf, net, kinds);
+    let (rederived, mut rejections) = rederive_contracts(proven, parent, ctx, kinds);
     for ((query, answer), proof) in witness.store.iter().zip(proven.store.iter()) {
         if !matches!(query, StoreQuery::Metadata { .. }) || !matches!(proof, StoreProof::Rederived)
         {
@@ -1937,15 +2235,15 @@ fn verify_metadata(
 pub fn fill_rederived_metadata(
     proven: &mut ProvenWitness,
     block: &StacksBlockId,
-    headers: &HeaderChain,
-    net: &NetworkParams,
+    trusted: &TrustedState,
 ) -> Vec<String> {
-    let Some(parent) = headers.get(block).map(|h| h.parent.clone()) else {
+    let Some(parent) = trusted.headers.get(block).map(|h| h.parent.clone()) else {
         return vec![];
     };
-    let marf = OpenedProof::open(&proven.marf, headers);
-    let (rederived, _) =
-        rederive_contracts(proven, &parent, headers, &marf, net, &mut BTreeMap::new());
+    let marf = OpenedProof::open(&proven.marf, trusted.headers);
+    let burn = BurnFacts::new(&proven.burn, trusted.bitcoin);
+    let ctx = EnvContext::new(trusted, &burn, &marf, &proven.coinbases);
+    let (rederived, _) = rederive_contracts(proven, &parent, &ctx, &mut BTreeMap::new());
     let mut unfilled = BTreeSet::new();
     for ((query, answer), proof) in proven.witness.store.iter_mut().zip(proven.store.iter()) {
         if !matches!(proof, StoreProof::Rederived) {
@@ -1982,39 +2280,69 @@ fn burn_view_of(
         .burn_view
         .as_ref()
         .ok_or("no tenure change in the block and no burn-view proof")?;
+    let header = headers.get(block).ok_or("unknown block")?;
+    tenure_change_view(header, inclusion, headers)
+}
+
+/// The burn view `inclusion` sets for `block`: a tenure change in `block`
+/// itself, or in an earlier block of its tenure (reached through parents with
+/// the same consensus hash). Whether a later tenure extend came in between
+/// is not checked (`NOTES.md`, burn-view recency).
+fn tenure_change_view(
+    block: &ChainHeader,
+    inclusion: &TxInclusion,
+    headers: &HeaderChain,
+) -> Result<ConsensusHash, String> {
     if !inclusion.holds(headers) {
         return Err("burn-view tenure change is not in its block".into());
     }
-    let header = headers.get(block).ok_or("unknown block")?;
-    let source = headers
-        .get(&inclusion.block)
-        .ok_or("unknown burn-view block")?;
-    // same tenure: an ancestor reached through blocks of this consensus hash
-    let mut cursor = headers.get(&header.parent);
-    let mut found = false;
-    while let Some(h) = cursor {
-        if h.consensus_hash != header.consensus_hash {
+    let mut found = inclusion.block == block.id;
+    let mut cursor = headers.get(&block.parent);
+    while let Some(h) = cursor.filter(|_| !found) {
+        if h.consensus_hash != block.consensus_hash {
             break;
         }
-        if h.id == source.id {
-            found = true;
-            break;
-        }
+        found = h.id == inclusion.block;
         cursor = headers.get(&h.parent);
     }
     if !found {
         return Err("burn-view tenure change is not earlier in this tenure".into());
     }
-    tenure_change(&inclusion.tx).ok_or_else(|| "burn-view proof is not a tenure change".into())
+    match &inclusion.tx.payload {
+        TransactionPayload::TenureChange(tc) => Ok(tc.burn_view_consensus_hash.clone()),
+        _ => Err("burn-view proof is not a tenure change".into()),
+    }
 }
 
+/// What environment lookups are checked against.
+#[derive(Clone)]
 struct EnvContext<'a> {
     headers: &'a HeaderChain,
     burn: &'a BurnFacts<'a>,
     net: &'a NetworkParams,
     coinbases: &'a [TxInclusion],
-    view_sortition: SortitionId,
-    view_height: u32,
+    marf: &'a OpenedProof,
+    /// The burn view's sortition and Bitcoin height (`None`: not proven, so
+    /// lookups through it are rejected).
+    view: Option<(SortitionId, u32)>,
+}
+
+impl<'a> EnvContext<'a> {
+    fn new(
+        trusted: &TrustedState<'a>,
+        burn: &'a BurnFacts<'a>,
+        marf: &'a OpenedProof,
+        coinbases: &'a [TxInclusion],
+    ) -> Self {
+        EnvContext {
+            headers: trusted.headers,
+            burn,
+            net: trusted.net,
+            coinbases,
+            marf,
+            view: None,
+        }
+    }
 }
 
 /// Header lookups go through one of two tables picked by the epoch argument;
@@ -2038,6 +2366,11 @@ fn verify_env(read: &EnvRead, ctx: &EnvContext) -> Result<(), String> {
             .ok_or_else(|| format!("unknown block {id}"))
     };
     let pox = &ctx.net.pox;
+    let view = || {
+        ctx.view
+            .clone()
+            .ok_or("no burn view proven for this lookup")
+    };
     match &read.query {
         // (a) the header chain
         StacksBlockHeaderHash { id, epoch } => expect_answer(
@@ -2078,8 +2411,8 @@ fn verify_env(read: &EnvRead, ctx: &EnvContext) -> Result<(), String> {
             };
             expect_answer(read, time)
         }
-        TipBurnBlockHeight => expect_answer(read, Some(ctx.view_height)),
-        TipSortitionId => expect_answer(read, Some(ctx.view_sortition.clone())),
+        TipBurnBlockHeight => expect_answer(read, Some(view()?.1)),
+        TipSortitionId => expect_answer(read, Some(view()?.0)),
         BurnBlockHeight { sortition } => {
             expect_answer(read, Some(ctx.burn.height_of_sortition(sortition)?))
         }
@@ -2088,10 +2421,11 @@ fn verify_env(read: &EnvRead, ctx: &EnvContext) -> Result<(), String> {
             expect_answer(read, Some(binding.sortition_id()))
         }
         BurnHeaderHash { height, sortition } => {
-            if sortition != &ctx.view_sortition {
+            let (view_sortition, view_height) = view()?;
+            if sortition != &view_sortition {
                 return Err("only the burn view's fork is proven".into());
             }
-            let expected = if *height > ctx.view_height || *height < ctx.net.first_burn_height {
+            let expected = if *height > view_height || *height < ctx.net.first_burn_height {
                 None
             } else {
                 Some(
@@ -2118,13 +2452,31 @@ fn verify_env(read: &EnvRead, ctx: &EnvContext) -> Result<(), String> {
         PoxPrepareLength => expect_answer(read, pox.prepare_length),
         PoxRewardCycleLength => expect_answer(read, pox.reward_cycle_length),
         PoxRejectionFraction => expect_answer(read, pox.pox_rejection_fraction),
+        // MARF walks at the tip's fork
+        StacksHeightForTenureHeight { tip, tenure_height } => {
+            let answer = *read
+                .answer
+                .downcast_ref::<Option<u32>>()
+                .ok_or("answer has the wrong type")?;
+            tenure_start_facts(
+                tip,
+                header(tip)?.height,
+                *tenure_height,
+                answer,
+                |block, path| {
+                    ctx.marf
+                        .get(block, path)
+                        .map(|end| end.value)
+                        .map_err(|e| format!("MARF proof fails: {e}"))
+                },
+            )
+        }
         // (c)/(d): not provable yet
         MinerAddress { .. }
         | TokensSpent { .. }
         | TokensSpentWinning { .. }
         | TokensEarned { .. }
-        | PoxPayoutAddrs { .. }
-        | StacksHeightForTenureHeight { .. } => Err("not provable yet".into()),
+        | PoxPayoutAddrs { .. } => Err("not provable yet".into()),
     }
 }
 
@@ -2147,7 +2499,6 @@ fn tenure_vrf_proof(ch: &ConsensusHash, ctx: &EnvContext) -> Result<Option<VRFPr
 
 #[cfg(test)]
 mod tests {
-    use clarity::vm::database::ClaritySerializable;
     use stacks_common::consts::CHAIN_ID_MAINNET;
 
     use super::*;
@@ -2197,12 +2548,14 @@ mod tests {
         let deploy_with = |name: &str, epoch: StacksEpochId, known: &HashMap<_, _>| {
             let id = boot_code_id(name, true);
             let tx = boot_deploy_tx(&id, &net).unwrap_or_else(|| panic!("no source for {name}"));
+            let env = EnvTap::from_witness(&[]);
             let deploy = ContractDeployment {
                 tx: &tx,
                 height: 1,
                 epoch,
                 epoch_key: (epoch != Epoch20).then(|| (epoch as u32).serialize()),
                 reads: &[],
+                env: &env,
             };
             let TransactionPayload::SmartContract(ref payload, _) = tx.payload else {
                 unreachable!()

@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::Instant;
 
+use clarity::vm::database::{BurnStateDB, HeadersDB};
 use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier};
 use stacks_common::types::chainstate::{ConsensusHash, StacksBlockId};
 
@@ -31,11 +32,11 @@ use crate::chainstate::stacks::db::{StacksBlockHeaderTypes, StacksChainState, St
 use crate::chainstate::stacks::index::marf::MarfConnection;
 use crate::chainstate::stacks::index::multiproof::MultiproofBuilder;
 use crate::chainstate::stacks::{StacksTransaction, TransactionPayload};
-use crate::clarity_vm::read_witness::{EnvQuery, ReadWitness, StoreQuery};
+use crate::clarity_vm::read_witness::{EnvQuery, EnvRead, ReadWitness, StoreQuery};
 use crate::clarity_vm::state_writes::StateWrite;
 use crate::clarity_vm::witness_proof::{
-    mark_served_metadata, prove_contracts, prove_store_reads, prove_writes, BitcoinHeader,
-    BurnBinding, NetworkParams, ProvenWitness, TxInclusion,
+    mark_served_metadata, prove_contracts, prove_env_reads, prove_store_reads, prove_writes,
+    BitcoinHeader, BurnBinding, DeployEnvSource, NetworkParams, ProvenWitness, TxInclusion,
 };
 use crate::clarity_vm::witness_wire::{ServedHeader, ServedWitness, WriteProof};
 use crate::core::FIRST_STACKS_BLOCK_ID;
@@ -156,6 +157,160 @@ impl NodeBlocks<'_> {
             .position(pick)
             .map(|index| TxInclusion::new(id.clone(), &txs, index)))
     }
+
+    /// The latest tenure change in tenure `tenure` at or before `start`,
+    /// walking back through blocks of that tenure, and every block walked (a
+    /// header the client walks too).
+    fn burn_view_change(
+        &self,
+        start: &StacksBlockId,
+        tenure: &ConsensusHash,
+    ) -> Result<(TxInclusion, Vec<StacksBlockId>), String> {
+        let mut walked = vec![];
+        let mut cursor = start.clone();
+        loop {
+            let info = self.header(&cursor)?;
+            if &info.consensus_hash != tenure {
+                return Err("no tenure change earlier in this tenure".into());
+            }
+            walked.push(cursor.clone());
+            if let Some(inclusion) = self.include(&cursor, is_tenure_change)? {
+                return Ok((inclusion, walked));
+            }
+            let StacksBlockHeaderTypes::Nakamoto(h) = &info.anchored_header else {
+                return Err("tenure reaches an epoch 2.x block".into());
+            };
+            cursor = h.parent_block_id.clone();
+        }
+    }
+}
+
+/// The consensus hash a tenure change sets as the burn view.
+fn view_of(tx: &StacksTransaction) -> Result<ConsensusHash, String> {
+    match &tx.payload {
+        TransactionPayload::TenureChange(tc) => Ok(tc.burn_view_consensus_hash.clone()),
+        _ => Err("burn-view proof is not a tenure change".into()),
+    }
+}
+
+/// A deploy's environment, as the node processed its deploying block: the
+/// headers DB, and the sortition DB at that block's burn view.
+struct NodeDeployEnv<'a> {
+    sortdb: &'a SortitionDB,
+    headers: &'a dyn HeadersDB,
+    blocks: &'a NodeBlocks<'a>,
+}
+
+impl DeployEnvSource for NodeDeployEnv<'_> {
+    fn with_env(
+        &self,
+        block: &StacksBlockId,
+        f: &mut dyn FnMut(&dyn HeadersDB, &dyn BurnStateDB),
+    ) -> Result<(), String> {
+        let info = self.blocks.header(block)?;
+        // an epoch 2.x block ran under its own sortition; lookups through it
+        // are refused as unprovable when the deploy witness is settled
+        let view = match &info.anchored_header {
+            StacksBlockHeaderTypes::Nakamoto(_) => view_of(&self.burn_view(block)?.tx)?,
+            StacksBlockHeaderTypes::Epoch2(_) => info.consensus_hash,
+        };
+        let sn = SortitionDB::get_block_snapshot_consensus(self.sortdb.conn(), &view)
+            .map_err(|e| format!("burn view {view}: {e:?}"))?
+            .ok_or_else(|| format!("burn view {view} has no snapshot"))?;
+        let burn = self.sortdb.index_handle(&sn.sortition_id);
+        f(self.headers, &burn);
+        Ok(())
+    }
+
+    fn burn_view(&self, block: &StacksBlockId) -> Result<TxInclusion, String> {
+        let info = self.blocks.header(block)?;
+        if !matches!(info.anchored_header, StacksBlockHeaderTypes::Nakamoto(_)) {
+            return Err("an epoch 2.x block has no tenure-change burn view".into());
+        }
+        Ok(self.blocks.burn_view_change(block, &info.consensus_hash)?.0)
+    }
+}
+
+/// What a set of environment lookups needs served besides the lookups:
+/// headers of the blocks they name, preimages of the consensus hashes they
+/// bind to, tenure-start coinbases (VRF seeds), and Bitcoin headers at burn
+/// heights read on a burn view's fork.
+#[derive(Default)]
+struct EnvNeeds {
+    blocks: BTreeSet<StacksBlockId>,
+    chs: Vec<ConsensusHash>,
+    tenure_starts: BTreeMap<ConsensusHash, StacksBlockId>,
+    /// (burn view, height)
+    burn_heights: BTreeSet<(ConsensusHash, u32)>,
+}
+
+impl EnvNeeds {
+    /// Add `reads`, evaluated under burn view `view` (`None`: no burn-view
+    /// lookups) on the fork of `tip`.
+    fn add(
+        &mut self,
+        reads: &[EnvRead],
+        view: Option<&ConsensusHash>,
+        tip: &StacksBlockId,
+        blocks: &NodeBlocks,
+        sortdb: &SortitionDB,
+        chainstate: &StacksChainState,
+    ) -> Result<(), String> {
+        for read in reads.iter() {
+            use EnvQuery::*;
+            match &read.query {
+                StacksBlockHeaderHash { id, .. }
+                | BurnHeaderHashForBlock { id }
+                | ConsensusHashForBlock { id, .. }
+                | StacksBlockTime { id }
+                | BurnBlockTime { id, .. }
+                | BurnBlockHeightForBlock { id }
+                | MinerAddress { id, .. }
+                | TokensSpent { id, .. }
+                | TokensSpentWinning { id, .. }
+                | TokensEarned { id, .. } => {
+                    self.blocks.insert(id.clone());
+                    self.chs.push(blocks.header(id)?.consensus_hash);
+                }
+                VrfSeed { id, epoch, .. } => {
+                    self.blocks.insert(id.clone());
+                    let ch = blocks.header(id)?.consensus_hash;
+                    if epoch.uses_nakamoto_blocks() && !self.tenure_starts.contains_key(&ch) {
+                        let start = NakamotoChainState::get_nakamoto_tenure_start_block_header(
+                            &mut chainstate.index_conn(),
+                            tip,
+                            &ch,
+                        )
+                        .map_err(|e| format!("tenure {ch}: {e:?}"))?
+                        .ok_or_else(|| format!("no tenure start for {ch}"))?;
+                        self.tenure_starts
+                            .insert(ch.clone(), start.index_block_hash());
+                    }
+                    self.chs.push(ch);
+                }
+                SortitionIdFromConsensusHash { consensus_hash } => {
+                    self.chs.push(consensus_hash.clone())
+                }
+                BurnBlockHeight { sortition } => {
+                    let sn = SortitionDB::get_block_snapshot(sortdb.conn(), sortition)
+                        .map_err(|e| format!("sortition {sortition}: {e:?}"))?
+                        .ok_or_else(|| format!("no sortition {sortition}"))?;
+                    self.chs.push(sn.consensus_hash);
+                }
+                TipBurnBlockHeight | TipSortitionId => {
+                    self.chs.extend(view.cloned());
+                }
+                BurnHeaderHash { height, .. } => {
+                    if let Some(view) = view {
+                        self.chs.push(view.clone());
+                        self.burn_heights.insert((view.clone(), *height));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 fn deploys(contract: &QualifiedContractIdentifier) -> impl Fn(&StacksTransaction) -> bool + '_ {
@@ -203,117 +358,31 @@ pub fn serve_witness(
     let burn_view = if block.txs.iter().any(is_tenure_change) {
         None
     } else {
-        let mut cursor = parent.clone();
-        loop {
-            let info = blocks.header(&cursor)?;
-            if info.consensus_hash != block.header.consensus_hash {
-                return Err("no tenure change earlier in this tenure".into());
-            }
-            needed.insert(cursor.clone());
-            if let Some(inclusion) = blocks.include(&cursor, is_tenure_change)? {
-                break Some(inclusion);
-            }
-            let StacksBlockHeaderTypes::Nakamoto(h) = &info.anchored_header else {
-                return Err("tenure reaches an epoch 2.x block".into());
-            };
-            cursor = h.parent_block_id.clone();
-        }
+        let (inclusion, walked) = blocks.burn_view_change(&parent, &block.header.consensus_hash)?;
+        needed.extend(walked);
+        Some(inclusion)
     };
-    let view_ch = block
-        .txs
-        .iter()
-        .chain(burn_view.iter().map(|i| &i.tx))
-        .find_map(|tx| match &tx.payload {
-            TransactionPayload::TenureChange(tc) => Some(tc.burn_view_consensus_hash.clone()),
-            _ => None,
-        })
-        .ok_or("no burn view")?;
-    let view_sn = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), &view_ch)
-        .map_err(|e| format!("burn view: {e:?}"))?
-        .ok_or("burn view has no snapshot")?;
+    let view_ch = match block.txs.iter().find(|tx| is_tenure_change(tx)) {
+        Some(tx) => view_of(tx)?,
+        None => view_of(&burn_view.as_ref().ok_or("no burn view")?.tx)?,
+    };
 
-    // consensus hashes whose preimages lookups need; blocks they name
-    let mut chs: Vec<ConsensusHash> = vec![view_ch, blocks.header(&parent)?.consensus_hash];
-    let mut tenure_starts: BTreeMap<ConsensusHash, StacksBlockId> = BTreeMap::new();
-    let mut burn_heights: BTreeSet<u32> = BTreeSet::new();
-    for read in witness.env.iter() {
-        use EnvQuery::*;
-        match &read.query {
-            StacksBlockHeaderHash { id, .. }
-            | BurnHeaderHashForBlock { id }
-            | ConsensusHashForBlock { id, .. }
-            | StacksBlockTime { id }
-            | BurnBlockTime { id, .. }
-            | BurnBlockHeightForBlock { id }
-            | MinerAddress { id, .. }
-            | TokensSpent { id, .. }
-            | TokensSpentWinning { id, .. }
-            | TokensEarned { id, .. } => {
-                needed.insert(id.clone());
-                chs.push(blocks.header(id)?.consensus_hash);
-            }
-            VrfSeed { id, epoch, .. } => {
-                needed.insert(id.clone());
-                let ch = blocks.header(id)?.consensus_hash;
-                if epoch.uses_nakamoto_blocks() && !tenure_starts.contains_key(&ch) {
-                    let start = NakamotoChainState::get_nakamoto_tenure_start_block_header(
-                        &mut chainstate.index_conn(),
-                        &parent,
-                        &ch,
-                    )
-                    .map_err(|e| format!("tenure {ch}: {e:?}"))?
-                    .ok_or_else(|| format!("no tenure start for {ch}"))?;
-                    tenure_starts.insert(ch.clone(), start.index_block_hash());
-                }
-                chs.push(ch);
-            }
-            SortitionIdFromConsensusHash { consensus_hash } => chs.push(consensus_hash.clone()),
-            BurnBlockHeight { sortition } => {
-                let sn = SortitionDB::get_block_snapshot(sortdb.conn(), sortition)
-                    .map_err(|e| format!("sortition {sortition}: {e:?}"))?
-                    .ok_or_else(|| format!("no sortition {sortition}"))?;
-                chs.push(sn.consensus_hash);
-            }
-            BurnHeaderHash { height, .. } => {
-                burn_heights.insert(*height);
-            }
-            _ => {}
-        }
-    }
-    let mut coinbases = vec![];
-    for (ch, start) in tenure_starts.iter() {
-        let inclusion = blocks
-            .include(start, is_coinbase)?
-            .ok_or_else(|| format!("tenure {ch} starts without a coinbase"))?;
-        needed.insert(start.clone());
-        coinbases.push(inclusion);
-    }
-    let mut seen = HashSet::new();
-    chs.retain(|ch| seen.insert(ch.clone()));
-    let burn = chs
-        .iter()
-        .map(|ch| burn_binding(sortdb, ch))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Bitcoin headers: every bound burn block, and burn heights read on the
-    // burn view's fork
-    let mut bitcoin: BTreeMap<u32, BitcoinHeader> = BTreeMap::new();
-    for ch in chs.iter() {
-        let header = bitcoin_header(sortdb, ch)?;
-        bitcoin.insert(header.height, header);
-    }
-    let view_handle = sortdb.index_handle(&view_sn.sortition_id);
-    for height in burn_heights {
-        if u64::from(height) > view_sn.block_height || u64::from(height) < sortdb.first_block_height
-        {
-            continue;
-        }
-        let sn = view_handle
-            .get_block_snapshot_by_height(u64::from(height))
-            .map_err(|e| format!("burn height {height}: {e:?}"))?
-            .ok_or_else(|| format!("no burn block at {height}"))?;
-        bitcoin.insert(height, bitcoin_header(sortdb, &sn.consensus_hash)?);
-    }
+    // what the block's own lookups need
+    let mut env = EnvNeeds::default();
+    env.chs = vec![view_ch.clone(), blocks.header(&parent)?.consensus_hash];
+    env.add(
+        &witness.env,
+        Some(&view_ch),
+        &parent,
+        &blocks,
+        sortdb,
+        chainstate,
+    )?;
+    let deploy_env = NodeDeployEnv {
+        sortdb,
+        headers: &chainstate.state_index,
+        blocks: &blocks,
+    };
 
     // `at-block` targets
     for (query, _) in witness.store.iter() {
@@ -348,6 +417,7 @@ pub fn serve_witness(
                     let started = Instant::now();
                     info!("Witness: walking {} store entries", witness.store.len());
                     let store = prove_store_reads(conn, &mut reads, &parent, witness)?;
+                    prove_env_reads(conn, &mut reads, &witness.env)?;
                     info!(
                         "Witness: walked {} store entries in {:?}",
                         store.len(),
@@ -362,11 +432,22 @@ pub fn serve_witness(
                                 .flatten()
                         };
                     let (contracts, unproven) =
-                        prove_contracts(conn, &mut reads, &parent, witness, &net, &find_deploy)?;
+                        prove_contracts(
+                            conn,
+                            &mut reads,
+                            &parent,
+                            witness,
+                            &net,
+                            &find_deploy,
+                            Some(&deploy_env),
+                        )?;
                     info!(
                         "Witness: proved {} contracts ({} with a deploy witness, {} unprovable) in {:?}",
                         contracts.len(),
-                        contracts.iter().filter(|c| !c.deploy_reads.is_empty()).count(),
+                        contracts
+                            .iter()
+                            .filter(|c| !c.deploy_reads.is_empty() || !c.deploy_env.is_empty())
+                            .count(),
                         unproven.len(),
                         started.elapsed()
                     );
@@ -411,6 +492,70 @@ pub fn serve_witness(
                 proven
             })
         })?;
+
+    // what the deploys' lookups need, under each deploying block's burn view
+    for evidence in contracts.iter() {
+        let view = match &evidence.deploy_burn_view {
+            Some(inclusion) => {
+                let deployed = blocks.header(&evidence.block)?;
+                let (_, walked) =
+                    blocks.burn_view_change(&evidence.block, &deployed.consensus_hash)?;
+                needed.extend(walked);
+                Some(view_of(&inclusion.tx)?)
+            }
+            None => None,
+        };
+        env.chs.extend(view.clone());
+        env.add(
+            &evidence.deploy_env,
+            view.as_ref(),
+            &parent,
+            &blocks,
+            sortdb,
+            chainstate,
+        )?;
+    }
+
+    let mut coinbases = vec![];
+    for (ch, start) in env.tenure_starts.iter() {
+        let inclusion = blocks
+            .include(start, is_coinbase)?
+            .ok_or_else(|| format!("tenure {ch} starts without a coinbase"))?;
+        needed.insert(start.clone());
+        coinbases.push(inclusion);
+    }
+    let mut seen = HashSet::new();
+    env.chs.retain(|ch| seen.insert(ch.clone()));
+    let burn = env
+        .chs
+        .iter()
+        .map(|ch| burn_binding(sortdb, ch))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Bitcoin headers: every bound burn block, and burn heights read on a
+    // burn view's fork
+    let mut bitcoin: BTreeMap<u32, BitcoinHeader> = BTreeMap::new();
+    for ch in env.chs.iter() {
+        let header = bitcoin_header(sortdb, ch)?;
+        bitcoin.insert(header.height, header);
+    }
+    for (view, height) in env.burn_heights.iter() {
+        let view_sn = SortitionDB::get_block_snapshot_consensus(sortdb.conn(), view)
+            .map_err(|e| format!("burn view: {e:?}"))?
+            .ok_or("burn view has no snapshot")?;
+        let height = u64::from(*height);
+        if height > view_sn.block_height || height < sortdb.first_block_height {
+            continue;
+        }
+        let sn = sortdb
+            .index_handle(&view_sn.sortition_id)
+            .get_block_snapshot_by_height(height)
+            .map_err(|e| format!("burn height {height}: {e:?}"))?
+            .ok_or_else(|| format!("no burn block at {height}"))?;
+        let header = bitcoin_header(sortdb, &sn.consensus_hash)?;
+        bitcoin.insert(header.height, header);
+    }
+    needed.extend(env.blocks);
 
     let mut proven = ProvenWitness {
         witness: witness.clone(),

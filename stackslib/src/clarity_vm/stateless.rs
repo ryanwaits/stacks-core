@@ -170,13 +170,17 @@ pub struct ContractDeployment<'a> {
     pub epoch_key: Option<String>,
     /// Chain state the deploy read (its deploy witness), as it answered.
     pub reads: &'a [(StoreQuery, Option<String>)],
+    /// Answers the deploy's environment lookups: from its deploy witness
+    /// (`EnvTap::from_witness`), or from a node's databases, recording them
+    /// (`EnvTap::recording`, the prover).
+    pub env: &'a EnvTap<'a>,
 }
 
 /// Why a contract's metadata could not be re-derived.
 #[derive(Debug)]
 pub enum DeriveError {
     /// The deploy read chain state its deploy witness does not hold (store
-    /// queries), or made environment lookups (not provable in a deploy yet).
+    /// queries, environment lookups).
     Missing {
         store: Vec<StoreQuery>,
         env: Vec<String>,
@@ -191,10 +195,10 @@ pub enum DeriveError {
 /// `known` contracts (already re-derived; source hash and metadata).
 ///
 /// Re-derivation is exact when analysis and initialization read nothing but
-/// those contracts, the deploy context (sender, sponsor, height, epoch) and
-/// `deploy.reads`: any other read fails with [`DeriveError::Missing`], naming
-/// it. A contract whose top-level code reads chain state carries those reads
-/// as its deploy witness (see `NOTES.md`).
+/// those contracts, the deploy context (sender, sponsor, height, epoch),
+/// `deploy.reads` and `deploy.env`: any other read fails with
+/// [`DeriveError::Missing`], naming it. A contract whose top-level code reads
+/// chain state carries those reads as its deploy witness (see `NOTES.md`).
 pub fn derive_contract_metadata(
     deploy: &ContractDeployment,
     known: &HashMap<QualifiedContractIdentifier, (Sha512Trunc256Sum, ContractMetadata)>,
@@ -264,11 +268,11 @@ pub fn derive_contract_metadata(
         missing.clone(),
         metadata.clone(),
     );
-    let env = EnvTap::from_witness(&[]);
+    let env = deploy.env;
     let mut conn = ClarityBlockConnection::from_writable_store_unmetered(
         Box::new(store),
-        &env,
-        &env,
+        env,
+        env,
         mainnet,
         chain_id,
         deploy.epoch,

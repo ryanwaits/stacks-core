@@ -37,11 +37,11 @@ use crate::chainstate::nakamoto::NakamotoBlock;
 use crate::chainstate::stacks::db::StacksBlockHeaderTypes;
 use crate::chainstate::stacks::events::StacksTransactionReceipt;
 use crate::chainstate::stacks::index::MARFValue;
-use crate::clarity_vm::read_witness::{EnvQuery, StoreQuery};
+use crate::clarity_vm::read_witness::StoreQuery;
 use crate::clarity_vm::state_writes::StateWrite;
 use crate::clarity_vm::stateless::{execute_statelessly, BlockLevelWrites, StatelessError};
 use crate::clarity_vm::witness_proof::{
-    check_read_witness, fill_rederived_metadata, BitcoinChain, ChainHeader, DeploySource,
+    check_read_witness, fill_rederived_metadata, BitcoinChain, ChainHeader, DeploySource, EnvClass,
     HeaderChain, NetworkParams, OpenedProof, StoreProof, TrustedState,
 };
 use crate::core::{
@@ -181,33 +181,6 @@ fn store_kind(query: &StoreQuery, answer: &Option<String>, proof: &StoreProof) -
         (_, StoreProof::OpenBlock) => "open-block (deterministic)",
         (_, StoreProof::Rederived) => "metadata (re-derived)",
         (_, StoreProof::Served) => "metadata (served, unproven)",
-    }
-}
-
-/// The class of an environment lookup (`NOTES.md`): (a) header chain,
-/// (b) consensus-hash preimage plus Bitcoin header, constant, or not provable.
-fn env_kind(query: &EnvQuery) -> &'static str {
-    use EnvQuery::*;
-    match query {
-        StacksBlockHeaderHash { .. }
-        | ConsensusHashForBlock { .. }
-        | StacksBlockTime { .. }
-        | VrfSeed { .. } => "env (a) header",
-        BurnHeaderHashForBlock { .. }
-        | BurnBlockHeightForBlock { .. }
-        | BurnBlockTime { .. }
-        | TipBurnBlockHeight
-        | TipSortitionId
-        | BurnHeaderHash { .. }
-        | BurnBlockHeight { .. }
-        | SortitionIdFromConsensusHash { .. } => "env (b) burn",
-        MinerAddress { .. }
-        | TokensSpent { .. }
-        | TokensSpentWinning { .. }
-        | TokensEarned { .. }
-        | PoxPayoutAddrs { .. }
-        | StacksHeightForTenureHeight { .. } => "env (c/d) unprovable",
-        _ => "env constant",
     }
 }
 
@@ -402,7 +375,7 @@ pub fn check_replayed_block(
         proven.witness.env.len(),
         proven.contracts.len()
     );
-    let unfilled = fill_rederived_metadata(&mut proven, &block_id, &headers, net);
+    let unfilled = fill_rederived_metadata(&mut proven, &block_id, &trusted);
     let check = check_read_witness(&block_id, &block.txs, &trusted, &proven);
     let rejections = check.rejections;
     match check.marf {
@@ -428,7 +401,10 @@ pub fn check_replayed_block(
         *report.entries.entry(*kind).or_default() += n;
     }
     for read in witness.env.iter() {
-        *report.entries.entry(env_kind(&read.query)).or_default() += 1;
+        *report
+            .entries
+            .entry(EnvClass::of(&read.query).label())
+            .or_default() += 1;
     }
     for evidence in proven.contracts.iter() {
         let kind = match evidence.source {
@@ -436,7 +412,7 @@ pub fn check_replayed_block(
             DeploySource::Tx(_) => "contract (deploy tx proven)",
         };
         *report.entries.entry(kind).or_default() += 1;
-        if !evidence.deploy_reads.is_empty() {
+        if !evidence.deploy_reads.is_empty() || !evidence.deploy_env.is_empty() {
             *report
                 .entries
                 .entry("contract (with deploy witness)")
